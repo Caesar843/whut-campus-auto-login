@@ -199,6 +199,64 @@ def test_script_prints_nas_id_source_without_sensitive_values(capsys):
     assert "202400001234" not in output
 
 
+def test_script_can_use_saved_config_without_printing_sensitive_values(capsys):
+    module = load_login_script()
+
+    class FakeAdapter:
+        def login(self, username, password):
+            assert username == "202400001234"
+            assert password == "secret-password"
+            return LoginResult(
+                status=LoginStatus.SUCCESS,
+                message="Login succeeded.",
+                portal_host="172.30.21.100",
+                nas_id="52",
+            )
+
+    class SavedConfig:
+        username = "202400001234"
+        password = "secret-password"
+        config_exists = True
+        credential_exists = True
+
+    exit_code = module.main(
+        env={},
+        adapter_factory=lambda timeout: FakeAdapter(),
+        argv=["--use-saved-config", "--timeout", "0.1"],
+        config_loader=lambda: SavedConfig(),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "status: success" in output
+    assert "account: 2024****1234" in output
+    assert "secret-password" not in output
+    assert "202400001234" not in output
+
+
+def test_script_reports_missing_saved_config_without_password(capsys):
+    module = load_login_script()
+
+    class MissingConfig:
+        username = "202400001234"
+        password = None
+        config_exists = True
+        credential_exists = False
+
+    exit_code = module.main(
+        env={},
+        argv=["--use-saved-config", "--timeout", "0.1"],
+        config_loader=lambda: MissingConfig(),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "Saved login config is incomplete" in output
+    assert "config_exists: true" in output
+    assert "password_saved: false" in output
+    assert "202400001234" not in output
+
+
 def test_script_prints_request_summary_without_sensitive_values(capsys):
     module = load_login_script()
 

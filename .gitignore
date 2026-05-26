@@ -42,3 +42,7 @@ Thumbs.db
 
 # Third-party reference projects are kept locally for analysis only.
 references/
+
+.pytest_cache/
+.pytest-basetemp*/
+__pycache__/
