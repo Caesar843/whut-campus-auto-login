@@ -88,4 +88,8 @@ class LoginResult:
 
     @property
     def ok(self) -> bool:
-        return self.status in {LoginStatus.SUCCESS, LoginStatus.ALREADY_ONLINE}
+        return self.status in {
+            LoginStatus.SUCCESS,
+            LoginStatus.ALREADY_ONLINE,
+            LoginStatus.LOGOUT_SUCCESS,
+        }

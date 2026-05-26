@@ -35,6 +35,11 @@ _IP_NOT_ONLINE_CODE = "IP_NOT_ONLINE"
 _INVALID_PORTAL_CONTEXT_CODE = "INVALID_PORTAL_CONTEXT"
 _INVALID_PORTAL_PARAMETER_CODE = "INVALID_PORTAL_PARAMETER"
 _AUTH_FAILED_CODE = "AUTH_FAILED"
+_LOGOUT_NOT_ONLINE_CODE = "LOGOUT_NOT_ONLINE"
+_LOGOUT_INVALID_SESSION_CODE = "LOGOUT_INVALID_SESSION"
+_LOGOUT_FAILED_CODE = "LOGOUT_FAILED"
+_LOGOUT_STILL_ONLINE_CODE = "LOGOUT_STILL_ONLINE"
+_LOGOUT_UNKNOWN_RESPONSE_CODE = "LOGOUT_UNKNOWN_RESPONSE"
 _IP_NOT_ONLINE_PATTERNS = (
     "设备ip不在线",
     "ip不在线",
@@ -59,6 +64,26 @@ _BAD_CREDENTIAL_PATTERNS = (
     "invalid username",
     "invalid credential",
     "authentication failed",
+)
+_LOGOUT_SUCCESS_PATTERNS = (
+    "成功",
+    "退出",
+    "注销",
+)
+_LOGOUT_NOT_ONLINE_PATTERNS = (
+    "不在线",
+    "未在线",
+    "not online",
+    "offline",
+)
+_LOGOUT_INVALID_SESSION_PATTERNS = (
+    "token",
+    "session",
+    "会话",
+    "失效",
+    "无效",
+    "重新登录",
+    "invalid",
 )
 
 
@@ -179,6 +204,29 @@ class WhutCampusLoginAdapter:
                 "Unknown campus login error.",
                 portal=context,
                 response_summary={"error": self._sanitize_text(str(exc), username, password)},
+            )
+
+    def logout(self) -> LoginResult:
+        context = _PortalContext(self.DEFAULT_HOST, self.DEFAULT_NAS_ID)
+        try:
+            context = self.bootstrap_portal_context()
+            config_api_base = self._load_config_api_base(context)
+            api_base = self._discover_api_base(context, config_api_base)
+            csrf_token = api_base.csrf_token or self._fetch_csrf_token(context)
+            status_payload = api_base.status_payload or self._fetch_account_status(
+                context,
+                csrf_token,
+            )
+            return self._complete_logout_with_status(context, status_payload, csrf_token)
+        except (_StageTimeout, requests.RequestException, _PortalUnavailable) as exc:
+            return self._logout_portal_unreachable_result(context, exc)
+        except Exception as exc:
+            return self._result(
+                LoginStatus.LOGOUT_UNKNOWN_RESPONSE,
+                "Logout failed with an unknown campus portal response.",
+                portal=context,
+                response_summary={"error": self._sanitize_text(str(exc), "", "")},
+                error_code=_LOGOUT_UNKNOWN_RESPONSE_CODE,
             )
 
     def bootstrap_portal_context(self) -> _PortalContext:
@@ -781,6 +829,170 @@ class WhutCampusLoginAdapter:
             )
         return payload
 
+    def _complete_logout_with_status(
+        self,
+        portal: _PortalContext,
+        status_payload: Dict[str, Any],
+        csrf_token: str,
+    ) -> LoginResult:
+        status_summary = self._summarize_payload(status_payload, "", "")
+        if not self._is_online_payload(status_payload):
+            return self._result(
+                LoginStatus.LOGOUT_NOT_ONLINE,
+                "当前设备不在线，无需注销。",
+                portal=portal,
+                response_summary=status_summary,
+                failed_stage="account_status",
+                error_code=_LOGOUT_NOT_ONLINE_CODE,
+            )
+
+        token = status_payload.get("token")
+        if not isinstance(token, str) or not token:
+            return self._result(
+                LoginStatus.LOGOUT_INVALID_SESSION,
+                "在线状态缺少可用于注销的会话 token。",
+                portal=portal,
+                response_summary=status_summary,
+                failed_stage="account_status",
+                error_code=_LOGOUT_INVALID_SESSION_CODE,
+                request_summary=self._build_logout_request_summary(token_present=False),
+            )
+
+        return self._submit_logout(portal, token, csrf_token)
+
+    def _submit_logout(
+        self,
+        portal: _PortalContext,
+        token: str,
+        csrf_token: str,
+    ) -> LoginResult:
+        url = self._logout_url(self._selected_api_base_url(portal), token)
+        headers = self._logout_headers(portal)
+        request_summary = self._build_logout_request_summary(token_present=True)
+        response = self._get(
+            "account_logout",
+            url,
+            headers=headers,
+            timeout=self.timeout,
+        )
+        attempted_url = sanitize_url(url)
+        if response.status_code != 200:
+            return self._result(
+                LoginStatus.LOGOUT_PORTAL_UNREACHABLE,
+                "Campus logout endpoint is unavailable.",
+                http_status=response.status_code,
+                portal=portal,
+                failed_stage="account_logout",
+                attempted_url=attempted_url,
+                request_summary=request_summary,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return self._result(
+                LoginStatus.LOGOUT_UNKNOWN_RESPONSE,
+                "Logout endpoint returned non-JSON response.",
+                http_status=response.status_code,
+                portal=portal,
+                response_summary={},
+                failed_stage="account_logout",
+                attempted_url=attempted_url,
+                error_code=_LOGOUT_UNKNOWN_RESPONSE_CODE,
+                request_summary=request_summary,
+            )
+
+        if not isinstance(payload, dict):
+            return self._result(
+                LoginStatus.LOGOUT_UNKNOWN_RESPONSE,
+                "Logout endpoint returned an unexpected response.",
+                http_status=response.status_code,
+                portal=portal,
+                response_summary={},
+                failed_stage="account_logout",
+                attempted_url=attempted_url,
+                error_code=_LOGOUT_UNKNOWN_RESPONSE_CODE,
+                request_summary=request_summary,
+            )
+
+        logout_summary = self._summarize_payload(payload, "", token)
+        status, message, error_code = self._classify_logout_payload(payload)
+        if status == LoginStatus.LOGOUT_SUCCESS:
+            return self._verify_logout_completed(
+                portal,
+                csrf_token,
+                logout_summary,
+                response.status_code,
+                attempted_url,
+                request_summary,
+            )
+        return self._result(
+            status,
+            message,
+            http_status=response.status_code,
+            portal=portal,
+            response_summary=logout_summary,
+            failed_stage="account_logout",
+            attempted_url=attempted_url,
+            error_code=error_code,
+            request_summary=request_summary,
+        )
+
+    def _verify_logout_completed(
+        self,
+        portal: _PortalContext,
+        csrf_token: str,
+        logout_summary: Dict[str, Any],
+        http_status: int,
+        attempted_url: str,
+        request_summary: Dict[str, Any],
+    ) -> LoginResult:
+        self._sleeper(self.retry_delay)
+        try:
+            status_payload = self._fetch_account_status(portal, csrf_token)
+        except (_StageTimeout, requests.RequestException, _PortalUnavailable) as exc:
+            return self._result(
+                LoginStatus.LOGOUT_UNKNOWN_RESPONSE,
+                "Logout was accepted, but post-logout status could not be verified.",
+                http_status=http_status,
+                portal=portal,
+                response_summary={
+                    "logout": logout_summary,
+                    "status": {"error": self._sanitize_text(str(exc), "", "")},
+                },
+                failed_stage="post_logout_status",
+                attempted_url=attempted_url,
+                error_code=_LOGOUT_UNKNOWN_RESPONSE_CODE,
+                request_summary=request_summary,
+            )
+
+        status_summary = self._summarize_payload(status_payload, "", "")
+        response_summary = {
+            "logout": logout_summary,
+            "status": status_summary,
+        }
+        if self._is_offline_payload(status_payload):
+            return self._result(
+                LoginStatus.LOGOUT_SUCCESS,
+                "校园网注销成功",
+                http_status=http_status,
+                portal=portal,
+                response_summary=response_summary,
+                attempted_url=attempted_url,
+                request_summary=request_summary,
+            )
+        return self._result(
+            LoginStatus.LOGOUT_FAILED,
+            "校园网注销请求已受理，但复查状态仍为在线。",
+            http_status=http_status,
+            portal=portal,
+            response_summary=response_summary,
+            failed_stage="post_logout_status",
+            attempted_url=attempted_url,
+            error_code=_LOGOUT_STILL_ONLINE_CODE,
+            request_summary=request_summary,
+        )
+
     def _submit_login(
         self,
         portal: _PortalContext,
@@ -922,6 +1134,9 @@ class WhutCampusLoginAdapter:
     def _api_url(self, base_url: str, endpoint: str) -> str:
         return base_url.rstrip("/") + "/" + endpoint.lstrip("/")
 
+    def _logout_url(self, base_url: str, token: str) -> str:
+        return self._api_url(base_url, "account/logout") + "?token=" + str(token)
+
     def _build_login_request_summary(
         self,
         portal: _PortalContext,
@@ -940,6 +1155,15 @@ class WhutCampusLoginAdapter:
             },
             "cookie_present": self._has_session_cookies(),
             "reused_same_session": True,
+        }
+
+    def _build_logout_request_summary(self, token_present: bool) -> Dict[str, Any]:
+        return {
+            "method": "GET",
+            "logout_payload": None,
+            "cookie_present": self._has_session_cookies(),
+            "reused_same_session": True,
+            "token_present": bool(token_present),
         }
 
     def _has_session_cookies(self) -> bool:
@@ -975,6 +1199,11 @@ class WhutCampusLoginAdapter:
         }
         if csrf_token:
             headers["X-Csrf-Token"] = csrf_token
+        return headers
+
+    def _logout_headers(self, portal: _PortalContext) -> Dict[str, str]:
+        headers = self._xhr_headers(portal, api_base_url=portal.api_base_url)
+        headers["Referer"] = f"http://{portal.host}/tpl/whut/success.html"
         return headers
 
     def _login_headers(self, portal: _PortalContext, csrf_token: str) -> Dict[str, str]:
@@ -1023,6 +1252,53 @@ class WhutCampusLoginAdapter:
         normalized = message.lower()
         return any(pattern in normalized for pattern in _AUTH_FAILED_PATTERNS)
 
+    def _classify_logout_payload(
+        self,
+        payload: Dict[str, Any],
+    ) -> Tuple[LoginStatus, str, Optional[str]]:
+        msg = str(payload.get("msg") or payload.get("message") or "")
+        if payload.get("code") == 0 or self._looks_like_logout_success(payload):
+            return LoginStatus.LOGOUT_SUCCESS, "校园网注销成功", None
+        if self._looks_like_logout_not_online(msg):
+            return (
+                LoginStatus.LOGOUT_NOT_ONLINE,
+                "当前设备不在线，无需注销。",
+                _LOGOUT_NOT_ONLINE_CODE,
+            )
+        if self._looks_like_logout_invalid_session(msg):
+            return (
+                LoginStatus.LOGOUT_INVALID_SESSION,
+                "校园网注销会话无效，请重新登录后再试。",
+                _LOGOUT_INVALID_SESSION_CODE,
+            )
+        if payload.get("code") == 1:
+            return (
+                LoginStatus.LOGOUT_FAILED,
+                "校园网注销失败。",
+                _LOGOUT_FAILED_CODE,
+            )
+        return (
+            LoginStatus.LOGOUT_UNKNOWN_RESPONSE,
+            "Logout failed with an unknown campus portal response.",
+            _LOGOUT_UNKNOWN_RESPONSE_CODE,
+        )
+
+    def _looks_like_logout_success(self, payload: Dict[str, Any]) -> bool:
+        if payload.get("online") is False:
+            return True
+        msg = str(payload.get("msg") or payload.get("message") or "")
+        if "失败" in msg or "错误" in msg:
+            return False
+        return any(pattern in msg for pattern in _LOGOUT_SUCCESS_PATTERNS)
+
+    def _looks_like_logout_not_online(self, message: str) -> bool:
+        normalized = message.lower().replace(" ", "")
+        return any(pattern in normalized for pattern in _LOGOUT_NOT_ONLINE_PATTERNS)
+
+    def _looks_like_logout_invalid_session(self, message: str) -> bool:
+        normalized = message.lower().replace(" ", "")
+        return any(pattern in normalized for pattern in _LOGOUT_INVALID_SESSION_PATTERNS)
+
     def _looks_like_login_success(self, payload: Dict[str, Any]) -> bool:
         if payload.get("code") == 0:
             return True
@@ -1036,6 +1312,14 @@ class WhutCampusLoginAdapter:
 
     def _is_online_payload(self, payload: Dict[str, Any]) -> bool:
         return payload.get("code") == 0
+
+    def _is_offline_payload(self, payload: Dict[str, Any]) -> bool:
+        if payload.get("online") is False:
+            return True
+        if payload.get("code") != 0:
+            return True
+        msg = str(payload.get("msg") or payload.get("message") or "")
+        return self._looks_like_logout_not_online(msg)
 
     def _summarize_payload(
         self,
@@ -1074,6 +1358,24 @@ class WhutCampusLoginAdapter:
         if exc.http_status is not None and exc.http_status != 200:
             return f"Portal detected but endpoint returned {exc.http_status}."
         return str(exc) or "Campus authentication service is unavailable."
+
+    def _logout_portal_unreachable_result(
+        self,
+        portal: _PortalContext,
+        exc: Exception,
+    ) -> LoginResult:
+        http_status = exc.http_status if isinstance(exc, _PortalUnavailable) else None
+        failed_stage = getattr(exc, "stage", None)
+        attempted_url = getattr(exc, "attempted_url", None)
+        return self._result(
+            LoginStatus.LOGOUT_PORTAL_UNREACHABLE,
+            "Campus logout portal is unreachable.",
+            http_status=http_status,
+            portal=portal,
+            response_summary={"error": self._sanitize_text(str(exc), "", "")},
+            failed_stage=failed_stage,
+            attempted_url=attempted_url,
+        )
 
     def _result(
         self,
