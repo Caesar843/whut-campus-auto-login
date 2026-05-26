@@ -12,9 +12,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from campus_login.adapters.whut import WhutCampusLoginAdapter  # noqa: E402
 from campus_login.core.client import login_with_adapter  # noqa: E402
 from campus_login.core.result import LoginResult, mask_account, sanitize_url  # noqa: E402
+from campus_login.local_config import load_login_config  # noqa: E402
 
 
 AdapterFactory = Callable[[float], WhutCampusLoginAdapter]
+ConfigLoader = Callable[[], object]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -26,6 +28,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=5.0,
         help="HTTP timeout in seconds for each portal request.",
+    )
+    parser.add_argument(
+        "--use-saved-config",
+        action="store_true",
+        help="Read username and password from the local secure config store.",
     )
     return parser
 
@@ -113,11 +120,27 @@ def main(
     env: Optional[Mapping[str, str]] = None,
     adapter_factory: Optional[AdapterFactory] = None,
     argv: Optional[Sequence[str]] = None,
+    config_loader: Optional[ConfigLoader] = None,
 ) -> int:
     args = _build_parser().parse_args([] if argv is None else list(argv))
     source_env = os.environ if env is None else env
-    username = source_env.get("WHUT_NET_USERNAME", "").strip()
-    password = source_env.get("WHUT_NET_PASSWORD", "")
+    if args.use_saved_config:
+        loader = config_loader or load_login_config
+        config = loader()
+        username = str(getattr(config, "username", "") or "").strip()
+        password = getattr(config, "password", None) or ""
+        if not username or not password:
+            print("Saved login config is incomplete.")
+            print(
+                f"config_exists: {_bool_text(bool(getattr(config, 'config_exists', False)))}"
+            )
+            print(
+                f"password_saved: {_bool_text(bool(getattr(config, 'credential_exists', False)))}"
+            )
+            return 2
+    else:
+        username = source_env.get("WHUT_NET_USERNAME", "").strip()
+        password = source_env.get("WHUT_NET_PASSWORD", "")
 
     if not username or not password:
         print("Missing environment variables: WHUT_NET_USERNAME and WHUT_NET_PASSWORD")
@@ -127,6 +150,10 @@ def main(
     result = login_with_adapter(factory(args.timeout), username, password)
     print_result(result, username, password)
     return 0 if result.ok else 1
+
+
+def _bool_text(value: bool) -> str:
+    return "true" if value else "false"
 
 
 if __name__ == "__main__":
