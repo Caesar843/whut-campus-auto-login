@@ -67,9 +67,9 @@ def test_enable_autostart_creates_shortcut_in_startup_folder(tmp_path):
     assert enabled is True
     assert shortcut_path.exists()
     assert shortcut_path.name == "whut-campus-auto-login.lnk"
-    assert backend.saved[shortcut_path].arguments.endswith(
-        'scripts\\dev\\test_login.py" --use-saved-config'
-    )
+    saved = backend.saved[shortcut_path]
+    assert saved.arguments.endswith('desktop_app\\tray_app.py" --startup-tray')
+    assert saved.working_directory == windows_startup.PROJECT_ROOT
 
 
 def test_repeated_enable_updates_single_shortcut_file(tmp_path):
@@ -93,6 +93,28 @@ def test_repeated_enable_updates_single_shortcut_file(tmp_path):
     assert list(startup_folder.glob("*.lnk")) == [
         startup_folder / "whut-campus-auto-login.lnk"
     ]
+
+
+def test_development_shortcut_prefers_path_pythonw_over_current_interpreter(monkeypatch):
+    pythonw_path = Path("C:/Users/lenovo/AppData/Local/Programs/Python/Python313/pythonw.exe")
+
+    def fake_which(command):
+        if command == "pythonw":
+            return str(pythonw_path)
+        return None
+
+    monkeypatch.setattr(windows_startup.sys, "frozen", False, raising=False)
+    monkeypatch.setattr(
+        windows_startup.sys,
+        "executable",
+        "C:/Users/CodexSandboxOffline/AppData/Local/Programs/Python/Python313/python.exe",
+    )
+    monkeypatch.setattr(windows_startup.shutil, "which", fake_which)
+
+    spec = windows_startup.build_shortcut_spec()
+
+    assert spec.target == pythonw_path
+    assert spec.arguments.endswith('desktop_app\\tray_app.py" --startup-tray')
 
 
 def test_disable_autostart_removes_shortcut_and_is_idempotent(tmp_path):

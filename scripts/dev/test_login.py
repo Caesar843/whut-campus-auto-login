@@ -12,7 +12,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from campus_login.adapters.whut import WhutCampusLoginAdapter  # noqa: E402
 from campus_login.core.client import login_with_adapter  # noqa: E402
 from campus_login.core.result import LoginResult, mask_account, sanitize_url  # noqa: E402
-from campus_login.local_config import load_login_config  # noqa: E402
+from campus_login.saved_login import (  # noqa: E402
+    load_saved_login_credentials,
+    login_with_saved_config,
+)
 
 
 AdapterFactory = Callable[[float], WhutCampusLoginAdapter]
@@ -125,10 +128,10 @@ def main(
     args = _build_parser().parse_args([] if argv is None else list(argv))
     source_env = os.environ if env is None else env
     if args.use_saved_config:
-        loader = config_loader or load_login_config
-        config = loader()
-        username = str(getattr(config, "username", "") or "").strip()
-        password = getattr(config, "password", None) or ""
+        credentials = load_saved_login_credentials(config_loader)
+        username = credentials.username
+        password = credentials.password
+        config = credentials.config
         if not username or not password:
             print("Saved login config is incomplete.")
             print(
@@ -147,7 +150,14 @@ def main(
         return 2
 
     factory = adapter_factory or (lambda timeout: WhutCampusLoginAdapter(timeout=timeout))
-    result = login_with_adapter(factory(args.timeout), username, password)
+    if args.use_saved_config:
+        result = login_with_saved_config(
+            timeout=args.timeout,
+            adapter_factory=factory,
+            config_loader=lambda: config,
+        )
+    else:
+        result = login_with_adapter(factory(args.timeout), username, password)
     print_result(result, username, password)
     return 0 if result.ok else 1
 

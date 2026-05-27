@@ -4,10 +4,10 @@ from enum import Enum
 from typing import Callable, Optional
 
 from campus_login.adapters.whut import WhutCampusLoginAdapter
-from campus_login.core.client import login_with_adapter, logout_with_adapter
+from campus_login.core.client import logout_with_adapter
 from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
-from campus_login.local_config import load_login_config
+from campus_login.saved_login import login_with_saved_config
 
 
 LOGGER = logging.getLogger(__name__)
@@ -83,6 +83,12 @@ class TrayController:
             self._on_status_changed(status)
 
     def test_login(self) -> TrayActionResult:
+        return self._run_login_action("test_login")
+
+    def startup_auto_login(self) -> TrayActionResult:
+        return self._run_login_action("startup_auto_login")
+
+    def _run_login_action(self, action: str) -> TrayActionResult:
         self.set_status(TrayStatus.LOGGING_IN)
         try:
             result = self._login_func()
@@ -90,7 +96,7 @@ class TrayController:
             LOGGER.exception("Tray login action failed.")
             self.set_status(TrayStatus.LOGIN_FAILED)
             return TrayActionResult(
-                action="test_login",
+                action=action,
                 status=self.status,
                 message=_safe_exception_message(exc),
             )
@@ -98,7 +104,7 @@ class TrayController:
         next_status = TrayStatus.LOGGED_IN if result.ok else TrayStatus.LOGIN_FAILED
         self.set_status(next_status)
         return TrayActionResult(
-            action="test_login",
+            action=action,
             status=self.status,
             message=result.message,
             result=result,
@@ -145,19 +151,6 @@ class TrayController:
 
     def request_exit(self) -> None:
         self._exit_func()
-
-
-def login_with_saved_config(timeout: float = 5.0) -> LoginResult:
-    config = load_login_config()
-    username = str(getattr(config, "username", "") or "").strip()
-    password = getattr(config, "password", None) or ""
-    if not username or not password:
-        return LoginResult(
-            status=LoginStatus.UNKNOWN_ERROR,
-            message="Saved login config is incomplete.",
-        )
-    adapter = WhutCampusLoginAdapter(timeout=timeout)
-    return login_with_adapter(adapter, username, password)
 
 
 def logout_current_session(timeout: float = 5.0) -> LoginResult:

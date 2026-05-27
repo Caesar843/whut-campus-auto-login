@@ -14,6 +14,7 @@ from desktop_app.tray.controller import (
 
 
 APP_NAME = "武汉理工校园网助手"
+STARTUP_TRAY_ARG = "--startup-tray"
 
 
 class _ActionWorker(QObject):
@@ -64,6 +65,13 @@ class TrayRuntime(QObject):
         self._tray.setToolTip(self._tooltip_text())
         self._tray.setContextMenu(self._menu)
         self._tray.show()
+
+    @property
+    def controller(self) -> TrayController:
+        return self._controller
+
+    def start_action(self, action: Callable[[], TrayActionResult]) -> None:
+        self._start_action(action)
 
     def _build_menu(self) -> None:
         title_action = self._menu.addAction(APP_NAME)
@@ -145,15 +153,35 @@ def run_tray_app(
     *,
     controller: Optional[TrayController] = None,
 ) -> int:
+    clean_argv = _qt_argv(argv)
     app = QApplication.instance()
     if app is None:
-        app = QApplication([APP_NAME, *list(argv or [])])
+        app = QApplication([APP_NAME, *clean_argv])
     app.setQuitOnLastWindowClosed(False)
 
     runtime = TrayRuntime(app, controller=controller)
     runtime.show()
+    schedule_startup_auto_login_if_requested(
+        argv,
+        start_action=runtime.start_action,
+        controller=runtime.controller,
+    )
     app._whut_tray_runtime = runtime
     return int(app.exec())
+
+
+def schedule_startup_auto_login_if_requested(
+    argv: Optional[Sequence[str]],
+    *,
+    start_action: Callable[[Callable[[], TrayActionResult]], None],
+    controller: TrayController,
+) -> None:
+    if STARTUP_TRAY_ARG in set(argv or []):
+        start_action(controller.startup_auto_login)
+
+
+def _qt_argv(argv: Optional[Sequence[str]]) -> list[str]:
+    return [item for item in list(argv or []) if item != STARTUP_TRAY_ARG]
 
 
 def _load_icon(app: QApplication) -> QIcon:

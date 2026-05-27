@@ -1,6 +1,7 @@
 import base64
 import locale
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from typing import Callable, Mapping, Optional
 
 SHORTCUT_NAME = "whut-campus-auto-login.lnk"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SOURCE_ENTRY_SCRIPT = PROJECT_ROOT / "scripts" / "dev" / "test_login.py"
+SOURCE_ENTRY_SCRIPT = PROJECT_ROOT / "desktop_app" / "tray_app.py"
 
 
 class AutostartError(RuntimeError):
@@ -131,14 +132,23 @@ def build_shortcut_spec() -> ShortcutSpec:
     if getattr(sys, "frozen", False):
         return ShortcutSpec(
             target=executable,
-            arguments="",
+            arguments="--startup-tray",
             working_directory=executable.parent,
         )
+    executable = _development_python_executable()
     return ShortcutSpec(
         target=executable,
-        arguments=f'"{SOURCE_ENTRY_SCRIPT}" --use-saved-config',
+        arguments=f'"{SOURCE_ENTRY_SCRIPT}" --startup-tray',
         working_directory=PROJECT_ROOT,
     )
+
+
+def _development_python_executable() -> Path:
+    for command in ("pythonw", "python"):
+        executable = shutil.which(command)
+        if executable:
+            return Path(executable).resolve()
+    return Path(sys.executable).resolve()
 
 
 def _is_windows(platform: Optional[str]) -> bool:

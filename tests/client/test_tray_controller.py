@@ -47,6 +47,69 @@ def test_test_login_calls_injected_login_function_and_marks_logged_in():
     assert controller.status_text == "已登录"
 
 
+def test_startup_auto_login_calls_injected_login_function_and_marks_logged_in():
+    calls = []
+    exit_calls = []
+
+    def login():
+        calls.append("login")
+        return _result(LoginStatus.SUCCESS)
+
+    controller = TrayController(
+        login_func=login,
+        exit_func=lambda: exit_calls.append("exit"),
+    )
+
+    action_result = controller.startup_auto_login()
+
+    assert calls == ["login"]
+    assert exit_calls == []
+    assert action_result.action == "startup_auto_login"
+    assert action_result.result.status == LoginStatus.SUCCESS
+    assert controller.status == TrayStatus.LOGGED_IN
+
+
+def test_startup_auto_login_failure_keeps_controller_running():
+    calls = []
+    exit_calls = []
+
+    def login():
+        calls.append("login")
+        return _result(LoginStatus.TIMEOUT)
+
+    controller = TrayController(
+        login_func=login,
+        exit_func=lambda: exit_calls.append("exit"),
+    )
+
+    action_result = controller.startup_auto_login()
+
+    assert calls == ["login"]
+    assert exit_calls == []
+    assert action_result.action == "startup_auto_login"
+    assert action_result.result.status == LoginStatus.TIMEOUT
+    assert controller.status == TrayStatus.LOGIN_FAILED
+
+
+def test_startup_auto_login_exception_marks_failed_without_exit():
+    exit_calls = []
+
+    def login():
+        raise RuntimeError("startup login exploded")
+
+    controller = TrayController(
+        login_func=login,
+        exit_func=lambda: exit_calls.append("exit"),
+    )
+
+    action_result = controller.startup_auto_login()
+
+    assert exit_calls == []
+    assert action_result.result is None
+    assert "startup login exploded" in action_result.message
+    assert controller.status == TrayStatus.LOGIN_FAILED
+
+
 def test_logout_calls_injected_logout_function_and_marks_logged_out():
     calls = []
 
