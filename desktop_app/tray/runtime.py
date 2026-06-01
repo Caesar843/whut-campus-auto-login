@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon, QWidget
 
+from desktop_app.main_window import create_main_window
 from desktop_app.tray.controller import (
     TrayActionResult,
     TrayController,
@@ -15,6 +18,7 @@ from desktop_app.tray.controller import (
 
 APP_NAME = "武汉理工校园网助手"
 STARTUP_TRAY_ARG = "--startup-tray"
+MainWindowFactory = Callable[[], QWidget]
 
 
 class _ActionWorker(QObject):
@@ -45,11 +49,14 @@ class TrayRuntime(QObject):
         app: QApplication,
         *,
         controller: Optional[TrayController] = None,
+        main_window_factory: Optional[MainWindowFactory] = None,
     ):
         super().__init__()
         self._app = app
         self._threads = []
         self._workers = []
+        self._main_window_factory = main_window_factory or create_main_window
+        self._main_window: Optional[QWidget] = None
         self._controller = controller or TrayController(
             exit_func=app.quit,
             on_status_changed=self.status_changed.emit,
@@ -66,6 +73,14 @@ class TrayRuntime(QObject):
         self._tray.setContextMenu(self._menu)
         self._tray.show()
 
+    def show_main_window(self) -> QWidget:
+        if self._main_window is None:
+            self._main_window = self._main_window_factory()
+        self._main_window.show()
+        self._main_window.raise_()
+        self._main_window.activateWindow()
+        return self._main_window
+
     @property
     def controller(self) -> TrayController:
         return self._controller
@@ -80,6 +95,10 @@ class TrayRuntime(QObject):
 
         self._status_action = self._menu.addAction(self._controller.status_menu_text)
         self._status_action.setEnabled(False)
+        self._menu.addSeparator()
+
+        open_window_action = self._menu.addAction("打开主界面")
+        open_window_action.triggered.connect(self.show_main_window)
         self._menu.addSeparator()
 
         test_login_action = self._menu.addAction("测试登录")
@@ -152,6 +171,7 @@ def run_tray_app(
     argv: Optional[Sequence[str]] = None,
     *,
     controller: Optional[TrayController] = None,
+    main_window_factory: Optional[MainWindowFactory] = None,
 ) -> int:
     clean_argv = _qt_argv(argv)
     app = QApplication.instance()
@@ -159,8 +179,14 @@ def run_tray_app(
         app = QApplication([APP_NAME, *clean_argv])
     app.setQuitOnLastWindowClosed(False)
 
-    runtime = TrayRuntime(app, controller=controller)
+    runtime = TrayRuntime(
+        app,
+        controller=controller,
+        main_window_factory=main_window_factory,
+    )
     runtime.show()
+    if should_show_main_window(argv):
+        runtime.show_main_window()
     schedule_startup_auto_login_if_requested(
         argv,
         start_action=runtime.start_action,
@@ -168,6 +194,10 @@ def run_tray_app(
     )
     app._whut_tray_runtime = runtime
     return int(app.exec())
+
+
+def should_show_main_window(argv: Optional[Sequence[str]]) -> bool:
+    return STARTUP_TRAY_ARG not in set(argv or [])
 
 
 def schedule_startup_auto_login_if_requested(

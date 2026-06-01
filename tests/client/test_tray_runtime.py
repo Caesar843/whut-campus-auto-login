@@ -44,3 +44,8 @@ def test_plain_tray_start_does_not_schedule_startup_auto_login():
     )
 
     assert tray_runtime.scheduled == []
+
+
+def test_plain_start_shows_main_window_but_startup_tray_does_not():
+    assert runtime.should_show_main_window([]) is True
+    assert runtime.should_show_main_window(["--startup-tray"]) is False
