@@ -16,6 +16,11 @@ from campus_login.saved_login import (  # noqa: E402
     load_saved_login_credentials,
     login_with_saved_config,
 )
+from license_client.license_guard import (  # noqa: E402
+    LicenseCheckFunc,
+    check_license_before_login,
+    license_blocked_result,
+)
 
 
 AdapterFactory = Callable[[float], WhutCampusLoginAdapter]
@@ -124,6 +129,7 @@ def main(
     adapter_factory: Optional[AdapterFactory] = None,
     argv: Optional[Sequence[str]] = None,
     config_loader: Optional[ConfigLoader] = None,
+    license_check_func: Optional[LicenseCheckFunc] = None,
 ) -> int:
     args = _build_parser().parse_args([] if argv is None else list(argv))
     source_env = os.environ if env is None else env
@@ -148,6 +154,13 @@ def main(
     if not username or not password:
         print("Missing environment variables: WHUT_NET_USERNAME and WHUT_NET_PASSWORD")
         return 2
+
+    license_checker = license_check_func or check_license_before_login
+    license_decision = license_checker()
+    if not license_decision.allowed:
+        result = license_blocked_result(license_decision)
+        print_result(result, username, password)
+        return 1
 
     factory = adapter_factory or (lambda timeout: WhutCampusLoginAdapter(timeout=timeout))
     if args.use_saved_config:

@@ -8,10 +8,20 @@ if str(PROJECT_ROOT) not in sys.path:
 from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
 from desktop_app.tray.controller import TrayController, TrayStatus
+from license_client.license_state import LicenseDecision, LicenseStatus as LicenseStateStatus
 
 
 def _result(status):
     return LoginResult(status=status, message=f"{status.value} message")
+
+
+def _allow_license():
+    return LicenseDecision(
+        status=LicenseStateStatus.TRIAL_ACTIVE,
+        allowed=True,
+        reason="trial_active",
+        message_for_ui="授权允许",
+    )
 
 
 def test_status_text_starts_unknown_and_can_update():
@@ -37,7 +47,7 @@ def test_test_login_calls_injected_login_function_and_marks_logged_in():
         calls.append("login")
         return _result(LoginStatus.SUCCESS)
 
-    controller = TrayController(login_func=login)
+    controller = TrayController(login_func=login, license_check_func=_allow_license)
 
     action_result = controller.test_login()
 
@@ -58,6 +68,7 @@ def test_startup_auto_login_calls_injected_login_function_and_marks_logged_in():
     controller = TrayController(
         login_func=login,
         exit_func=lambda: exit_calls.append("exit"),
+        license_check_func=_allow_license,
     )
 
     action_result = controller.startup_auto_login()
@@ -80,6 +91,7 @@ def test_startup_auto_login_failure_keeps_controller_running():
     controller = TrayController(
         login_func=login,
         exit_func=lambda: exit_calls.append("exit"),
+        license_check_func=_allow_license,
     )
 
     action_result = controller.startup_auto_login()
@@ -100,6 +112,7 @@ def test_startup_auto_login_exception_marks_failed_without_exit():
     controller = TrayController(
         login_func=login,
         exit_func=lambda: exit_calls.append("exit"),
+        license_check_func=_allow_license,
     )
 
     action_result = controller.startup_auto_login()
@@ -186,7 +199,11 @@ def test_relogin_calls_logout_then_login_in_order():
         calls.append("logout")
         return _result(LoginStatus.LOGOUT_SUCCESS)
 
-    controller = TrayController(login_func=login, logout_func=logout)
+    controller = TrayController(
+        login_func=login,
+        logout_func=logout,
+        license_check_func=_allow_license,
+    )
 
     action_result = controller.relogin()
 
@@ -211,7 +228,11 @@ def test_relogin_does_not_login_when_logout_is_still_pending():
             error_code="LOGOUT_STILL_ONLINE",
         )
 
-    controller = TrayController(login_func=login, logout_func=logout)
+    controller = TrayController(
+        login_func=login,
+        logout_func=logout,
+        license_check_func=_allow_license,
+    )
 
     action_result = controller.relogin()
 
@@ -224,7 +245,7 @@ def test_login_exception_is_caught_and_marks_login_failed():
     def login():
         raise RuntimeError("login exploded")
 
-    controller = TrayController(login_func=login)
+    controller = TrayController(login_func=login, license_check_func=_allow_license)
 
     action_result = controller.test_login()
 

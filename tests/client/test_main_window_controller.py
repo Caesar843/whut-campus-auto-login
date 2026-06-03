@@ -11,6 +11,7 @@ from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
 from campus_login.local_config import LocalConfigError
 from desktop_app.main_window import MainWindowController, login_result_display
+from license_client.license_state import LicenseDecision, LicenseStatus as LicenseStateStatus
 
 
 @dataclass
@@ -20,6 +21,15 @@ class FakeConfig:
     auto_login_enabled: bool = True
     config_exists: bool = False
     credential_exists: bool = False
+
+
+def _allow_license():
+    return LicenseDecision(
+        status=LicenseStateStatus.TRIAL_ACTIVE,
+        allowed=True,
+        reason="trial_active",
+        message_for_ui="授权允许",
+    )
 
 
 def test_controller_loads_config_and_autostart_state():
@@ -138,7 +148,10 @@ def test_test_login_uses_injected_runner_without_real_network():
         calls.append((username, password))
         return LoginResult(status=LoginStatus.SUCCESS, message="ok")
 
-    controller = MainWindowController(login_runner=login_runner)
+    controller = MainWindowController(
+        login_runner=login_runner,
+        license_check_func=_allow_license,
+    )
 
     result = controller.test_login(" 366369 ", "secret-password")
 

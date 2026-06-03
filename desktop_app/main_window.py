@@ -34,6 +34,13 @@ from desktop_app.autostart.windows_startup import (
     is_autostart_enabled,
 )
 from desktop_app.widgets import AccountLineEdit, PasswordLineEdit, StatusLabel
+from license_client.license_guard import (
+    LicenseCheckFunc,
+    check_license_before_login,
+    get_current_license_state,
+    license_blocked_result,
+)
+from license_client.license_state import LicenseDecision
 
 
 LOGGER = logging.getLogger(__name__)
@@ -52,6 +59,8 @@ class MainWindowState:
     autostart_enabled: bool = False
     config_exists: bool = False
     credential_exists: bool = False
+    license_message: str = LICENSE_PLACEHOLDER
+    license_variant: str = "neutral"
 
 
 class MainWindowController:
@@ -65,6 +74,8 @@ class MainWindowController:
         enable_autostart_func: Callable[[], bool] = enable_autostart,
         disable_autostart_func: Callable[[], bool] = disable_autostart,
         login_runner: Optional[LoginRunner] = None,
+        license_check_func: Optional[LicenseCheckFunc] = None,
+        license_state_func: Optional[Callable[[], LicenseDecision]] = None,
     ):
         self._load_config = load_config_func
         self._save_config = save_config_func
@@ -73,9 +84,12 @@ class MainWindowController:
         self._enable_autostart = enable_autostart_func
         self._disable_autostart = disable_autostart_func
         self._login_runner = login_runner or _default_login_runner
+        self._license_check = license_check_func or check_license_before_login
+        self._license_state = license_state_func or get_current_license_state
 
     def load_state(self) -> MainWindowState:
         config = self._load_config()
+        license_decision = self._license_state()
         return MainWindowState(
             username=str(getattr(config, "username", "") or ""),
             password=str(getattr(config, "password", "") or ""),
@@ -83,6 +97,8 @@ class MainWindowController:
             autostart_enabled=bool(self._is_autostart_enabled()),
             config_exists=bool(getattr(config, "config_exists", False)),
             credential_exists=bool(getattr(config, "credential_exists", False)),
+            license_message=license_decision.message_for_ui or LICENSE_PLACEHOLDER,
+            license_variant=_license_variant(license_decision),
         )
 
     def save(self, username: str, password: str, autostart_enabled: bool) -> str:
@@ -118,6 +134,9 @@ class MainWindowController:
                 status=LoginStatus.UNKNOWN_ERROR,
                 message="请先输入校园网账号和密码。",
             )
+        license_decision = self._license_check()
+        if not license_decision.allowed:
+            return license_blocked_result(license_decision)
         return self._login_runner(clean_username, password)
 
 
@@ -171,6 +190,8 @@ class MainWindow(QMainWindow):
             self._set_status("已读取本机配置，密码仅来自本机安全凭据。", "success")
         else:
             self._set_status("尚未保存配置，请输入校园网账号和密码。", "neutral")
+        self.license_label.setText(state.license_message)
+        self.license_label.set_variant(state.license_variant)
 
     def closeEvent(self, event) -> None:
         if self.isVisible():
@@ -383,6 +404,14 @@ def _field_label(text: str) -> QLabel:
 
 def _safe_message(exc: Exception) -> str:
     return str(exc)[:240] or exc.__class__.__name__
+
+
+def _license_variant(decision: LicenseDecision) -> str:
+    if decision.allowed:
+        return "success"
+    if decision.status.value in {"uninitialized", "server_unreachable", "config_only"}:
+        return "warning"
+    return "error"
 
 
 def _style_sheet() -> str:

@@ -1,0 +1,4 @@
+fastapi>=0.136,<1
+uvicorn>=0.48,<1
+cryptography>=48,<49
+httpx>=0.28,<1

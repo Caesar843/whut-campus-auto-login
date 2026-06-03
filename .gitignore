@@ -32,10 +32,18 @@ Thumbs.db
 *.bak
 *.tmp
 
-# Keep real campus network credentials, cookies, tokens, and packet captures out of git.
+# Keep real campus network credentials, cookies, local tokens, keys, databases, and packet captures out of git.
 *cookie*
-*token*
 *session*
+license_token.json
+*.license_token.json
+*.token.json
+*.key
+*.pem
+*.db
+*.sqlite
+*.sqlite3
+.license-dev.sqlite3
 *.har
 *.pcap
 *.pcapng
@@ -43,6 +51,6 @@ Thumbs.db
 # Third-party reference projects are kept locally for analysis only.
 references/
 
-.pytest_cache/
+.pytest-temp/
 .pytest-basetemp*/
-__pycache__/
+.pytest-runtime-temp*/

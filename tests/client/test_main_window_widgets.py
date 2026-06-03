@@ -73,4 +73,4 @@ def test_main_window_initializes_fields_from_controller():
     assert window.password_input.text() == "secret-password"
     assert window.password_input.echoMode() == QLineEdit.EchoMode.Password
     assert window.autostart_checkbox.isChecked() is True
-    assert "未接入授权" in window.license_label.text()
+    assert "未初始化" in window.license_label.text()

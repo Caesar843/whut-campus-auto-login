@@ -8,6 +8,11 @@ from campus_login.core.client import logout_with_adapter
 from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
 from campus_login.saved_login import login_with_saved_config
+from license_client.license_guard import (
+    LicenseCheckFunc,
+    check_license_before_login,
+    license_blocked_result,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -60,6 +65,7 @@ class TrayController:
         logout_func: Optional[LogoutFunc] = None,
         exit_func: Optional[ExitFunc] = None,
         on_status_changed: Optional[StatusChangedFunc] = None,
+        license_check_func: Optional[LicenseCheckFunc] = None,
     ):
         self._login_func = login_func or login_with_saved_config
         self._logout_func = logout_current_session
@@ -67,6 +73,7 @@ class TrayController:
             self._logout_func = logout_func
         self._exit_func = exit_func or (lambda: None)
         self._on_status_changed = on_status_changed
+        self._license_check = license_check_func or check_license_before_login
         self.status = TrayStatus.UNKNOWN
 
     @property
@@ -90,6 +97,16 @@ class TrayController:
 
     def _run_login_action(self, action: str) -> TrayActionResult:
         self.set_status(TrayStatus.LOGGING_IN)
+        license_decision = self._license_check()
+        if not license_decision.allowed:
+            self.set_status(TrayStatus.LOGIN_FAILED)
+            blocked_result = license_blocked_result(license_decision)
+            return TrayActionResult(
+                action=action,
+                status=self.status,
+                message=blocked_result.message,
+                result=blocked_result,
+            )
         try:
             result = self._login_func()
         except Exception as exc:
@@ -133,6 +150,16 @@ class TrayController:
         )
 
     def relogin(self) -> TrayActionResult:
+        license_decision = self._license_check()
+        if not license_decision.allowed:
+            self.set_status(TrayStatus.LOGIN_FAILED)
+            blocked_result = license_blocked_result(license_decision)
+            return TrayActionResult(
+                action="relogin",
+                status=self.status,
+                message=blocked_result.message,
+                result=blocked_result,
+            )
         logout_result = self.logout()
         if logout_result.status != TrayStatus.LOGGED_OUT:
             return TrayActionResult(

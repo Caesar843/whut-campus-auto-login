@@ -3,6 +3,7 @@ from pathlib import Path
 
 from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
+from license_client.license_state import LicenseDecision, LicenseStatus as LicenseStateStatus
 
 
 def load_login_script():
@@ -11,6 +12,15 @@ def load_login_script():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _allow_license():
+    return LicenseDecision(
+        status=LicenseStateStatus.TRIAL_ACTIVE,
+        allowed=True,
+        reason="trial_active",
+        message_for_ui="授权允许",
+    )
 
 
 def test_script_requires_environment_credentials(capsys):
@@ -47,6 +57,7 @@ def test_script_prints_safe_summary_without_password(capsys):
         },
         adapter_factory=lambda timeout: FakeAdapter(),
         argv=["--timeout", "0.1"],
+        license_check_func=_allow_license,
     )
 
     output = capsys.readouterr().out
@@ -77,6 +88,7 @@ def test_script_prints_failed_stage_without_password(capsys):
         },
         adapter_factory=lambda timeout: FakeAdapter(),
         argv=["--timeout", "0.1"],
+        license_check_func=_allow_license,
     )
 
     output = capsys.readouterr().out
@@ -114,6 +126,7 @@ def test_script_prints_attempted_url_without_sensitive_values(capsys):
         },
         adapter_factory=lambda timeout: FakeAdapter(),
         argv=["--timeout", "0.1"],
+        license_check_func=_allow_license,
     )
 
     output = capsys.readouterr().out
@@ -158,6 +171,7 @@ def test_script_prints_error_code_without_password(capsys):
         },
         adapter_factory=lambda timeout: FakeAdapter(),
         argv=["--timeout", "0.1"],
+        license_check_func=_allow_license,
     )
 
     output = capsys.readouterr().out
@@ -190,6 +204,7 @@ def test_script_prints_nas_id_source_without_sensitive_values(capsys):
         },
         adapter_factory=lambda timeout: FakeAdapter(),
         argv=["--timeout", "0.1"],
+        license_check_func=_allow_license,
     )
 
     output = capsys.readouterr().out
@@ -224,6 +239,7 @@ def test_script_can_use_saved_config_without_printing_sensitive_values(capsys):
         adapter_factory=lambda timeout: FakeAdapter(),
         argv=["--use-saved-config", "--timeout", "0.1"],
         config_loader=lambda: SavedConfig(),
+        license_check_func=_allow_license,
     )
 
     output = capsys.readouterr().out
@@ -295,6 +311,7 @@ def test_script_prints_request_summary_without_sensitive_values(capsys):
         },
         adapter_factory=lambda timeout: FakeAdapter(),
         argv=["--timeout", "0.1"],
+        license_check_func=_allow_license,
     )
 
     output = capsys.readouterr().out
@@ -314,3 +331,39 @@ def test_script_prints_request_summary_without_sensitive_values(capsys):
     assert "raw-session" not in output
     assert "aa:bb:cc:dd:ee:ff" not in output
     assert "张三" not in output
+
+
+def test_script_checks_license_before_login(capsys):
+    module = load_login_script()
+    calls = []
+
+    class FakeAdapter:
+        def login(self, username, password):
+            calls.append((username, password))
+            return LoginResult(status=LoginStatus.SUCCESS, message="ok")
+
+    blocked = LicenseDecision(
+        status=LicenseStateStatus.TRIAL_EXPIRED,
+        allowed=False,
+        reason="trial_expired",
+        message_for_ui="授权已过期",
+    )
+
+    exit_code = module.main(
+        env={
+            "WHUT_NET_USERNAME": "202400001234",
+            "WHUT_NET_PASSWORD": "secret-password",
+        },
+        adapter_factory=lambda timeout: FakeAdapter(),
+        argv=["--timeout", "0.1"],
+        license_check_func=lambda: blocked,
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert calls == []
+    assert "status: unknown_error" in output
+    assert "error_code: LICENSE_BLOCKED" in output
+    assert "授权已过期" in output
+    assert "secret-password" not in output
+    assert "202400001234" not in output
