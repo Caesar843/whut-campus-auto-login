@@ -68,12 +68,16 @@ def check_license_before_login(
         needs_register=True,
     )
     if not api_result.reachable:
-        if _can_bootstrap_login(
-            saved_login_available_func=saved_login_available_func,
-            campus_network_probe_func=campus_network_probe_func or default_campus_network_probe,
+        if not _saved_login_available(saved_login_available_func):
+            return server_unreachable_decision(reason="missing_saved_login_config")
+        if _campus_network_available(
+            campus_network_probe_func or default_campus_network_probe
         ):
             return bootstrap_allowed_decision()
-        return server_unreachable_decision()
+        return server_unreachable_decision(
+            reason="bootstrap_portal_not_ready",
+            retryable=True,
+        )
     if not api_result.signed_license_token:
         return uninitialized_decision()
     if not public_key:
@@ -195,6 +199,7 @@ def _verify_to_decision(
         message_for_ui=decision.message_for_ui,
         signed_license_token=signed_license_token if decision.allowed else None,
         bootstrap_required=decision.bootstrap_required,
+        retryable=decision.retryable,
     )
 
 
@@ -212,18 +217,15 @@ def _call_api(
     return client.refresh_license(device_fingerprint_hash=device_fingerprint_hash)
 
 
-def _can_bootstrap_login(
-    *,
-    saved_login_available_func: Callable[[], bool],
-    campus_network_probe_func: Callable[[], bool],
-) -> bool:
+def _saved_login_available(saved_login_available_func: Callable[[], bool]) -> bool:
     try:
-        has_saved_login = bool(saved_login_available_func())
+        return bool(saved_login_available_func())
     except Exception as exc:
         LOGGER.warning("Saved login availability check failed: %s", exc.__class__.__name__)
         return False
-    if not has_saved_login:
-        return False
+
+
+def _campus_network_available(campus_network_probe_func: Callable[[], bool]) -> bool:
     try:
         return bool(campus_network_probe_func())
     except Exception as exc:

@@ -32,6 +32,7 @@ class LicenseDecision:
     message_for_ui: str = ""
     signed_license_token: Optional[str] = None
     bootstrap_required: bool = False
+    retryable: bool = False
 
 
 def evaluate_local_license(
@@ -121,21 +122,25 @@ def server_unreachable_decision(
     *,
     allowed: bool = False,
     fallback: Optional[LicenseDecision] = None,
+    reason: str = "server_unreachable",
+    retryable: bool = False,
 ) -> LicenseDecision:
     if allowed and fallback is not None:
         return LicenseDecision(
             status=LicenseStatus.SERVER_UNREACHABLE,
             allowed=True,
-            reason="server_unreachable",
+            reason=reason,
             license_type=fallback.license_type,
             expires_at=fallback.expires_at,
             days_remaining=fallback.days_remaining,
+            retryable=retryable,
             message_for_ui=f"授权状态：离线可用，本地授权有效至 {_date_text(fallback.expires_at)}",
         )
     return LicenseDecision(
         status=LicenseStatus.SERVER_UNREACHABLE,
         allowed=False,
-        reason="server_unreachable",
+        reason=reason,
+        retryable=retryable,
         message_for_ui="授权未初始化，且当前无法连接授权服务。请确认已连接武汉理工校园网，或先手动联网后重试。",
     )
 

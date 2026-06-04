@@ -201,7 +201,10 @@ def test_device_mismatch_blocks_use():
 
     assert verification.valid is False
     assert verification.error == "device_mismatch"
-    assert evaluate_local_license(verification).allowed is False
+    decision = evaluate_local_license(verification)
+    assert decision.allowed is False
+    assert decision.reason == "device_mismatch"
+    assert decision.retryable is False
 
 
 def test_revoked_token_blocks_use():
@@ -302,10 +305,12 @@ def test_guard_blocks_bootstrap_when_saved_config_missing(tmp_path):
 
     assert decision.allowed is False
     assert decision.status == LicenseStatus.SERVER_UNREACHABLE
+    assert decision.reason == "missing_saved_login_config"
+    assert decision.retryable is False
     assert decision.bootstrap_required is False
 
 
-def test_guard_blocks_bootstrap_when_campus_network_missing(tmp_path):
+def test_guard_marks_bootstrap_portal_not_ready_as_retryable(tmp_path):
     decision = check_license_before_login(
         token_path=tmp_path / "missing-license.json",
         public_key_b64="unused",
@@ -317,6 +322,8 @@ def test_guard_blocks_bootstrap_when_campus_network_missing(tmp_path):
 
     assert decision.allowed is False
     assert decision.status == LicenseStatus.SERVER_UNREACHABLE
+    assert decision.reason == "bootstrap_portal_not_ready"
+    assert decision.retryable is True
     assert decision.bootstrap_required is False
 
 
@@ -358,6 +365,7 @@ def test_expired_token_blocks_without_bootstrap_even_when_campus_network_availab
 
     assert decision.allowed is False
     assert decision.status == LicenseStatus.TRIAL_EXPIRED
+    assert decision.retryable is False
     assert decision.bootstrap_required is False
     assert "试用期已结束" in decision.message_for_ui
 
@@ -384,6 +392,7 @@ def test_paid_expired_token_blocks_without_bootstrap(tmp_path):
 
     assert decision.allowed is False
     assert decision.status == LicenseStatus.PAID_EXPIRED
+    assert decision.retryable is False
     assert decision.bootstrap_required is False
 
 
@@ -402,6 +411,7 @@ def test_invalid_token_blocks_without_bootstrap(tmp_path):
 
     assert decision.allowed is False
     assert decision.status == LicenseStatus.TOKEN_INVALID
+    assert decision.retryable is False
     assert decision.bootstrap_required is False
     assert "本地授权凭证无效" in decision.message_for_ui
 
@@ -423,6 +433,7 @@ def test_revoked_token_blocks_without_bootstrap(tmp_path):
 
     assert decision.allowed is False
     assert decision.status == LicenseStatus.REVOKED
+    assert decision.retryable is False
     assert decision.bootstrap_required is False
 
 
