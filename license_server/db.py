@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Iterator
 
+
+LEGACY_CAMPUS_ACCOUNT_COLUMNS = (
+    "campus_account_hash",
+    "campus_account_masked",
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -13,8 +17,6 @@ CREATE TABLE IF NOT EXISTS devices (
     device_name TEXT,
     os TEXT,
     app_version TEXT,
-    campus_account_hash TEXT,
-    campus_account_masked TEXT,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
 );
@@ -46,3 +48,10 @@ def connect(database_path: Path) -> sqlite3.Connection:
 def initialize_database(database_path: Path) -> None:
     with connect(database_path) as connection:
         connection.executescript(SCHEMA)
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(devices)").fetchall()
+        }
+        for column in LEGACY_CAMPUS_ACCOUNT_COLUMNS:
+            if column in columns:
+                connection.execute(f'ALTER TABLE devices DROP COLUMN "{column}"')

@@ -80,7 +80,7 @@ def test_main_window_bootstrap_login_syncs_license_after_success():
     assert login_calls == [("202400001234", "secret-password")]
     assert len(sync_calls) == 1
     assert sync_calls[0]["bootstrap_decision"].bootstrap_required is True
-    assert sync_calls[0]["campus_account"] == "202400001234"
+    assert set(sync_calls[0]) == {"bootstrap_decision"}
 
 
 def test_main_window_bootstrap_login_failure_does_not_sync_license():

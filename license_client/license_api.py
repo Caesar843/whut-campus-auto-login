@@ -32,8 +32,6 @@ class LicenseApiClient:
         self,
         *,
         device_fingerprint_hash: str,
-        campus_account_hash: Optional[str] = None,
-        campus_account_masked: Optional[str] = None,
     ) -> LicenseApiResult:
         payload = {
             "product_id": PRODUCT_ID,
@@ -41,8 +39,6 @@ class LicenseApiClient:
             "device_name": socket.gethostname(),
             "os": platform.platform(),
             "app_version": APP_VERSION,
-            "campus_account_hash": campus_account_hash,
-            "campus_account_masked": campus_account_masked,
         }
         return self._post("/device/register", payload)
 

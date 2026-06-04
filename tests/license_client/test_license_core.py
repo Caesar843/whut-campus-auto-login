@@ -7,7 +7,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from license_client.license_api import LicenseApiResult
+from license_client.license_api import LicenseApiClient, LicenseApiResult
 from license_client.license_guard import (
     check_license_before_login,
     try_initialize_license_after_bootstrap_login,
@@ -57,6 +57,44 @@ def _signed_license_token(private_key, **overrides):
     payload_segment = _b64url(payload_json)
     signature_segment = _b64url(private_key.sign(payload_segment.encode("ascii")))
     return f"{payload_segment}.{signature_segment}"
+
+
+def test_register_device_payload_excludes_campus_account_fields(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return {
+                "status": "trial_active",
+                "signed_license_token": "signed-token",
+            }
+
+    def fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["payload"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("license_client.license_api.requests.post", fake_post)
+
+    result = LicenseApiClient(base_url="http://license.local").register_device(
+        device_fingerprint_hash="device-a",
+    )
+
+    assert result.signed_license_token == "signed-token"
+    forbidden_keys = {
+        "campus_account",
+        "campus_account_hash",
+        "campus_account_masked",
+        "account_hash",
+        "account_masked",
+        "username",
+        "password",
+    }
+    assert forbidden_keys.isdisjoint(set(captured["payload"]))
 
 
 def test_token_store_round_trips_signed_license_token(tmp_path):
@@ -409,7 +447,6 @@ def test_bootstrap_success_initializes_and_saves_license_token(tmp_path):
             status="trial_active",
             signed_license_token=signed_license_token,
         ),
-        campus_account="202400001234",
     )
 
     assert decision.allowed is True

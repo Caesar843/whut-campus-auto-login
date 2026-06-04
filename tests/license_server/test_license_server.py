@@ -1,10 +1,12 @@
 import base64
+import sqlite3
 from datetime import datetime, timezone
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
 from fastapi.testclient import TestClient
 
+from license_server.db import initialize_database
 from license_server.app import create_app
 
 
@@ -46,8 +48,6 @@ def _register_payload(device_hash="device-a"):
         "device_name": "dev pc",
         "os": "Windows",
         "app_version": "0.1.0",
-        "campus_account_hash": "account-hash",
-        "campus_account_masked": "2024****1234",
     }
 
 
@@ -58,6 +58,85 @@ def test_health_endpoint_returns_service_status(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_devices_schema_excludes_campus_account_columns(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+
+    initialize_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(devices)").fetchall()
+        }
+    assert "campus_account_hash" not in columns
+    assert "campus_account_masked" not in columns
+
+
+def test_initialize_database_removes_legacy_campus_account_columns(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id TEXT NOT NULL,
+                device_fingerprint_hash TEXT NOT NULL UNIQUE,
+                device_name TEXT,
+                os TEXT,
+                app_version TEXT,
+                campus_account_hash TEXT,
+                campus_account_masked TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO devices (
+                product_id, device_fingerprint_hash, device_name, os, app_version,
+                campus_account_hash, campus_account_masked, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "whut-campus-auto-login",
+                "device-a",
+                "dev pc",
+                "Windows",
+                "0.1.0",
+                "account-hash",
+                "2024****1234",
+                "2026-06-04T00:00:00Z",
+                "2026-06-04T00:00:00Z",
+            ),
+        )
+
+    initialize_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(devices)").fetchall()
+        }
+        device = connection.execute(
+            "SELECT device_fingerprint_hash, app_version FROM devices"
+        ).fetchone()
+    assert "campus_account_hash" not in columns
+    assert "campus_account_masked" not in columns
+    assert device == ("device-a", "0.1.0")
+
+
+def test_register_device_rejects_campus_account_fields(tmp_path):
+    client, _public_key_b64_value = _client(tmp_path)
+    payload = _register_payload()
+    payload["campus_account_hash"] = "account-hash"
+    payload["campus_account_masked"] = "2024****1234"
+
+    response = client.post("/device/register", json=payload)
+
+    assert response.status_code == 422
 
 
 def test_register_new_device_issues_14_day_trial(tmp_path):

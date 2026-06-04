@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 from pathlib import Path
 from typing import Callable, Optional
 
 from campus_login.adapters.whut import WhutCampusLoginAdapter
-from campus_login.core.result import LoginResult, mask_account
+from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
 from campus_login.local_config import has_login_config
 
@@ -39,7 +38,6 @@ def check_license_before_login(
     public_key_b64: Optional[str] = None,
     device_fingerprint_hash: Optional[str] = None,
     api_client: Optional[Callable[[], LicenseApiResult]] = None,
-    campus_account: Optional[str] = None,
     saved_login_available_func: Callable[[], bool] = has_login_config,
     campus_network_probe_func: Optional[Callable[[], bool]] = None,
 ) -> LicenseDecision:
@@ -68,7 +66,6 @@ def check_license_before_login(
         api_client,
         device_fingerprint_hash=current_device_hash,
         needs_register=True,
-        campus_account=campus_account,
     )
     if not api_result.reachable:
         if _can_bootstrap_login(
@@ -99,7 +96,6 @@ def try_initialize_license_after_bootstrap_login(
     public_key_b64: Optional[str] = None,
     device_fingerprint_hash: Optional[str] = None,
     api_client: Optional[Callable[[], LicenseApiResult]] = None,
-    campus_account: Optional[str] = None,
 ) -> LicenseDecision:
     if not bootstrap_decision.bootstrap_required:
         return bootstrap_decision
@@ -109,7 +105,6 @@ def try_initialize_license_after_bootstrap_login(
         api_client,
         device_fingerprint_hash=current_device_hash,
         needs_register=True,
-        campus_account=campus_account,
     )
     if not api_result.reachable:
         return server_unreachable_decision()
@@ -208,17 +203,12 @@ def _call_api(
     *,
     device_fingerprint_hash: str,
     needs_register: bool,
-    campus_account: Optional[str],
 ) -> LicenseApiResult:
     if api_client is not None:
         return api_client()
     client = LicenseApiClient()
     if needs_register:
-        return client.register_device(
-            device_fingerprint_hash=device_fingerprint_hash,
-            campus_account_hash=_account_hash(campus_account),
-            campus_account_masked=mask_account(campus_account),
-        )
+        return client.register_device(device_fingerprint_hash=device_fingerprint_hash)
     return client.refresh_license(device_fingerprint_hash=device_fingerprint_hash)
 
 
@@ -248,12 +238,6 @@ def _missing_public_key_decision() -> LicenseDecision:
         reason="missing_public_key",
         message_for_ui="本地授权凭证无效，请联网刷新授权。",
     )
-
-
-def _account_hash(campus_account: Optional[str]) -> Optional[str]:
-    if not campus_account:
-        return None
-    return hashlib.sha256(str(campus_account).strip().encode("utf-8")).hexdigest()
 
 
 def _public_key_from_env() -> str:

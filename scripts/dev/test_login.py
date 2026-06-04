@@ -161,7 +161,7 @@ def main(
     if license_check_func is not None:
         license_decision = license_check_func()
     else:
-        license_decision = check_license_before_login(campus_account=username)
+        license_decision = check_license_before_login()
     if not license_decision.allowed:
         result = license_blocked_result(license_decision)
         print_result(result, username, password)
@@ -178,10 +178,7 @@ def main(
         result = login_with_adapter(factory(args.timeout), username, password)
     if result.ok and license_decision.bootstrap_required:
         license_sync = license_bootstrap_sync_func or try_initialize_license_after_bootstrap_login
-        license_sync(
-            bootstrap_decision=license_decision,
-            campus_account=username,
-        )
+        license_sync(bootstrap_decision=license_decision)
     print_result(result, username, password)
     return 0 if result.ok else 1
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from license_client.constants import PAID_LICENSE_DAYS, PRODUCT_ID, TRIAL_DAYS
 from license_server.db import connect
@@ -13,13 +13,13 @@ from license_server.signer import datetime_text, sign_license_payload, utc_now_t
 
 
 class DeviceRegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     product_id: str
     device_fingerprint_hash: str
     device_name: Optional[str] = None
     os: Optional[str] = None
     app_version: Optional[str] = None
-    campus_account_hash: Optional[str] = None
-    campus_account_masked: Optional[str] = None
 
 
 class LicenseRefreshRequest(BaseModel):
@@ -55,8 +55,8 @@ def create_router(*, database_path: Path, private_key_b64: str, admin_token: str
                     """
                     INSERT INTO devices (
                         product_id, device_fingerprint_hash, device_name, os, app_version,
-                        campus_account_hash, campus_account_masked, first_seen_at, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        first_seen_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         request.product_id,
@@ -64,8 +64,6 @@ def create_router(*, database_path: Path, private_key_b64: str, admin_token: str
                         request.device_name,
                         request.os,
                         request.app_version,
-                        request.campus_account_hash,
-                        request.campus_account_masked,
                         datetime_text(now),
                         datetime_text(now),
                     ),
@@ -84,9 +82,7 @@ def create_router(*, database_path: Path, private_key_b64: str, admin_token: str
                 connection.execute(
                     """
                     UPDATE devices
-                    SET last_seen_at = ?, app_version = ?, device_name = ?, os = ?,
-                        campus_account_hash = COALESCE(?, campus_account_hash),
-                        campus_account_masked = COALESCE(?, campus_account_masked)
+                    SET last_seen_at = ?, app_version = ?, device_name = ?, os = ?
                     WHERE id = ?
                     """,
                     (
@@ -94,8 +90,6 @@ def create_router(*, database_path: Path, private_key_b64: str, admin_token: str
                         request.app_version,
                         request.device_name,
                         request.os,
-                        request.campus_account_hash,
-                        request.campus_account_masked,
                         device_id,
                     ),
                 )

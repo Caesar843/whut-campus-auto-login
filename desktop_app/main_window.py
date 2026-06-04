@@ -140,21 +140,18 @@ class MainWindowController:
                 status=LoginStatus.UNKNOWN_ERROR,
                 message="请先输入校园网账号和密码。",
             )
-        license_decision = self._check_license_before_login(clean_username)
+        license_decision = self._check_license_before_login()
         if not license_decision.allowed:
             return license_blocked_result(license_decision)
         result = self._login_runner(clean_username, password)
         if result.ok and license_decision.bootstrap_required:
-            self._license_bootstrap_sync(
-                bootstrap_decision=license_decision,
-                campus_account=clean_username,
-            )
+            self._license_bootstrap_sync(bootstrap_decision=license_decision)
         return result
 
-    def _check_license_before_login(self, campus_account: str) -> LicenseDecision:
+    def _check_license_before_login(self) -> LicenseDecision:
         if self._license_check is not None:
             return self._license_check()
-        return check_license_before_login(campus_account=campus_account)
+        return check_license_before_login()
 
 
 class _LoginWorker(QObject):

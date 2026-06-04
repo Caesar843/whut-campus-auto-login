@@ -405,6 +405,6 @@ def test_script_bootstrap_login_success_syncs_license_without_printing_sensitive
     assert exit_code == 0
     assert len(sync_calls) == 1
     assert sync_calls[0]["bootstrap_decision"].bootstrap_required is True
-    assert sync_calls[0]["campus_account"] == "202400001234"
+    assert set(sync_calls[0]) == {"bootstrap_decision"}
     assert "secret-password" not in output
     assert "202400001234" not in output
