@@ -17,9 +17,11 @@ from campus_login.saved_login import (  # noqa: E402
     login_with_saved_config,
 )
 from license_client.license_guard import (  # noqa: E402
+    LicenseBootstrapSyncFunc,
     LicenseCheckFunc,
     check_license_before_login,
     license_blocked_result,
+    try_initialize_license_after_bootstrap_login,
 )
 
 
@@ -130,6 +132,7 @@ def main(
     argv: Optional[Sequence[str]] = None,
     config_loader: Optional[ConfigLoader] = None,
     license_check_func: Optional[LicenseCheckFunc] = None,
+    license_bootstrap_sync_func: Optional[LicenseBootstrapSyncFunc] = None,
 ) -> int:
     args = _build_parser().parse_args([] if argv is None else list(argv))
     source_env = os.environ if env is None else env
@@ -155,8 +158,10 @@ def main(
         print("Missing environment variables: WHUT_NET_USERNAME and WHUT_NET_PASSWORD")
         return 2
 
-    license_checker = license_check_func or check_license_before_login
-    license_decision = license_checker()
+    if license_check_func is not None:
+        license_decision = license_check_func()
+    else:
+        license_decision = check_license_before_login(campus_account=username)
     if not license_decision.allowed:
         result = license_blocked_result(license_decision)
         print_result(result, username, password)
@@ -171,6 +176,12 @@ def main(
         )
     else:
         result = login_with_adapter(factory(args.timeout), username, password)
+    if result.ok and license_decision.bootstrap_required:
+        license_sync = license_bootstrap_sync_func or try_initialize_license_after_bootstrap_login
+        license_sync(
+            bootstrap_decision=license_decision,
+            campus_account=username,
+        )
     print_result(result, username, password)
     return 0 if result.ok else 1
 

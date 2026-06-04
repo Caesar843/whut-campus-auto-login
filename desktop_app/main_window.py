@@ -35,10 +35,12 @@ from desktop_app.autostart.windows_startup import (
 )
 from desktop_app.widgets import AccountLineEdit, PasswordLineEdit, StatusLabel
 from license_client.license_guard import (
+    LicenseBootstrapSyncFunc,
     LicenseCheckFunc,
     check_license_before_login,
     get_current_license_state,
     license_blocked_result,
+    try_initialize_license_after_bootstrap_login,
 )
 from license_client.license_state import LicenseDecision
 
@@ -75,6 +77,7 @@ class MainWindowController:
         disable_autostart_func: Callable[[], bool] = disable_autostart,
         login_runner: Optional[LoginRunner] = None,
         license_check_func: Optional[LicenseCheckFunc] = None,
+        license_bootstrap_sync_func: Optional[LicenseBootstrapSyncFunc] = None,
         license_state_func: Optional[Callable[[], LicenseDecision]] = None,
     ):
         self._load_config = load_config_func
@@ -84,7 +87,10 @@ class MainWindowController:
         self._enable_autostart = enable_autostart_func
         self._disable_autostart = disable_autostart_func
         self._login_runner = login_runner or _default_login_runner
-        self._license_check = license_check_func or check_license_before_login
+        self._license_check = license_check_func
+        self._license_bootstrap_sync = (
+            license_bootstrap_sync_func or try_initialize_license_after_bootstrap_login
+        )
         self._license_state = license_state_func or get_current_license_state
 
     def load_state(self) -> MainWindowState:
@@ -134,10 +140,21 @@ class MainWindowController:
                 status=LoginStatus.UNKNOWN_ERROR,
                 message="请先输入校园网账号和密码。",
             )
-        license_decision = self._license_check()
+        license_decision = self._check_license_before_login(clean_username)
         if not license_decision.allowed:
             return license_blocked_result(license_decision)
-        return self._login_runner(clean_username, password)
+        result = self._login_runner(clean_username, password)
+        if result.ok and license_decision.bootstrap_required:
+            self._license_bootstrap_sync(
+                bootstrap_decision=license_decision,
+                campus_account=clean_username,
+            )
+        return result
+
+    def _check_license_before_login(self, campus_account: str) -> LicenseDecision:
+        if self._license_check is not None:
+            return self._license_check()
+        return check_license_before_login(campus_account=campus_account)
 
 
 class _LoginWorker(QObject):

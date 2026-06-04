@@ -9,9 +9,11 @@ from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
 from campus_login.saved_login import login_with_saved_config
 from license_client.license_guard import (
+    LicenseBootstrapSyncFunc,
     LicenseCheckFunc,
     check_license_before_login,
     license_blocked_result,
+    try_initialize_license_after_bootstrap_login,
 )
 
 
@@ -66,6 +68,7 @@ class TrayController:
         exit_func: Optional[ExitFunc] = None,
         on_status_changed: Optional[StatusChangedFunc] = None,
         license_check_func: Optional[LicenseCheckFunc] = None,
+        license_bootstrap_sync_func: Optional[LicenseBootstrapSyncFunc] = None,
     ):
         self._login_func = login_func or login_with_saved_config
         self._logout_func = logout_current_session
@@ -74,6 +77,9 @@ class TrayController:
         self._exit_func = exit_func or (lambda: None)
         self._on_status_changed = on_status_changed
         self._license_check = license_check_func or check_license_before_login
+        self._license_bootstrap_sync = (
+            license_bootstrap_sync_func or try_initialize_license_after_bootstrap_login
+        )
         self.status = TrayStatus.UNKNOWN
 
     @property
@@ -119,6 +125,8 @@ class TrayController:
             )
 
         next_status = TrayStatus.LOGGED_IN if result.ok else TrayStatus.LOGIN_FAILED
+        if result.ok and license_decision.bootstrap_required:
+            self._license_bootstrap_sync(bootstrap_decision=license_decision)
         self.set_status(next_status)
         return TrayActionResult(
             action=action,

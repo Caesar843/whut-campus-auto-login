@@ -23,6 +23,16 @@ def _allow_license():
     )
 
 
+def _bootstrap_license():
+    return LicenseDecision(
+        status=LicenseStateStatus.BOOTSTRAP_ALLOWED,
+        allowed=True,
+        reason="bootstrap_allowed",
+        message_for_ui="bootstrap",
+        bootstrap_required=True,
+    )
+
+
 def test_script_requires_environment_credentials(capsys):
     module = load_login_script()
 
@@ -365,5 +375,36 @@ def test_script_checks_license_before_login(capsys):
     assert "status: unknown_error" in output
     assert "error_code: LICENSE_BLOCKED" in output
     assert "授权已过期" in output
+    assert "secret-password" not in output
+    assert "202400001234" not in output
+
+
+def test_script_bootstrap_login_success_syncs_license_without_printing_sensitive_values(capsys):
+    module = load_login_script()
+    sync_calls = []
+
+    class FakeAdapter:
+        def login(self, username, password):
+            assert username == "202400001234"
+            assert password == "secret-password"
+            return LoginResult(status=LoginStatus.SUCCESS, message="ok")
+
+    exit_code = module.main(
+        env={
+            "WHUT_NET_USERNAME": "202400001234",
+            "WHUT_NET_PASSWORD": "secret-password",
+        },
+        adapter_factory=lambda timeout: FakeAdapter(),
+        argv=["--timeout", "0.1"],
+        license_check_func=_bootstrap_license,
+        license_bootstrap_sync_func=lambda **kwargs: sync_calls.append(kwargs)
+        or _allow_license(),
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert len(sync_calls) == 1
+    assert sync_calls[0]["bootstrap_decision"].bootstrap_required is True
+    assert sync_calls[0]["campus_account"] == "202400001234"
     assert "secret-password" not in output
     assert "202400001234" not in output

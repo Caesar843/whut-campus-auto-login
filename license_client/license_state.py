@@ -17,6 +17,7 @@ class LicenseStatus(str, Enum):
     REVOKED = "revoked"
     TOKEN_INVALID = "token_invalid"
     SERVER_UNREACHABLE = "server_unreachable"
+    BOOTSTRAP_ALLOWED = "bootstrap_allowed"
     CONFIG_ONLY = "config_only"
 
 
@@ -30,6 +31,7 @@ class LicenseDecision:
     days_remaining: Optional[int] = None
     message_for_ui: str = ""
     signed_license_token: Optional[str] = None
+    bootstrap_required: bool = False
 
 
 def evaluate_local_license(
@@ -66,8 +68,16 @@ def evaluate_local_license(
         )
 
     if verification.error == "expired":
-        status = LicenseStatus.PAID_EXPIRED if license_type in {"paid", "manual"} else LicenseStatus.TRIAL_EXPIRED
-        message = "授权状态：正式版已过期，请续费" if status == LicenseStatus.PAID_EXPIRED else "授权状态：试用已结束，请购买正式版"
+        status = (
+            LicenseStatus.PAID_EXPIRED
+            if license_type in {"paid", "manual"}
+            else LicenseStatus.TRIAL_EXPIRED
+        )
+        message = (
+            "正式授权已过期，请续费后继续使用。"
+            if status == LicenseStatus.PAID_EXPIRED
+            else "试用期已结束，请激活正式版后继续使用。"
+        )
         return LicenseDecision(
             status=status,
             allowed=False,
@@ -85,7 +95,7 @@ def evaluate_local_license(
             license_type=license_type or None,
             expires_at=expires_at,
             days_remaining=days_remaining,
-            message_for_ui="授权状态：授权异常，请联网刷新或联系开发者",
+            message_for_ui="本地授权凭证无效，请联网刷新授权。",
         )
     return LicenseDecision(
         status=LicenseStatus.TOKEN_INVALID,
@@ -94,7 +104,7 @@ def evaluate_local_license(
         license_type=license_type or None,
         expires_at=expires_at,
         days_remaining=days_remaining,
-        message_for_ui="授权状态：授权异常，请联网刷新或联系开发者",
+        message_for_ui="本地授权凭证无效，请联网刷新授权。",
     )
 
 
@@ -103,11 +113,15 @@ def uninitialized_decision() -> LicenseDecision:
         status=LicenseStatus.UNINITIALIZED,
         allowed=False,
         reason="missing_signed_license_token",
-        message_for_ui="授权状态：未初始化，请连接网络后获取试用资格",
+        message_for_ui="授权未初始化，且当前无法连接授权服务。请确认已连接武汉理工校园网，或先手动联网后重试。",
     )
 
 
-def server_unreachable_decision(*, allowed: bool = False, fallback: Optional[LicenseDecision] = None) -> LicenseDecision:
+def server_unreachable_decision(
+    *,
+    allowed: bool = False,
+    fallback: Optional[LicenseDecision] = None,
+) -> LicenseDecision:
     if allowed and fallback is not None:
         return LicenseDecision(
             status=LicenseStatus.SERVER_UNREACHABLE,
@@ -122,7 +136,17 @@ def server_unreachable_decision(*, allowed: bool = False, fallback: Optional[Lic
         status=LicenseStatus.SERVER_UNREACHABLE,
         allowed=False,
         reason="server_unreachable",
-        message_for_ui="授权状态：未初始化，请连接网络后获取试用资格",
+        message_for_ui="授权未初始化，且当前无法连接授权服务。请确认已连接武汉理工校园网，或先手动联网后重试。",
+    )
+
+
+def bootstrap_allowed_decision() -> LicenseDecision:
+    return LicenseDecision(
+        status=LicenseStatus.BOOTSTRAP_ALLOWED,
+        allowed=True,
+        reason="bootstrap_allowed",
+        message_for_ui="首次使用：将先尝试完成校园网登录，联网后自动获取试用资格。",
+        bootstrap_required=True,
     )
 
 
