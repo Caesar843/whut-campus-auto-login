@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Callable, Optional
+
+from campus_login.adapters.whut import WhutCampusLoginAdapter
+from campus_login.core.result import LoginResult
+from campus_login.core.status import LoginStatus
+from campus_login.local_config import has_login_config
+
+from license_client.constants import PRODUCT_ID
+from license_client.device_fingerprint import generate_device_fingerprint_hash
+from license_client.license_api import LicenseApiClient, LicenseApiResult
+from license_client.license_state import (
+    LicenseDecision,
+    LicenseStatus,
+    bootstrap_allowed_decision,
+    evaluate_local_license,
+    server_unreachable_decision,
+    uninitialized_decision,
+)
+from license_client.token_store import (
+    load_signed_license_token,
+    save_signed_license_token,
+)
+from license_client.token_verify import verify_signed_license_token
+
+
+LOGGER = logging.getLogger(__name__)
+LicenseCheckFunc = Callable[..., LicenseDecision]
+LicenseBootstrapSyncFunc = Callable[..., LicenseDecision]
+
+
+def check_license_before_login(
+    *,
+    token_path: Optional[Path] = None,
+    public_key_b64: Optional[str] = None,
+    device_fingerprint_hash: Optional[str] = None,
+    api_client: Optional[Callable[[], LicenseApiResult]] = None,
+    saved_login_available_func: Callable[[], bool] = has_login_config,
+    campus_network_probe_func: Optional[Callable[[], bool]] = None,
+) -> LicenseDecision:
+    current_device_hash = device_fingerprint_hash or generate_device_fingerprint_hash()
+    loaded = load_signed_license_token(token_path=token_path)
+    public_key = public_key_b64 or _public_key_from_env()
+
+    if loaded.signed_license_token:
+        if not public_key:
+            return _missing_public_key_decision()
+        return _verify_to_decision(
+            loaded.signed_license_token,
+            public_key_b64=public_key,
+            device_fingerprint_hash=current_device_hash,
+        )
+
+    if loaded.status == "corrupt":
+        return LicenseDecision(
+            status=LicenseStatus.TOKEN_INVALID,
+            allowed=False,
+            reason=loaded.error or "corrupt_token_file",
+            message_for_ui="本地授权凭证无效，请联网刷新授权。",
+        )
+
+    api_result = _call_api(
+        api_client,
+        device_fingerprint_hash=current_device_hash,
+        needs_register=True,
+    )
+    if not api_result.reachable:
+        if not _saved_login_available(saved_login_available_func):
+            return server_unreachable_decision(reason="missing_saved_login_config")
+        if _campus_network_available(
+            campus_network_probe_func or default_campus_network_probe
+        ):
+            return bootstrap_allowed_decision()
+        return server_unreachable_decision(
+            reason="bootstrap_portal_not_ready",
+            retryable=True,
+        )
+    if not api_result.signed_license_token:
+        return uninitialized_decision()
+    if not public_key:
+        return _missing_public_key_decision()
+
+    refreshed_decision = _verify_to_decision(
+        api_result.signed_license_token,
+        public_key_b64=public_key,
+        device_fingerprint_hash=current_device_hash,
+    )
+    if refreshed_decision.allowed:
+        save_signed_license_token(api_result.signed_license_token, token_path=token_path)
+    return refreshed_decision
+
+
+def try_initialize_license_after_bootstrap_login(
+    *,
+    bootstrap_decision: LicenseDecision,
+    token_path: Optional[Path] = None,
+    public_key_b64: Optional[str] = None,
+    device_fingerprint_hash: Optional[str] = None,
+    api_client: Optional[Callable[[], LicenseApiResult]] = None,
+) -> LicenseDecision:
+    if not bootstrap_decision.bootstrap_required:
+        return bootstrap_decision
+
+    current_device_hash = device_fingerprint_hash or generate_device_fingerprint_hash()
+    api_result = _call_api(
+        api_client,
+        device_fingerprint_hash=current_device_hash,
+        needs_register=True,
+    )
+    if not api_result.reachable:
+        return server_unreachable_decision()
+    if not api_result.signed_license_token:
+        return uninitialized_decision()
+
+    public_key = public_key_b64 or _public_key_from_env()
+    if not public_key:
+        return _missing_public_key_decision()
+
+    decision = _verify_to_decision(
+        api_result.signed_license_token,
+        public_key_b64=public_key,
+        device_fingerprint_hash=current_device_hash,
+    )
+    if decision.allowed:
+        save_signed_license_token(api_result.signed_license_token, token_path=token_path)
+    return decision
+
+
+def default_campus_network_probe(timeout: float = 1.5) -> bool:
+    try:
+        context = WhutCampusLoginAdapter(timeout=timeout, retry_delay=0).bootstrap_portal_context()
+    except Exception as exc:
+        LOGGER.info("Campus portal probe failed for bootstrap license flow: %s", exc.__class__.__name__)
+        return False
+    return bool(getattr(context, "portal_detected", False))
+
+
+def get_current_license_state(
+    *,
+    token_path: Optional[Path] = None,
+    public_key_b64: Optional[str] = None,
+    device_fingerprint_hash: Optional[str] = None,
+) -> LicenseDecision:
+    loaded = load_signed_license_token(token_path=token_path)
+    if not loaded.signed_license_token:
+        if loaded.status == "corrupt":
+            return LicenseDecision(
+                status=LicenseStatus.TOKEN_INVALID,
+                allowed=False,
+                reason=loaded.error or "corrupt_token_file",
+                message_for_ui="本地授权凭证无效，请联网刷新授权。",
+            )
+        return uninitialized_decision()
+    public_key = public_key_b64 or _public_key_from_env()
+    if not public_key:
+        return _missing_public_key_decision()
+    return _verify_to_decision(
+        loaded.signed_license_token,
+        public_key_b64=public_key,
+        device_fingerprint_hash=device_fingerprint_hash or generate_device_fingerprint_hash(),
+    )
+
+
+def license_blocked_result(decision: LicenseDecision) -> LoginResult:
+    return LoginResult(
+        status=LoginStatus.UNKNOWN_ERROR,
+        message=decision.message_for_ui or "License does not allow campus login.",
+        error_code="LICENSE_BLOCKED",
+        response_summary={
+            "license_status": decision.status.value,
+            "license_reason": decision.reason,
+        },
+    )
+
+
+def _verify_to_decision(
+    signed_license_token: str,
+    *,
+    public_key_b64: str,
+    device_fingerprint_hash: str,
+) -> LicenseDecision:
+    verification = verify_signed_license_token(
+        signed_license_token,
+        public_key_b64=public_key_b64,
+        current_device_fingerprint_hash=device_fingerprint_hash,
+        expected_product_id=PRODUCT_ID,
+    )
+    decision = evaluate_local_license(verification)
+    return LicenseDecision(
+        status=decision.status,
+        allowed=decision.allowed,
+        reason=decision.reason,
+        license_type=decision.license_type,
+        expires_at=decision.expires_at,
+        days_remaining=decision.days_remaining,
+        message_for_ui=decision.message_for_ui,
+        signed_license_token=signed_license_token if decision.allowed else None,
+        bootstrap_required=decision.bootstrap_required,
+        retryable=decision.retryable,
+    )
+
+
+def _call_api(
+    api_client: Optional[Callable[[], LicenseApiResult]],
+    *,
+    device_fingerprint_hash: str,
+    needs_register: bool,
+) -> LicenseApiResult:
+    if api_client is not None:
+        return api_client()
+    client = LicenseApiClient()
+    if needs_register:
+        return client.register_device(device_fingerprint_hash=device_fingerprint_hash)
+    return client.refresh_license(device_fingerprint_hash=device_fingerprint_hash)
+
+
+def _saved_login_available(saved_login_available_func: Callable[[], bool]) -> bool:
+    try:
+        return bool(saved_login_available_func())
+    except Exception as exc:
+        LOGGER.warning("Saved login availability check failed: %s", exc.__class__.__name__)
+        return False
+
+
+def _campus_network_available(campus_network_probe_func: Callable[[], bool]) -> bool:
+    try:
+        return bool(campus_network_probe_func())
+    except Exception as exc:
+        LOGGER.warning("Campus network probe failed: %s", exc.__class__.__name__)
+        return False
+
+
+def _missing_public_key_decision() -> LicenseDecision:
+    return LicenseDecision(
+        status=LicenseStatus.TOKEN_INVALID,
+        allowed=False,
+        reason="missing_public_key",
+        message_for_ui="本地授权凭证无效，请联网刷新授权。",
+    )
+
+
+def _public_key_from_env() -> str:
+    import os
+
+    return os.environ.get("LICENSE_PUBLIC_KEY", "").strip()
