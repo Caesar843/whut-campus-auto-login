@@ -12,6 +12,10 @@ from desktop_app.tray.controller import TrayController
 from license_client.license_state import LicenseDecision, LicenseStatus
 
 
+FAKE_ACCOUNT = "2024" + "00001234"
+FAKE_PASSWORD = "secret-" + "password"
+
+
 def _decision(allowed: bool) -> LicenseDecision:
     status = LicenseStatus.TRIAL_ACTIVE if allowed else LicenseStatus.TRIAL_EXPIRED
     return LicenseDecision(
@@ -30,6 +34,15 @@ def _bootstrap_decision() -> LicenseDecision:
         message_for_ui="bootstrap",
         bootstrap_required=True,
     )
+
+
+class FakeLogStore:
+    def __init__(self):
+        self.entries = []
+
+    def write(self, **kwargs):
+        self.entries.append(kwargs)
+        return True
 
 
 def test_main_window_login_is_blocked_before_runner_when_license_denies():
@@ -99,6 +112,39 @@ def test_main_window_bootstrap_login_failure_does_not_sync_license():
 
     assert result.status == LoginStatus.TIMEOUT
     assert sync_calls == []
+
+
+def test_main_window_logs_license_guard_allowed_blocked_and_bootstrap():
+    log_store = FakeLogStore()
+    blocked = MainWindowController(
+        login_runner=lambda username, password: LoginResult(
+            status=LoginStatus.SUCCESS,
+            message="ok",
+        ),
+        license_check_func=lambda: _decision(False),
+        log_store=log_store,
+    )
+
+    blocked.test_login(FAKE_ACCOUNT, FAKE_PASSWORD)
+
+    assert log_store.entries[-1]["event"] == "license_guard_blocked"
+    assert log_store.entries[-1]["action"] == "manual_login"
+
+    allowed = MainWindowController(
+        login_runner=lambda username, password: LoginResult(
+            status=LoginStatus.SUCCESS,
+            message="ok",
+        ),
+        license_check_func=lambda: _bootstrap_decision(),
+        license_bootstrap_sync_func=lambda **kwargs: _decision(True),
+        log_store=log_store,
+    )
+
+    allowed.test_login(FAKE_ACCOUNT, FAKE_PASSWORD)
+
+    events = [entry["event"] for entry in log_store.entries]
+    assert "license_guard_allowed" in events
+    assert "bootstrap_allowed" in events
 
 
 def test_tray_test_login_is_blocked_before_login_func_when_license_denies():

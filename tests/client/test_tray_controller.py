@@ -11,6 +11,14 @@ from desktop_app.tray.controller import TrayController, TrayStatus
 from license_client.license_state import LicenseDecision, LicenseStatus as LicenseStateStatus
 
 
+FAKE_ACCOUNT = "2024" + "00001234"
+FAKE_PASSWORD = "secret-" + "password"
+RAW_TOKEN = "raw-" + "token"
+RAW_SIGNED_TOKEN = "raw-signed-" + "token"
+RAW_COOKIE = "raw-" + "cookie"
+RAW_SESSION = "raw-" + "session"
+
+
 def _result(status):
     return LoginResult(status=status, message=f"{status.value} message")
 
@@ -32,6 +40,15 @@ def _deny_license(status, reason, *, retryable=False):
         message_for_ui="license blocked",
         retryable=retryable,
     )
+
+
+class FakeLogStore:
+    def __init__(self):
+        self.entries = []
+
+    def write(self, **kwargs):
+        self.entries.append(kwargs)
+        return True
 
 
 def test_status_text_starts_unknown_and_can_update():
@@ -423,6 +440,109 @@ def test_logout_exception_is_caught_and_marks_logout_failed():
     assert action_result.result is None
     assert "logout exploded" in action_result.message
     assert controller.status == TrayStatus.LOGOUT_FAILED
+
+
+def test_tray_controller_logs_manual_login_failure_and_failed_stage():
+    log_store = FakeLogStore()
+    controller = TrayController(
+        login_func=lambda: LoginResult(
+            status=LoginStatus.TIMEOUT,
+            message="timeout",
+            failed_stage="account_status",
+        ),
+        license_check_func=_allow_license,
+        log_store=log_store,
+    )
+
+    controller.test_login()
+
+    assert [entry["event"] for entry in log_store.entries] == [
+        "license_guard_allowed",
+        "manual_login_attempt",
+        "manual_login_failed",
+        "campus_login_failed_stage",
+    ]
+    assert log_store.entries[-1]["failed_stage"] == "account_status"
+    assert log_store.entries[-1]["failure_reason"] == LoginStatus.TIMEOUT.value
+
+
+def test_tray_controller_logs_startup_retry_states_without_breaking_recent_result():
+    log_store = FakeLogStore()
+    controller = TrayController(
+        login_func=lambda: _result(LoginStatus.TIMEOUT),
+        license_check_func=_allow_license,
+        log_store=log_store,
+    )
+
+    action_result = controller.startup_auto_login(retry_count=2)
+    controller.mark_startup_retrying(action_result)
+    controller.mark_startup_stopped(action_result)
+
+    assert controller.last_startup_auto_login_result.status == "stopped"
+    assert "startup_auto_login_attempt" in [entry["event"] for entry in log_store.entries]
+    assert "startup_auto_login_retrying" in [entry["event"] for entry in log_store.entries]
+    assert "startup_auto_login_stopped" in [entry["event"] for entry in log_store.entries]
+    assert log_store.entries[-1]["retry_count"] == 2
+
+
+def test_tray_controller_logs_license_blocked_without_calling_login():
+    calls = []
+    log_store = FakeLogStore()
+    controller = TrayController(
+        login_func=lambda: calls.append("login") or _result(LoginStatus.SUCCESS),
+        license_check_func=lambda: _deny_license(
+            LicenseStateStatus.TRIAL_EXPIRED,
+            "expired",
+        ),
+        log_store=log_store,
+    )
+
+    action_result = controller.test_login()
+
+    assert calls == []
+    assert action_result.result.error_code == "LICENSE_BLOCKED"
+    assert log_store.entries[-1]["event"] == "license_guard_blocked"
+    assert log_store.entries[-1]["failure_reason"] == "expired"
+
+
+def test_tray_controller_sanitizes_login_exception_message():
+    def login():
+        raise RuntimeError(
+            f"password={FAKE_PASSWORD} token={RAW_TOKEN} signed_token={RAW_SIGNED_TOKEN} "
+            f"cookie={RAW_COOKIE} session={RAW_SESSION} account={FAKE_ACCOUNT}"
+        )
+
+    controller = TrayController(login_func=login, license_check_func=_allow_license)
+
+    action_result = controller.test_login()
+
+    for forbidden in (
+        FAKE_PASSWORD,
+        RAW_TOKEN,
+        RAW_SIGNED_TOKEN,
+        RAW_COOKIE,
+        RAW_SESSION,
+        FAKE_ACCOUNT,
+    ):
+        assert forbidden not in action_result.message
+
+
+def test_tray_controller_logs_logout_success_and_failure():
+    log_store = FakeLogStore()
+    results = iter(
+        [
+            _result(LoginStatus.LOGOUT_SUCCESS),
+            LoginResult(status=LoginStatus.LOGOUT_FAILED, message="failed"),
+        ]
+    )
+    controller = TrayController(logout_func=lambda: next(results), log_store=log_store)
+
+    controller.logout()
+    controller.logout()
+
+    assert "logout_attempt" in [entry["event"] for entry in log_store.entries]
+    assert "logout_success" in [entry["event"] for entry in log_store.entries]
+    assert "logout_failed" in [entry["event"] for entry in log_store.entries]
 
 
 def test_exit_action_invokes_callback():

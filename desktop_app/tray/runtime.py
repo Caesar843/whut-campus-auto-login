@@ -8,7 +8,13 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon, QWidget
 
+from desktop_app.log_window import RuntimeLogWindow
 from desktop_app.main_window import create_main_window
+from desktop_app.runtime_logs import (
+    RuntimeLogStore,
+    get_default_log_store,
+    safe_exception_message,
+)
 from desktop_app.tray.controller import (
     TrayActionResult,
     TrayController,
@@ -148,7 +154,7 @@ class _ActionWorker(QObject):
             result = TrayActionResult(
                 action="worker",
                 status=TrayStatus.UNKNOWN,
-                message=str(exc)[:240] or exc.__class__.__name__,
+                message=safe_exception_message(exc),
             )
         self.finished.emit(result)
 
@@ -162,17 +168,28 @@ class TrayRuntime(QObject):
         *,
         controller: Optional[TrayController] = None,
         main_window_factory: Optional[MainWindowFactory] = None,
+        log_store: Optional[RuntimeLogStore] = None,
     ):
         super().__init__()
         self._app = app
         self._threads = []
         self._workers = []
         self._action_running = False
+        self._log_store = log_store or get_default_log_store()
+        self._log_store.cleanup()
+        self._log_store.write(
+            event="app_start",
+            action="tray_start",
+            status="started",
+            safe_message="Application started.",
+        )
         self._main_window_factory = main_window_factory or create_main_window
         self._main_window: Optional[QWidget] = None
+        self._log_window: Optional[RuntimeLogWindow] = None
         self._controller = controller or TrayController(
             exit_func=app.quit,
             on_status_changed=self.status_changed.emit,
+            log_store=self._log_store,
         )
         self._startup_retry = StartupAutoLoginRetryCoordinator(
             controller=self._controller,
@@ -199,6 +216,15 @@ class TrayRuntime(QObject):
         self._main_window.activateWindow()
         return self._main_window
 
+    def show_runtime_logs(self) -> RuntimeLogWindow:
+        if self._log_window is None:
+            self._log_window = RuntimeLogWindow(log_store=self._log_store)
+        self._log_window.refresh_logs()
+        self._log_window.show()
+        self._log_window.raise_()
+        self._log_window.activateWindow()
+        return self._log_window
+
     @property
     def controller(self) -> TrayController:
         return self._controller
@@ -220,6 +246,8 @@ class TrayRuntime(QObject):
 
         open_window_action = self._menu.addAction("打开主界面")
         open_window_action.triggered.connect(self.show_main_window)
+        runtime_logs_action = self._menu.addAction("查看运行日志")
+        runtime_logs_action.triggered.connect(self.show_runtime_logs)
         self._menu.addSeparator()
 
         test_login_action = self._menu.addAction("测试登录")
@@ -324,6 +352,7 @@ def run_tray_app(
     *,
     controller: Optional[TrayController] = None,
     main_window_factory: Optional[MainWindowFactory] = None,
+    log_store: Optional[RuntimeLogStore] = None,
 ) -> int:
     clean_argv = _qt_argv(argv)
     app = QApplication.instance()
@@ -335,6 +364,7 @@ def run_tray_app(
         app,
         controller=controller,
         main_window_factory=main_window_factory,
+        log_store=log_store,
     )
     runtime.show()
     if should_show_main_window(argv):
@@ -342,6 +372,7 @@ def run_tray_app(
     schedule_startup_auto_login_if_requested(
         argv,
         start_startup_auto_login=runtime.start_startup_auto_login,
+        log_store=runtime._log_store,
     )
     app._whut_tray_runtime = runtime
     return int(app.exec())
@@ -355,8 +386,16 @@ def schedule_startup_auto_login_if_requested(
     argv: Optional[Sequence[str]],
     *,
     start_startup_auto_login: Callable[[], None],
+    log_store: Optional[RuntimeLogStore] = None,
 ) -> None:
     if STARTUP_TRAY_ARG in set(argv or []):
+        if log_store is not None:
+            log_store.write(
+                event="startup_auto_login_scheduled",
+                action="startup_auto_login",
+                status="scheduled",
+                safe_message="Startup auto login scheduled.",
+            )
         start_startup_auto_login()
 
 

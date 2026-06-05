@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from PySide6.QtWidgets import QApplication, QLineEdit
 
+from desktop_app.log_window import RuntimeLogWindow
 from desktop_app.main_window import MainWindow, MainWindowController
 from desktop_app.widgets import AccountLineEdit, PasswordLineEdit
 
@@ -28,6 +29,17 @@ class FakeConfig:
     auto_login_enabled = True
     config_exists = True
     credential_exists = True
+
+
+class FakeLogStore:
+    def read_recent(self, limit=80):
+        return []
+
+    def build_diagnostic_text(self, limit=30):
+        return "诊断信息"
+
+    def clear(self):
+        return True
 
 
 def test_password_field_is_hidden_by_default_and_toggles_visibility():
@@ -58,6 +70,43 @@ def test_account_field_has_placeholder_and_leading_action():
 
     assert "校园网账号" in field.placeholderText()
     assert field.actions()
+
+
+def test_main_window_has_runtime_log_entry_button_and_preserves_pricing_copy():
+    _app()
+    controller = MainWindowController(
+        load_config_func=lambda: FakeConfig(),
+        is_autostart_enabled_func=lambda: True,
+    )
+
+    window = MainWindow(controller=controller)
+
+    assert window.runtime_logs_button.text() == "查看运行日志"
+    assert "免费试用 14 天" in window.notice_label.text()
+    assert "9.9 元" in window.notice_label.text()
+    assert ("8" + ".88") not in window.notice_label.text()
+    assert ("免费试用 " + "7 天") not in window.notice_label.text()
+
+
+def test_main_window_reuses_independent_runtime_log_window():
+    _app()
+    log_store = FakeLogStore()
+    controller = MainWindowController(
+        load_config_func=lambda: FakeConfig(),
+        is_autostart_enabled_func=lambda: True,
+        log_store=log_store,
+    )
+    window = MainWindow(controller=controller)
+
+    window._show_runtime_logs()
+    first = window._log_window
+    window._show_runtime_logs()
+
+    assert window._log_window is first
+    assert isinstance(first, RuntimeLogWindow)
+    assert first.isWindow() is True
+    assert first.parent() is None
+    assert window.findChildren(RuntimeLogWindow) == []
 
 
 def test_main_window_initializes_fields_from_controller():

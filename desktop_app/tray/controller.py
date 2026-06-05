@@ -9,6 +9,11 @@ from campus_login.core.client import logout_with_adapter
 from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
 from campus_login.saved_login import login_with_saved_config
+from desktop_app.runtime_logs import (
+    RuntimeLogStore,
+    get_default_log_store,
+    safe_exception_message,
+)
 from license_client.license_guard import (
     LicenseBootstrapSyncFunc,
     LicenseCheckFunc,
@@ -86,6 +91,7 @@ class TrayController:
         on_status_changed: Optional[StatusChangedFunc] = None,
         license_check_func: Optional[LicenseCheckFunc] = None,
         license_bootstrap_sync_func: Optional[LicenseBootstrapSyncFunc] = None,
+        log_store: Optional[RuntimeLogStore] = None,
     ):
         self._login_func = login_func or login_with_saved_config
         self._logout_func = logout_current_session
@@ -97,6 +103,7 @@ class TrayController:
         self._license_bootstrap_sync = (
             license_bootstrap_sync_func or try_initialize_license_after_bootstrap_login
         )
+        self._log_store = log_store or get_default_log_store()
         self.status = TrayStatus.UNKNOWN
         self.last_startup_auto_login_result: Optional[RecentAutoLoginResult] = None
 
@@ -150,6 +157,15 @@ class TrayController:
         except Exception as exc:
             LOGGER.exception("Tray license check failed.")
             self.set_status(TrayStatus.LOGIN_FAILED)
+            self._write_log(
+                event="license_guard_blocked",
+                action=_log_action(action),
+                status="blocked",
+                failed_stage="license_check",
+                failure_reason="license_check_error",
+                retry_count=retry_count,
+                safe_message=_safe_exception_message(exc),
+            )
             return TrayActionResult(
                 action=action,
                 status=self.status,
@@ -161,6 +177,19 @@ class TrayController:
         if not license_decision.allowed:
             self.set_status(TrayStatus.LOGIN_FAILED)
             blocked_result = license_blocked_result(license_decision)
+            self._write_license_decision_log(
+                event="license_guard_blocked",
+                action=_log_action(action),
+                decision=license_decision,
+                retry_count=retry_count,
+            )
+            if license_decision.reason == "bootstrap_portal_not_ready":
+                self._write_license_decision_log(
+                    event="bootstrap_portal_not_ready",
+                    action=_log_action(action),
+                    decision=license_decision,
+                    retry_count=retry_count,
+                )
             return TrayActionResult(
                 action=action,
                 status=self.status,
@@ -171,11 +200,39 @@ class TrayController:
                 failed_stage=_license_failure_stage(license_decision.reason),
                 retry_count=retry_count,
             )
+        self._write_license_decision_log(
+            event="license_guard_allowed",
+            action=_log_action(action),
+            decision=license_decision,
+            retry_count=retry_count,
+        )
+        if license_decision.bootstrap_required:
+            self._write_license_decision_log(
+                event="bootstrap_allowed",
+                action=_log_action(action),
+                decision=license_decision,
+                retry_count=retry_count,
+            )
+        self._write_log(
+            event=_login_attempt_event(action),
+            action=_log_action(action),
+            status="started",
+            retry_count=retry_count,
+            safe_message="Campus login attempt started.",
+        )
         try:
             result = self._login_func()
         except Exception as exc:
             LOGGER.exception("Tray login action failed.")
             self.set_status(TrayStatus.LOGIN_FAILED)
+            self._write_log(
+                event=_login_result_event(action, success=False),
+                action=_log_action(action),
+                status="failed",
+                failure_reason="login_exception",
+                retry_count=retry_count,
+                safe_message=_safe_exception_message(exc),
+            )
             return TrayActionResult(
                 action=action,
                 status=self.status,
@@ -188,6 +245,7 @@ class TrayController:
         if result.ok and license_decision.bootstrap_required:
             self._license_bootstrap_sync(bootstrap_decision=license_decision)
         self.set_status(next_status)
+        self._write_login_result_log(result, action=action, retry_count=retry_count)
         return TrayActionResult(
             action=action,
             status=self.status,
@@ -201,10 +259,28 @@ class TrayController:
 
     def mark_startup_retrying(self, result: TrayActionResult) -> None:
         self._record_startup_result(result, "retrying")
+        self._write_log(
+            event="startup_auto_login_retrying",
+            action="startup_auto_login",
+            status="retrying",
+            failed_stage=result.failed_stage,
+            failure_reason=result.failure_reason,
+            retry_count=result.retry_count,
+            safe_message=result.message,
+        )
         self.set_status(TrayStatus.RETRYING)
 
     def mark_startup_stopped(self, result: TrayActionResult) -> None:
         self._record_startup_result(result, "stopped")
+        self._write_log(
+            event="startup_auto_login_stopped",
+            action="startup_auto_login",
+            status="stopped",
+            failed_stage=result.failed_stage,
+            failure_reason=result.failure_reason,
+            retry_count=result.retry_count,
+            safe_message=result.message,
+        )
         self.set_status(TrayStatus.STOPPED)
 
     def _record_startup_result(self, result: TrayActionResult, status: str) -> None:
@@ -218,12 +294,25 @@ class TrayController:
         )
 
     def logout(self) -> TrayActionResult:
+        self._write_log(
+            event="logout_attempt",
+            action="logout",
+            status="started",
+            safe_message="Campus logout attempt started.",
+        )
         self.set_status(TrayStatus.LOGGING_OUT)
         try:
             result = self._logout_func()
         except Exception as exc:
             LOGGER.exception("Tray logout action failed.")
             self.set_status(TrayStatus.LOGOUT_FAILED)
+            self._write_log(
+                event="logout_failed",
+                action="logout",
+                status="failed",
+                failure_reason="logout_exception",
+                safe_message=_safe_exception_message(exc),
+            )
             return TrayActionResult(
                 action="logout",
                 status=self.status,
@@ -232,6 +321,7 @@ class TrayController:
 
         next_status = _status_from_logout_result(result)
         self.set_status(next_status)
+        self._write_logout_result_log(result)
         return TrayActionResult(
             action="logout",
             status=self.status,
@@ -244,12 +334,22 @@ class TrayController:
         if not license_decision.allowed:
             self.set_status(TrayStatus.LOGIN_FAILED)
             blocked_result = license_blocked_result(license_decision)
+            self._write_license_decision_log(
+                event="license_guard_blocked",
+                action="relogin",
+                decision=license_decision,
+            )
             return TrayActionResult(
                 action="relogin",
                 status=self.status,
                 message=blocked_result.message,
                 result=blocked_result,
             )
+        self._write_license_decision_log(
+            event="license_guard_allowed",
+            action="relogin",
+            decision=license_decision,
+        )
         logout_result = self.logout()
         if logout_result.status != TrayStatus.LOGGED_OUT:
             return TrayActionResult(
@@ -265,6 +365,77 @@ class TrayController:
             message=login_result.message,
             result=login_result.result,
         )
+
+    def _write_license_decision_log(
+        self,
+        *,
+        event: str,
+        action: str,
+        decision,
+        retry_count: int = 0,
+    ) -> None:
+        self._write_log(
+            event=event,
+            action=action,
+            status="allowed" if decision.allowed else "blocked",
+            failed_stage=None if decision.allowed else _license_failure_stage(decision.reason),
+            failure_reason=None if decision.allowed else decision.reason,
+            retry_count=retry_count,
+            safe_message=decision.message_for_ui or decision.reason,
+        )
+
+    def _write_login_result_log(
+        self,
+        result: LoginResult,
+        *,
+        action: str,
+        retry_count: int,
+    ) -> None:
+        response_code, response_msg = _response_summary(result)
+        self._write_log(
+            event=_login_result_event(action, success=result.ok),
+            action=_log_action(action),
+            status="success" if result.ok else "failed",
+            failed_stage=result.failed_stage,
+            failure_reason=None if result.ok else (result.error_code or result.status.value),
+            retry_count=retry_count,
+            safe_message=result.message,
+            http_status=result.http_status,
+            response_code=response_code,
+            response_msg=response_msg,
+        )
+        if not result.ok and result.failed_stage:
+            self._write_log(
+                event="campus_login_failed_stage",
+                action=_log_action(action),
+                status="failed",
+                failed_stage=result.failed_stage,
+                failure_reason=result.error_code or result.status.value,
+                retry_count=retry_count,
+                safe_message=result.message,
+                response_msg=response_msg,
+            )
+
+    def _write_logout_result_log(self, result: LoginResult) -> None:
+        response_code, response_msg = _response_summary(result)
+        success = result.status in {LoginStatus.LOGOUT_SUCCESS, LoginStatus.LOGOUT_NOT_ONLINE}
+        self._write_log(
+            event="logout_success" if success else "logout_failed",
+            action="logout",
+            status="success" if success else "failed",
+            failed_stage=result.failed_stage,
+            failure_reason=None if success else (result.error_code or result.status.value),
+            safe_message=result.message,
+            http_status=result.http_status,
+            response_code=response_code,
+            response_msg=response_msg,
+        )
+
+    def _write_log(self, **kwargs) -> None:
+        try:
+            self._log_store.write(**kwargs)
+        except Exception:
+            LOGGER.exception("Runtime log write failed.")
 
     def request_exit(self) -> None:
         self._exit_func()
@@ -294,8 +465,40 @@ def _is_logout_pending_confirmation(result: LoginResult) -> bool:
     return False
 
 
+def _log_action(action: str) -> str:
+    if action == "startup_auto_login":
+        return "startup_auto_login"
+    if action == "relogin":
+        return "relogin"
+    return "manual_login"
+
+
+def _login_attempt_event(action: str) -> str:
+    if action == "startup_auto_login":
+        return "startup_auto_login_attempt"
+    return "manual_login_attempt"
+
+
+def _login_result_event(action: str, *, success: bool) -> str:
+    if action == "startup_auto_login":
+        return "startup_auto_login_success" if success else "manual_login_failed"
+    return "manual_login_success" if success else "manual_login_failed"
+
+
+def _response_summary(result: LoginResult) -> tuple[object, str]:
+    summary = result.response_summary or {}
+    if not isinstance(summary, dict):
+        return None, ""
+    if "logout" in summary and isinstance(summary["logout"], dict):
+        summary = summary["logout"]
+    return (
+        summary.get("code"),
+        str(summary.get("msg") or summary.get("message") or summary.get("error") or ""),
+    )
+
+
 def _safe_exception_message(exc: Exception) -> str:
-    return str(exc)[:240] or exc.__class__.__name__
+    return safe_exception_message(exc)
 
 
 _RETRYABLE_STARTUP_LOGIN_STATUSES = {

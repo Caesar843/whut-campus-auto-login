@@ -33,6 +33,12 @@ from desktop_app.autostart.windows_startup import (
     enable_autostart,
     is_autostart_enabled,
 )
+from desktop_app.log_window import RuntimeLogWindow
+from desktop_app.runtime_logs import (
+    RuntimeLogStore,
+    get_default_log_store,
+    safe_exception_message,
+)
 from desktop_app.widgets import AccountLineEdit, PasswordLineEdit, StatusLabel
 from license_client.license_guard import (
     LicenseBootstrapSyncFunc,
@@ -79,6 +85,7 @@ class MainWindowController:
         license_check_func: Optional[LicenseCheckFunc] = None,
         license_bootstrap_sync_func: Optional[LicenseBootstrapSyncFunc] = None,
         license_state_func: Optional[Callable[[], LicenseDecision]] = None,
+        log_store: Optional[RuntimeLogStore] = None,
     ):
         self._load_config = load_config_func
         self._save_config = save_config_func
@@ -92,6 +99,11 @@ class MainWindowController:
             license_bootstrap_sync_func or try_initialize_license_after_bootstrap_login
         )
         self._license_state = license_state_func or get_current_license_state
+        self._log_store = log_store or get_default_log_store()
+
+    @property
+    def log_store(self) -> RuntimeLogStore:
+        return self._log_store
 
     def load_state(self) -> MainWindowState:
         config = self._load_config()
@@ -136,14 +148,51 @@ class MainWindowController:
     def test_login(self, username: str, password: str) -> LoginResult:
         clean_username = str(username or "").strip()
         if not clean_username or not password:
+            self._write_log(
+                event="manual_login_failed",
+                action="manual_login",
+                status="failed",
+                failure_reason="missing_credentials",
+                safe_message="Please enter campus account and password before testing login.",
+            )
             return LoginResult(
                 status=LoginStatus.UNKNOWN_ERROR,
                 message="请先输入校园网账号和密码。",
             )
+        self._write_log(
+            event="manual_login_attempt",
+            action="manual_login",
+            status="started",
+            safe_message="Manual campus login test started.",
+            password=password,
+        )
         license_decision = self._check_license_before_login()
         if not license_decision.allowed:
+            self._write_license_decision_log(
+                event="license_guard_blocked",
+                action="manual_login",
+                decision=license_decision,
+            )
             return license_blocked_result(license_decision)
+        self._write_license_decision_log(
+            event="license_guard_allowed",
+            action="manual_login",
+            decision=license_decision,
+        )
+        if license_decision.bootstrap_required:
+            self._write_license_decision_log(
+                event="bootstrap_allowed",
+                action="manual_login",
+                decision=license_decision,
+            )
         result = self._login_runner(clean_username, password)
+        self._write_login_result_log(
+            result,
+            action="manual_login",
+            success_event="manual_login_success",
+            failed_event="manual_login_failed",
+            password=password,
+        )
         if result.ok and license_decision.bootstrap_required:
             self._license_bootstrap_sync(bootstrap_decision=license_decision)
         return result
@@ -152,6 +201,62 @@ class MainWindowController:
         if self._license_check is not None:
             return self._license_check()
         return check_license_before_login()
+
+    def _write_license_decision_log(
+        self,
+        *,
+        event: str,
+        action: str,
+        decision: LicenseDecision,
+    ) -> None:
+        self._write_log(
+            event=event,
+            action=action,
+            status="allowed" if decision.allowed else "blocked",
+            failure_reason=None if decision.allowed else decision.reason,
+            safe_message=decision.message_for_ui or decision.reason,
+        )
+
+    def _write_login_result_log(
+        self,
+        result: LoginResult,
+        *,
+        action: str,
+        success_event: str,
+        failed_event: str,
+        password: str,
+    ) -> None:
+        response_code, response_msg = _response_summary(result)
+        event = success_event if result.ok else failed_event
+        self._write_log(
+            event=event,
+            action=action,
+            status="success" if result.ok else "failed",
+            failed_stage=result.failed_stage,
+            failure_reason=None if result.ok else (result.error_code or result.status.value),
+            safe_message=result.message,
+            http_status=result.http_status,
+            response_code=response_code,
+            response_msg=response_msg,
+            password=password,
+        )
+        if not result.ok and result.failed_stage:
+            self._write_log(
+                event="campus_login_failed_stage",
+                action=action,
+                status="failed",
+                failed_stage=result.failed_stage,
+                failure_reason=result.error_code or result.status.value,
+                safe_message=result.message,
+                response_msg=response_msg,
+                password=password,
+            )
+
+    def _write_log(self, **kwargs) -> None:
+        try:
+            self._log_store.write(**kwargs)
+        except Exception:
+            LOGGER.exception("Runtime log write failed.")
 
 
 class _LoginWorker(QObject):
@@ -171,7 +276,7 @@ class _LoginWorker(QObject):
             LOGGER.exception("Main window login test failed.")
             result = LoginResult(
                 status=LoginStatus.UNKNOWN_ERROR,
-                message=str(exc)[:240] or exc.__class__.__name__,
+                message=safe_exception_message(exc),
             )
         self.finished.emit(result)
 
@@ -187,6 +292,7 @@ class MainWindow(QMainWindow):
         self._controller = controller or MainWindowController()
         self._thread: Optional[QThread] = None
         self._worker: Optional[_LoginWorker] = None
+        self._log_window: Optional[RuntimeLogWindow] = None
         self._build_ui()
         self.load_state()
 
@@ -270,23 +376,30 @@ class MainWindow(QMainWindow):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             actions.addWidget(button)
         card_layout.addLayout(actions)
+        self.runtime_logs_button = QPushButton("查看运行日志")
+        self.runtime_logs_button.setObjectName("runtimeLogsButton")
+        self.runtime_logs_button.setMinimumHeight(38)
+        self.runtime_logs_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        card_layout.addWidget(self.runtime_logs_button)
         layout.addWidget(card)
 
         notice = QLabel(
             "说明：本工具会在电脑已连接武汉理工校园网环境后，自动完成校园网认证登录。\n"
             "它不会自动选择 Wi-Fi、绕过验证码或突破校园网设备限制。\n"
             "校园网账号密码仅保存在本机，不会上传服务器。\n\n"
-            "付费说明：免费试用 7 天。试用结束后，8.88 元 / 年。"
+            "付费说明：免费试用 14 天。试用结束后，9.9 元 / 年。"
             "支付成功后会自动激活正式版，无需输入激活码。"
         )
         notice.setObjectName("notice")
         notice.setWordWrap(True)
-        layout.addWidget(notice)
+        self.notice_label = notice
+        layout.addWidget(self.notice_label)
         layout.addStretch(1)
 
         self.save_button.clicked.connect(self._save_config)
         self.test_button.clicked.connect(self._start_test_login)
         self.clear_button.clicked.connect(self._confirm_clear_config)
+        self.runtime_logs_button.clicked.connect(self._show_runtime_logs)
 
         self.setCentralWidget(root)
         self.setStyleSheet(_style_sheet())
@@ -365,6 +478,13 @@ class MainWindow(QMainWindow):
         self._set_status(message, "success")
         self.license_label.setText(LICENSE_PLACEHOLDER)
 
+    @Slot()
+    def _show_runtime_logs(self) -> None:
+        if self._log_window is None:
+            self._log_window = RuntimeLogWindow(log_store=self._controller.log_store)
+        self._log_window.refresh_logs()
+        self._log_window.show_for_owner(self)
+
     def _set_status(self, text: str, variant: str) -> None:
         self.status_label.setText(text)
         self.status_label.set_variant(variant)
@@ -402,6 +522,16 @@ def login_result_display(result: LoginResult) -> tuple[str, str]:
     return f"登录失败：{result.message}", "error"
 
 
+def _response_summary(result: LoginResult) -> tuple[object, str]:
+    summary = result.response_summary or {}
+    if not isinstance(summary, dict):
+        return None, ""
+    return (
+        summary.get("code"),
+        str(summary.get("msg") or summary.get("message") or summary.get("error") or ""),
+    )
+
+
 def _default_login_runner(username: str, password: str) -> LoginResult:
     return login_with_adapter(
         WhutCampusLoginAdapter(timeout=5.0),
@@ -417,7 +547,7 @@ def _field_label(text: str) -> QLabel:
 
 
 def _safe_message(exc: Exception) -> str:
-    return str(exc)[:240] or exc.__class__.__name__
+    return safe_exception_message(exc)
 
 
 def _license_variant(decision: LicenseDecision) -> str:

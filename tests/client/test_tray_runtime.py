@@ -1,10 +1,15 @@
 from pathlib import Path
+import os
 import sys
 from types import SimpleNamespace
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from PySide6.QtWidgets import QApplication, QWidget
 
 from desktop_app.tray import runtime
 from desktop_app.tray.controller import TrayActionResult, TrayStatus
@@ -57,6 +62,72 @@ class RejectingAttemptStarter:
         return False
 
 
+class FakeTrayLogStore:
+    def __init__(self):
+        self.entries = []
+        self.cleanup_calls = 0
+
+    def cleanup(self):
+        self.cleanup_calls += 1
+        return True
+
+    def write(self, **kwargs):
+        self.entries.append(kwargs)
+        return True
+
+    def read_recent(self, limit=80):
+        return []
+
+    def build_diagnostic_text(self, limit=30):
+        return "诊断信息"
+
+    def clear(self):
+        return True
+
+
+class FakeTrayController:
+    status = TrayStatus.UNKNOWN
+    status_menu_text = "状态：未知"
+
+    def __init__(self):
+        self.test_login_calls = 0
+        self.logout_calls = 0
+        self.relogin_calls = 0
+        self.exit_calls = 0
+
+    def test_login(self):
+        self.test_login_calls += 1
+        return action_result()
+
+    def logout(self):
+        self.logout_calls += 1
+        return action_result()
+
+    def relogin(self):
+        self.relogin_calls += 1
+        return action_result()
+
+    def startup_auto_login(self, retry_count=1):
+        return action_result()
+
+    def mark_startup_retrying(self, result):
+        pass
+
+    def mark_startup_stopped(self, result):
+        pass
+
+    def request_exit(self):
+        self.exit_calls += 1
+
+
+def _app():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(["test-tray-runtime"])
+    app.setQuitOnLastWindowClosed(False)
+    return app
+
+
 def action_result(*, status=TrayStatus.LOGIN_FAILED, retryable=False, reason=None):
     return TrayActionResult(
         action="startup_auto_login",
@@ -91,6 +162,27 @@ def test_startup_tray_argument_starts_retry_coordinator():
     )
 
     assert calls == ["start"]
+
+
+def test_startup_tray_argument_logs_scheduled_event_without_changing_coordinator_start():
+    calls = []
+    log_store = FakeTrayLogStore()
+
+    runtime.schedule_startup_auto_login_if_requested(
+        ["--startup-tray"],
+        start_startup_auto_login=lambda: calls.append("start"),
+        log_store=log_store,
+    )
+
+    assert calls == ["start"]
+    assert log_store.entries == [
+        {
+            "event": "startup_auto_login_scheduled",
+            "action": "startup_auto_login",
+            "status": "scheduled",
+            "safe_message": "Startup auto login scheduled.",
+        }
+    ]
 
 
 def test_plain_tray_start_does_not_start_retry_coordinator():
@@ -251,3 +343,28 @@ def test_manual_action_cancels_pending_startup_retry():
 def test_plain_start_shows_main_window_but_startup_tray_does_not():
     assert runtime.should_show_main_window([]) is True
     assert runtime.should_show_main_window(["--startup-tray"]) is False
+
+
+def test_tray_runtime_menu_contains_runtime_logs_and_opens_independent_window():
+    app = _app()
+    controller = FakeTrayController()
+    log_store = FakeTrayLogStore()
+    tray_runtime = runtime.TrayRuntime(
+        app,
+        controller=controller,
+        main_window_factory=QWidget,
+        log_store=log_store,
+    )
+
+    menu_texts = [action.text() for action in tray_runtime._menu.actions()]
+    first = tray_runtime.show_runtime_logs()
+    second = tray_runtime.show_runtime_logs()
+
+    assert "查看运行日志" in menu_texts
+    assert first is second
+    assert first.isWindow() is True
+    assert first.parent() is None
+    assert controller.test_login_calls == 0
+    assert controller.logout_calls == 0
+    assert controller.relogin_calls == 0
+    tray_runtime._tray.hide()
