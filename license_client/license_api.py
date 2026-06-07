@@ -8,7 +8,7 @@ from typing import Any, Mapping, Optional
 
 import requests
 
-from license_client.constants import APP_VERSION, DEFAULT_LICENSE_SERVER_URL, PRODUCT_ID
+from license_client.constants import APP_VERSION, PRODUCT_ID, resolve_license_server_url
 
 
 LOGGER = logging.getLogger(__name__)
@@ -24,8 +24,8 @@ class LicenseApiResult:
 
 
 class LicenseApiClient:
-    def __init__(self, base_url: str = DEFAULT_LICENSE_SERVER_URL, timeout: float = 2.0):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: Optional[str] = None, timeout: float = 2.0):
+        self.base_url = (base_url or resolve_license_server_url()).rstrip("/")
         self.timeout = timeout
 
     def register_device(

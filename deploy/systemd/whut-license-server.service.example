@@ -1,0 +1,16 @@
+[Unit]
+Description=WHUT Campus Auto Login License Server
+After=network.target
+
+[Service]
+Type=simple
+User=whutlogin
+Group=whutlogin
+WorkingDirectory=/opt/whut-campus-auto-login
+EnvironmentFile=/etc/whut-campus-auto-login/license-server.env
+ExecStart=/opt/whut-campus-auto-login/.venv/bin/uvicorn license_server.app:app --host 127.0.0.1 --port 8787
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

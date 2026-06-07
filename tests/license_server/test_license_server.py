@@ -1,13 +1,15 @@
 import base64
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
 from fastapi.testclient import TestClient
 
 from license_server.db import initialize_database
-from license_server.app import create_app
+from license_server.app import _default_app, create_app
+from license_server.config import load_config
 
 
 def _private_key_b64() -> str:
@@ -57,7 +59,57 @@ def test_health_endpoint_returns_service_status(tmp_path):
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    assert response.json() == {"status": "ok", "service": "license_server"}
+
+
+def test_default_app_health_works_without_sensitive_env(monkeypatch):
+    monkeypatch.delenv("LICENSE_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("LICENSE_PRIVATE_KEY_FILE", raising=False)
+    monkeypatch.delenv("LICENSE_ADMIN_TOKEN", raising=False)
+
+    client = TestClient(_default_app())
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "service": "license_server"}
+
+
+def test_load_config_uses_relative_sqlite_database_url(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///./license_server_dev.sqlite3")
+    monkeypatch.setenv("LICENSE_PRIVATE_KEY", "private-placeholder")
+    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
+    monkeypatch.delenv("LICENSE_DB_PATH", raising=False)
+
+    config = load_config()
+
+    assert config.database_path == Path("license_server_dev.sqlite3")
+
+
+def test_load_config_uses_absolute_sqlite_database_url(monkeypatch):
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "sqlite:////var/lib/whut-campus-auto-login/license.sqlite3",
+    )
+    monkeypatch.setenv("LICENSE_PRIVATE_KEY", "private-placeholder")
+    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
+    monkeypatch.delenv("LICENSE_DB_PATH", raising=False)
+
+    config = load_config()
+
+    assert config.database_path.as_posix().endswith(
+        "/var/lib/whut-campus-auto-login/license.sqlite3"
+    )
+
+
+def test_load_config_keeps_license_db_path_fallback(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("LICENSE_DB_PATH", "legacy-license.sqlite3")
+    monkeypatch.setenv("LICENSE_PRIVATE_KEY", "private-placeholder")
+    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
+
+    config = load_config()
+
+    assert config.database_path == Path("legacy-license.sqlite3")
 
 
 def test_devices_schema_excludes_campus_account_columns(tmp_path):
@@ -135,6 +187,25 @@ def test_register_device_rejects_campus_account_fields(tmp_path):
     payload["campus_account_masked"] = "2024****1234"
 
     response = client.post("/device/register", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_refresh_license_rejects_campus_account_fields(tmp_path):
+    client, _public_key_b64_value = _client(tmp_path)
+    client.post("/device/register", json=_register_payload())
+
+    response = client.post(
+        "/license/refresh",
+        json={
+            "product_id": "whut-campus-auto-login",
+            "device_fingerprint_hash": "device-a",
+            "app_version": "0.1.0",
+            "campus_account_hash": "account-hash",
+            "campus_account_masked": "2024****1234",
+            "password": "secret",
+        },
+    )
 
     assert response.status_code == 422
 
@@ -219,3 +290,47 @@ def test_admin_grant_requires_admin_token(tmp_path):
     )
 
     assert response.status_code == 403
+
+
+def test_env_example_contains_only_placeholders():
+    content = Path("license_server/.env.example").read_text(encoding="utf-8")
+
+    assert "LICENSE_SERVER_URL=http://127.0.0.1:8787" in content
+    assert "LICENSE_PRIVATE_KEY=replace_with_base64_or_configured_private_key" in content
+    assert "LICENSE_PUBLIC_KEY=replace_with_public_key" in content
+    assert "LICENSE_ADMIN_TOKEN=replace_with_strong_admin_token" in content
+    assert "DATABASE_URL=sqlite:///./license_server_dev.sqlite3" in content
+    assert "SERVER_ENV=development" in content
+    assert "LICENSE_DB_PATH" not in content
+    forbidden_fragments = [
+        "124.223.7.147",
+        "license.whutlogin.cn",
+        "BEGIN " + "PRIVATE KEY",
+        "signed_license_token",
+        "license_token.json",
+        "sk_",
+        "wxpay",
+        "alipay_" + "secret",
+    ]
+    for fragment in forbidden_fragments:
+        assert fragment not in content
+
+
+def test_deploy_examples_exist_and_include_required_settings():
+    service = Path("deploy/systemd/whut-license-server.service.example")
+    nginx = Path("deploy/nginx/license.whutlogin.cn.conf.example")
+
+    service_content = service.read_text(encoding="utf-8")
+    nginx_content = nginx.read_text(encoding="utf-8")
+
+    assert "WorkingDirectory=/opt/whut-campus-auto-login" in service_content
+    assert "EnvironmentFile=/etc/whut-campus-auto-login/license-server.env" in service_content
+    assert "/opt/whut-campus-auto-login/.venv/bin/uvicorn" in service_content
+    assert "--host 127.0.0.1 --port 8787" in service_content
+    assert "Restart=always" in service_content
+
+    assert "server_name license.whutlogin.cn;" in nginx_content
+    assert "listen 80;" in nginx_content
+    assert "proxy_pass http://127.0.0.1:8787;" in nginx_content
+    assert "/path/to/fullchain.pem" in nginx_content
+    assert "/path/to/privkey.pem" in nginx_content

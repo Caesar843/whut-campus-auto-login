@@ -23,12 +23,16 @@ class DeviceRegisterRequest(BaseModel):
 
 
 class LicenseRefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     product_id: str
     device_fingerprint_hash: str
     app_version: Optional[str] = None
 
 
 class AdminGrantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     device_fingerprint_hash: str
     license_days: int = Field(default=PAID_LICENSE_DAYS, ge=1, le=3660)
     reason: str
@@ -36,10 +40,6 @@ class AdminGrantRequest(BaseModel):
 
 def create_router(*, database_path: Path, private_key_b64: str, admin_token: str) -> APIRouter:
     router = APIRouter()
-
-    @router.get("/health")
-    def health():
-        return {"status": "ok"}
 
     @router.post("/device/register")
     def register_device(request: DeviceRegisterRequest):

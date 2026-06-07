@@ -8,6 +8,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from license_client.license_api import LicenseApiClient, LicenseApiResult
+from license_client.constants import DEFAULT_LICENSE_SERVER_URL
 from license_client.license_guard import (
     check_license_before_login,
     try_initialize_license_after_bootstrap_login,
@@ -57,6 +58,30 @@ def _signed_license_token(private_key, **overrides):
     payload_segment = _b64url(payload_json)
     signature_segment = _b64url(private_key.sign(payload_segment.encode("ascii")))
     return f"{payload_segment}.{signature_segment}"
+
+
+def test_license_api_client_uses_default_local_server_when_env_missing(monkeypatch):
+    monkeypatch.delenv("LICENSE_SERVER_URL", raising=False)
+
+    client = LicenseApiClient()
+
+    assert client.base_url == DEFAULT_LICENSE_SERVER_URL
+
+
+def test_license_api_client_uses_license_server_url_env(monkeypatch):
+    monkeypatch.setenv("LICENSE_SERVER_URL", "https://license.example.test/")
+
+    client = LicenseApiClient()
+
+    assert client.base_url == "https://license.example.test"
+
+
+def test_license_api_client_explicit_base_url_overrides_env(monkeypatch):
+    monkeypatch.setenv("LICENSE_SERVER_URL", "https://license.example.test")
+
+    client = LicenseApiClient(base_url="http://license.local/")
+
+    assert client.base_url == "http://license.local"
 
 
 def test_register_device_payload_excludes_campus_account_fields(monkeypatch):

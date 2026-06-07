@@ -10,6 +10,9 @@ from license_server.db import initialize_database
 from license_server.routes import create_router
 
 
+HEALTH_RESPONSE = {"status": "ok", "service": "license_server"}
+
+
 def create_app(
     *,
     database_path: Optional[Path] = None,
@@ -23,6 +26,7 @@ def create_app(
         admin_token = admin_token or config.admin_token
     initialize_database(Path(database_path))
     app = FastAPI(title="WHUT Campus Auto Login License Server")
+    _add_health_route(app)
     app.include_router(
         create_router(
             database_path=Path(database_path),
@@ -38,12 +42,14 @@ def _default_app() -> FastAPI:
         return create_app()
     except RuntimeError:
         fallback = FastAPI(title="WHUT Campus Auto Login License Server")
-
-        @fallback.get("/health")
-        def health():
-            return {"status": "unconfigured"}
-
+        _add_health_route(fallback)
         return fallback
+
+
+def _add_health_route(app: FastAPI) -> None:
+    @app.get("/health")
+    def health():
+        return HEALTH_RESPONSE
 
 
 app = _default_app()
