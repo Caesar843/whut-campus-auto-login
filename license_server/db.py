@@ -37,6 +37,29 @@ CREATE TABLE IF NOT EXISTS licenses (
     revoked_at TEXT,
     FOREIGN KEY (device_id) REFERENCES devices(id)
 );
+
+CREATE TABLE IF NOT EXISTS payment_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL UNIQUE,
+    product_id TEXT NOT NULL,
+    device_fingerprint_hash TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    payment_channel TEXT NOT NULL,
+    order_status TEXT NOT NULL,
+    payment_status TEXT NOT NULL,
+    provider_status TEXT NOT NULL,
+    provider_order_id TEXT,
+    transaction_id TEXT,
+    created_at TEXT NOT NULL,
+    expire_at TEXT NOT NULL,
+    paid_at TEXT,
+    closed_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_orders_device_open
+ON payment_orders(device_fingerprint_hash, payment_status, order_status, expire_at);
 """
 
 

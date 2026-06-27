@@ -8,8 +8,21 @@ It implements:
 - `POST /device/register`
 - `POST /license/refresh`
 - `POST /admin/grant`
+- `POST /payment/create`
+- `GET /payment/status`
 
-It does not implement payment, orders, user accounts, WeChat Pay, or Alipay.
+Payment support is only an order skeleton:
+
+- it creates and stores unpaid local payment orders;
+- it does not integrate real WeChat Pay;
+- it does not integrate real Alipay;
+- it does not generate real or fake QR codes;
+- it does not generate real or fake payment links;
+- it does not simulate payment success;
+- it does not issue paid licenses from payment orders.
+
+Orders can only become `paid` after a future real payment callback verifies the
+provider signature, amount, order status, and idempotency rules.
 
 ## Local Setup
 
