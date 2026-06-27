@@ -66,6 +66,7 @@ ON payment_orders(device_fingerprint_hash, payment_status, order_status, expire_
 def connect(database_path: Path) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
+    connection.execute("PRAGMA foreign_keys = ON")
     connection.row_factory = sqlite3.Row
     return connection
 
