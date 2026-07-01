@@ -12,6 +12,7 @@ from typing import Callable, Mapping, Optional
 SHORTCUT_NAME = "whut-campus-auto-login.lnk"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ENTRY_SCRIPT = PROJECT_ROOT / "desktop_app" / "tray_app.py"
+POWERSHELL_TIMEOUT_SECONDS = 10
 
 
 class AutostartError(RuntimeError):
@@ -225,19 +226,23 @@ def _run_powershell(script: str, *args: str) -> str:
     encoded_script = base64.b64encode(
         _prepare_powershell_script(script, args).encode("utf-16le")
     ).decode("ascii")
-    completed = subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            encoded_script,
-        ],
-        check=False,
-        capture_output=True,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded_script,
+            ],
+            check=False,
+            capture_output=True,
+            timeout=POWERSHELL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AutostartError("PowerShell command timed out.") from exc
     stdout = _decode_process_output(completed.stdout)
     stderr = _decode_process_output(completed.stderr)
     if completed.returncode != 0:

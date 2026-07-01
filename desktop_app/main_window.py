@@ -194,7 +194,18 @@ class MainWindowController:
             password=password,
         )
         if result.ok and license_decision.bootstrap_required:
-            self._license_bootstrap_sync(bootstrap_decision=license_decision)
+            try:
+                self._license_bootstrap_sync(bootstrap_decision=license_decision)
+            except Exception as exc:
+                LOGGER.warning("License bootstrap sync failed: %s", exc.__class__.__name__)
+                self._write_log(
+                    event="license_bootstrap_sync_failed",
+                    action="manual_login",
+                    status="failed",
+                    failed_stage="license_bootstrap_sync",
+                    failure_reason="license_bootstrap_sync_error",
+                    safe_message=_safe_message(exc),
+                )
         return result
 
     def _check_license_before_login(self) -> LicenseDecision:
@@ -477,6 +488,7 @@ class MainWindow(QMainWindow):
         self.password_input.clear()
         self._set_status(message, "success")
         self.license_label.setText(LICENSE_PLACEHOLDER)
+        self.license_label.set_variant("neutral")
 
     @Slot()
     def _show_runtime_logs(self) -> None:

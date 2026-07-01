@@ -9,10 +9,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtWidgets import QApplication, QLineEdit
+from PySide6.QtWidgets import QApplication, QMessageBox, QLineEdit
 
 from desktop_app.log_window import RuntimeLogWindow
-from desktop_app.main_window import MainWindow, MainWindowController
+from desktop_app.main_window import LICENSE_PLACEHOLDER, MainWindow, MainWindowController
 from desktop_app.widgets import AccountLineEdit, PasswordLineEdit
 
 
@@ -107,6 +107,68 @@ def test_main_window_reuses_independent_runtime_log_window():
     assert first.isWindow() is True
     assert first.parent() is None
     assert window.findChildren(RuntimeLogWindow) == []
+
+
+def test_clear_config_resets_license_label_text_and_variant(monkeypatch):
+    _app()
+    calls = []
+    controller = MainWindowController(
+        load_config_func=lambda: FakeConfig(),
+        clear_config_func=lambda: calls.append("clear"),
+        is_autostart_enabled_func=lambda: True,
+    )
+    window = MainWindow(controller=controller)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    for variant, old_color in (
+        ("success", "#166534"),
+        ("warning", "#92400E"),
+        ("error", "#991B1B"),
+    ):
+        window.license_label.setText(f"{variant} license")
+        window.license_label.set_variant(variant)
+
+        window._confirm_clear_config()
+
+        style = window.license_label.styleSheet()
+        assert window.license_label.text() == LICENSE_PLACEHOLDER
+        assert "#334155" in style
+        assert "#E2E8F0" in style
+        assert "#F8FAFC" in style
+        assert old_color not in style
+
+    assert calls == ["clear", "clear", "clear"]
+
+
+def test_clear_config_failure_does_not_reset_license_label(monkeypatch):
+    _app()
+
+    def fail_clear():
+        raise RuntimeError("clear failed")
+
+    controller = MainWindowController(
+        load_config_func=lambda: FakeConfig(),
+        clear_config_func=fail_clear,
+        is_autostart_enabled_func=lambda: True,
+    )
+    window = MainWindow(controller=controller)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window.license_label.setText("paid active")
+    window.license_label.set_variant("success")
+
+    window._confirm_clear_config()
+
+    assert window.license_label.text() == "paid active"
+    assert "#166534" in window.license_label.styleSheet()
+    assert "clear failed" in window.status_label.text()
 
 
 def test_main_window_initializes_fields_from_controller():

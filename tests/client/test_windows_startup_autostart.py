@@ -1,5 +1,6 @@
 import base64
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -210,6 +211,7 @@ def test_powershell_runner_uses_binary_capture_and_decodes_locale_output(monkeyp
     def fake_run(command, **kwargs):
         assert kwargs["capture_output"] is True
         assert kwargs["check"] is False
+        assert kwargs["timeout"] == windows_startup.POWERSHELL_TIMEOUT_SECONDS
         assert kwargs.get("text") is not True
         assert "encoding" not in kwargs
         return SimpleNamespace(
@@ -225,6 +227,7 @@ def test_powershell_runner_uses_binary_capture_and_decodes_locale_output(monkeyp
 
 def test_powershell_runner_raises_autostart_error_when_stderr_is_missing(monkeypatch):
     def fake_run(command, **kwargs):
+        assert kwargs["timeout"] == windows_startup.POWERSHELL_TIMEOUT_SECONDS
         return SimpleNamespace(returncode=1, stdout=b"", stderr=None)
 
     monkeypatch.setattr(windows_startup.subprocess, "run", fake_run)
@@ -237,6 +240,7 @@ def test_powershell_runner_embeds_path_arguments_in_encoded_command(monkeypatch)
     raw_path = r"C:\Path With Spaces\whut's-login.lnk"
 
     def fake_run(command, **kwargs):
+        assert kwargs["timeout"] == windows_startup.POWERSHELL_TIMEOUT_SECONDS
         assert "-EncodedCommand" in command
         assert raw_path not in command
         encoded = command[command.index("-EncodedCommand") + 1]
@@ -248,3 +252,14 @@ def test_powershell_runner_embeds_path_arguments_in_encoded_command(monkeypatch)
     monkeypatch.setattr(windows_startup.subprocess, "run", fake_run)
 
     assert windows_startup._run_powershell("Write-Output $args[0]", raw_path) == "ok"
+
+
+def test_powershell_runner_raises_autostart_error_on_timeout(monkeypatch):
+    def fake_run(command, **kwargs):
+        assert kwargs["timeout"] == windows_startup.POWERSHELL_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(windows_startup.subprocess, "run", fake_run)
+
+    with pytest.raises(windows_startup.AutostartError, match="timed out"):
+        windows_startup._run_powershell("Start-Sleep 999")
