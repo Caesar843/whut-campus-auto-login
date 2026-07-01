@@ -466,6 +466,33 @@ def test_tray_controller_logs_manual_login_failure_and_failed_stage():
     assert log_store.entries[-1]["failure_reason"] == LoginStatus.TIMEOUT.value
 
 
+def test_tray_controller_logs_startup_auto_login_failure_separately():
+    log_store = FakeLogStore()
+    controller = TrayController(
+        login_func=lambda: LoginResult(
+            status=LoginStatus.TIMEOUT,
+            message="timeout",
+            failed_stage="account_status",
+        ),
+        license_check_func=_allow_license,
+        log_store=log_store,
+    )
+
+    controller.startup_auto_login(retry_count=2)
+
+    events = [entry["event"] for entry in log_store.entries]
+    assert "startup_auto_login_attempt" in events
+    assert "startup_auto_login_failed" in events
+    assert "manual_login_failed" not in events
+
+    failed_log = next(
+        entry for entry in log_store.entries if entry["event"] == "startup_auto_login_failed"
+    )
+    assert failed_log["action"] == "startup_auto_login"
+    assert failed_log["status"] == "failed"
+    assert failed_log["failed_stage"] == "account_status"
+
+
 def test_tray_controller_logs_startup_retry_states_without_breaking_recent_result():
     log_store = FakeLogStore()
     controller = TrayController(

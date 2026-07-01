@@ -2,10 +2,14 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
+import campus_login.local_config as local_config
 from campus_login.local_config import (
     clear_login_config,
     has_login_config,
     load_login_config,
+    LocalConfigError,
     save_login_config,
 )
 
@@ -13,20 +17,35 @@ from campus_login.local_config import (
 class MemoryCredentialStore:
     def __init__(self):
         self.password = None
+        self.save_calls = 0
+        self.delete_calls = 0
 
     def save_password(self, password):
+        self.save_calls += 1
         self.password = password
 
     def load_password(self):
         return self.password
 
     def delete_password(self):
+        self.delete_calls += 1
         existed = self.password is not None
         self.password = None
         return existed
 
     def has_password(self):
         return self.password is not None
+
+
+class FailingDeleteCredentialStore(MemoryCredentialStore):
+    def delete_password(self):
+        self.delete_calls += 1
+        raise RuntimeError("credential delete failed")
+
+
+class FalseyCredentialStore(MemoryCredentialStore):
+    def __bool__(self):
+        return False
 
 
 def load_config_cli():
@@ -120,6 +139,178 @@ def test_clear_login_config_removes_config_and_credential(tmp_path):
     assert credential_store.has_password() is False
     assert config_path.exists() is False
     assert has_login_config(config_path=config_path, credential_store=credential_store) is False
+
+
+def test_none_credential_store_uses_default_store(tmp_path, monkeypatch):
+    default_store = MemoryCredentialStore()
+    default_store.save_password("default-password")
+    monkeypatch.setattr(local_config, "get_default_credential_store", lambda: default_store)
+
+    loaded = load_login_config(config_path=tmp_path / "config.json", credential_store=None)
+
+    assert loaded.password == "default-password"
+
+
+def test_falsey_credential_store_is_not_replaced_by_default(tmp_path, monkeypatch):
+    default_store = MemoryCredentialStore()
+    default_store.save_password("default-password")
+    falsey_store = FalseyCredentialStore()
+    falsey_store.save_password("falsey-password")
+    monkeypatch.setattr(local_config, "get_default_credential_store", lambda: default_store)
+
+    loaded = load_login_config(config_path=tmp_path / "config.json", credential_store=falsey_store)
+
+    assert loaded.password == "falsey-password"
+
+
+def test_truthy_credential_store_is_not_replaced_by_default(tmp_path, monkeypatch):
+    default_store = MemoryCredentialStore()
+    default_store.save_password("default-password")
+    credential_store = MemoryCredentialStore()
+    credential_store.save_password("store-password")
+    monkeypatch.setattr(local_config, "get_default_credential_store", lambda: default_store)
+
+    loaded = load_login_config(config_path=tmp_path / "config.json", credential_store=credential_store)
+
+    assert loaded.password == "store-password"
+
+
+def test_clear_login_config_still_clears_password_when_config_delete_fails(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    credential_store = MemoryCredentialStore()
+    credential_store.save_password("secret-password")
+
+    def fail_unlink(self, missing_ok=False):
+        raise OSError("config delete failed")
+
+    monkeypatch.setattr(type(config_path), "unlink", fail_unlink)
+
+    with pytest.raises(LocalConfigError) as exc_info:
+        clear_login_config(
+            config_path=config_path,
+            credential_store=credential_store,
+        )
+
+    assert credential_store.delete_calls == 1
+    assert credential_store.has_password() is False
+    assert "secret-password" not in str(exc_info.value)
+
+
+def test_clear_login_config_missing_file_still_clears_password(tmp_path):
+    credential_store = MemoryCredentialStore()
+    credential_store.save_password("secret-password")
+
+    cleared = clear_login_config(
+        config_path=tmp_path / "missing.json",
+        credential_store=credential_store,
+    )
+
+    assert cleared.config_exists is False
+    assert cleared.credential_exists is False
+    assert credential_store.delete_calls == 1
+    assert credential_store.has_password() is False
+
+
+def test_clear_login_config_password_delete_failure_does_not_expose_password(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    credential_store = FailingDeleteCredentialStore()
+    credential_store.save_password("secret-password")
+
+    with pytest.raises(LocalConfigError) as exc_info:
+        clear_login_config(
+            config_path=config_path,
+            credential_store=credential_store,
+        )
+
+    assert credential_store.delete_calls == 1
+    assert "secret-password" not in str(exc_info.value)
+
+
+def test_clear_login_config_reports_when_config_and_password_delete_both_fail(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    credential_store = FailingDeleteCredentialStore()
+    credential_store.save_password("secret-password")
+
+    def fail_unlink(self, missing_ok=False):
+        raise OSError("config delete failed")
+
+    monkeypatch.setattr(type(config_path), "unlink", fail_unlink)
+
+    with pytest.raises(LocalConfigError) as exc_info:
+        clear_login_config(
+            config_path=config_path,
+            credential_store=credential_store,
+        )
+
+    message = str(exc_info.value)
+    assert credential_store.delete_calls == 1
+    assert "config file removal failed" in message
+    assert "password credential removal also failed" in message
+    assert "secret-password" not in message
+
+
+def test_save_login_config_rolls_back_password_when_config_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    credential_store = MemoryCredentialStore()
+    write_error = OSError("config write failed")
+
+    def fail_write_text(self, *args, **kwargs):
+        raise write_error
+
+    monkeypatch.setattr(type(config_path), "write_text", fail_write_text)
+
+    with pytest.raises(LocalConfigError) as exc_info:
+        save_login_config(
+            "366369",
+            "secret-password",
+            config_path=config_path,
+            credential_store=credential_store,
+        )
+
+    assert credential_store.save_calls == 1
+    assert credential_store.delete_calls == 1
+    assert credential_store.has_password() is False
+    assert exc_info.value.__cause__ is write_error
+    assert "secret-password" not in str(exc_info.value)
+
+
+def test_save_login_config_keeps_write_error_when_password_rollback_fails(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    credential_store = FailingDeleteCredentialStore()
+    write_error = OSError("config write failed")
+
+    def fail_write_text(self, *args, **kwargs):
+        raise write_error
+
+    monkeypatch.setattr(type(config_path), "write_text", fail_write_text)
+
+    with pytest.raises(LocalConfigError) as exc_info:
+        save_login_config(
+            "366369",
+            "secret-password",
+            config_path=config_path,
+            credential_store=credential_store,
+        )
+
+    assert credential_store.save_calls == 1
+    assert credential_store.delete_calls == 1
+    assert exc_info.value.__cause__ is write_error
+    assert "secret-password" not in str(exc_info.value)
 
 
 def test_config_cli_save_show_status_and_clear_never_print_plaintext(tmp_path, capsys):

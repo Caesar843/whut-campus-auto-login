@@ -8,7 +8,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from campus_login.core.result import LoginResult
 from campus_login.core.status import LoginStatus
 from desktop_app.main_window import MainWindowController
-from desktop_app.tray.controller import TrayController
+from desktop_app.tray.controller import TrayController, TrayStatus
 from license_client.license_state import LicenseDecision, LicenseStatus
 
 
@@ -96,6 +96,30 @@ def test_main_window_bootstrap_login_syncs_license_after_success():
     assert set(sync_calls[0]) == {"bootstrap_decision"}
 
 
+def test_main_window_bootstrap_sync_failure_keeps_login_success():
+    log_store = FakeLogStore()
+
+    def fail_sync(**kwargs):
+        raise RuntimeError("license server timeout")
+
+    controller = MainWindowController(
+        login_runner=lambda username, password: LoginResult(
+            status=LoginStatus.SUCCESS,
+            message="ok",
+        ),
+        license_check_func=lambda: _bootstrap_decision(),
+        license_bootstrap_sync_func=fail_sync,
+        log_store=log_store,
+    )
+
+    result = controller.test_login("202400001234", "secret-password")
+
+    assert result.status == LoginStatus.SUCCESS
+    assert log_store.entries[-1]["event"] == "license_bootstrap_sync_failed"
+    assert log_store.entries[-1]["failed_stage"] == "license_bootstrap_sync"
+    assert log_store.entries[-1]["failure_reason"] == "license_bootstrap_sync_error"
+
+
 def test_main_window_bootstrap_login_failure_does_not_sync_license():
     sync_calls = []
     controller = MainWindowController(
@@ -179,6 +203,33 @@ def test_tray_test_login_bootstrap_syncs_license_after_success():
     assert action_result.status.value == "logged_in"
     assert len(sync_calls) == 1
     assert sync_calls[0]["bootstrap_decision"].bootstrap_required is True
+
+
+def test_tray_bootstrap_sync_failure_keeps_logged_in_status():
+    observed = []
+    log_store = FakeLogStore()
+
+    def fail_sync(**kwargs):
+        raise RuntimeError("license server timeout")
+
+    controller = TrayController(
+        login_func=lambda: LoginResult(status=LoginStatus.SUCCESS, message="ok"),
+        license_check_func=lambda: _bootstrap_decision(),
+        license_bootstrap_sync_func=fail_sync,
+        on_status_changed=observed.append,
+        log_store=log_store,
+    )
+
+    action_result = controller.test_login()
+
+    assert observed == [TrayStatus.LOGGING_IN, TrayStatus.LOGGED_IN]
+    assert action_result.status.value == "logged_in"
+    assert controller.status.value == "logged_in"
+    sync_log = next(
+        entry for entry in log_store.entries if entry["event"] == "license_bootstrap_sync_failed"
+    )
+    assert sync_log["failed_stage"] == "license_bootstrap_sync"
+    assert sync_log["failure_reason"] == "license_bootstrap_sync_error"
 
 
 def test_tray_startup_auto_login_bootstrap_syncs_license_after_success():

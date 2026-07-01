@@ -82,7 +82,12 @@ def save_login_config(
             encoding="utf-8",
         )
     except OSError as exc:
-        store.delete_password()
+        try:
+            store.delete_password()
+        except Exception:
+            raise LocalConfigError(
+                "Failed to write local login config; additionally failed to remove saved password."
+            ) from exc
         raise LocalConfigError("Failed to write local login config.") from exc
 
     return load_login_config(config_path=path, credential_store=store)
@@ -117,11 +122,27 @@ def clear_login_config(
     credential_store: Optional[CredentialStore] = None,
 ) -> LoginConfig:
     path = _resolve_config_path(config_path)
+    store = _resolve_credential_store(credential_store)
+    remove_error: Optional[OSError] = None
+
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        raise LocalConfigError("Failed to remove local login config.") from exc
-    _resolve_credential_store(credential_store).delete_password()
+        remove_error = exc
+
+    try:
+        store.delete_password()
+    except Exception as exc:
+        if remove_error is not None:
+            raise LocalConfigError(
+                "Failed to clear local login config: config file removal failed; "
+                "password credential removal also failed."
+            ) from remove_error
+        raise LocalConfigError("Failed to remove saved login password.") from exc
+
+    if remove_error is not None:
+        raise LocalConfigError("Failed to remove local login config.") from remove_error
+
     return LoginConfig(config_exists=False, credential_exists=False, config_path=path)
 
 
@@ -144,7 +165,7 @@ def _resolve_config_path(config_path: Optional[Path]) -> Path:
 def _resolve_credential_store(
     credential_store: Optional[CredentialStore],
 ) -> CredentialStore:
-    return credential_store or get_default_credential_store()
+    return credential_store if credential_store is not None else get_default_credential_store()
 
 
 def _read_config_payload(path: Path) -> dict:
