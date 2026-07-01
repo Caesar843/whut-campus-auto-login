@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from license_client.constants import PAID_LICENSE_DAYS, PRODUCT_ID, TRIAL_DAYS
 from license_server.db import connect
 from license_server.signer import datetime_text, sign_license_payload, utc_now_text
+
+
+LEGACY_DEVICE_DESCRIPTION_FIELDS = {"device_name", "os", "app_version"}
 
 
 class DeviceRegisterRequest(BaseModel):
@@ -17,9 +20,11 @@ class DeviceRegisterRequest(BaseModel):
 
     product_id: str
     device_fingerprint_hash: str
-    device_name: Optional[str] = None
-    os: Optional[str] = None
-    app_version: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_device_description_fields(cls, data: Any) -> Any:
+        return _drop_legacy_device_description_fields(data)
 
 
 class LicenseRefreshRequest(BaseModel):
@@ -27,7 +32,11 @@ class LicenseRefreshRequest(BaseModel):
 
     product_id: str
     device_fingerprint_hash: str
-    app_version: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_legacy_device_description_fields(cls, data: Any) -> Any:
+        return _drop_legacy_device_description_fields(data)
 
 
 class AdminGrantRequest(BaseModel):
@@ -54,16 +63,12 @@ def create_router(*, database_path: Path, private_key_b64: str, admin_token: str
                 cursor = connection.execute(
                     """
                     INSERT INTO devices (
-                        product_id, device_fingerprint_hash, device_name, os, app_version,
-                        first_seen_at, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        product_id, device_fingerprint_hash, first_seen_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?)
                     """,
                     (
                         request.product_id,
                         request.device_fingerprint_hash,
-                        request.device_name,
-                        request.os,
-                        request.app_version,
                         datetime_text(now),
                         datetime_text(now),
                     ),
@@ -82,14 +87,11 @@ def create_router(*, database_path: Path, private_key_b64: str, admin_token: str
                 connection.execute(
                     """
                     UPDATE devices
-                    SET last_seen_at = ?, app_version = ?, device_name = ?, os = ?
+                    SET last_seen_at = ?
                     WHERE id = ?
                     """,
                     (
                         datetime_text(now),
-                        request.app_version,
-                        request.device_name,
-                        request.os,
                         device_id,
                     ),
                 )
@@ -123,8 +125,8 @@ def create_router(*, database_path: Path, private_key_b64: str, admin_token: str
             if device is None:
                 raise HTTPException(status_code=404, detail="device_not_found")
             connection.execute(
-                "UPDATE devices SET last_seen_at = ?, app_version = COALESCE(?, app_version) WHERE id = ?",
-                (datetime_text(now), request.app_version, int(device["id"])),
+                "UPDATE devices SET last_seen_at = ? WHERE id = ?",
+                (datetime_text(now), int(device["id"])),
             )
             license_row = _latest_license(connection, int(device["id"]))
             if license_row is None:
@@ -176,13 +178,24 @@ def _validate_product(product_id: str) -> None:
         raise HTTPException(status_code=400, detail="invalid_product_id")
 
 
+def _drop_legacy_device_description_fields(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+    # ponytail: old clients sent these; remove this shim after clients stop.
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in LEGACY_DEVICE_DESCRIPTION_FIELDS
+    }
+
+
 def _create_license(connection, *, device_id: int, license_type: str, source: str, starts_at: datetime, expires_at: datetime):
     cursor = connection.execute(
         """
         INSERT INTO licenses (
             device_id, license_type, status, starts_at, expires_at, source, order_id,
-            created_at, revoked_at, revoked_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)
+            created_at, revoked_at
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)
         """,
         (
             device_id,

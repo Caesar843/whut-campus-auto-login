@@ -47,9 +47,6 @@ def _register_payload(device_hash="device-a"):
     return {
         "product_id": "whut-campus-auto-login",
         "device_fingerprint_hash": device_hash,
-        "device_name": "dev pc",
-        "os": "Windows",
-        "app_version": "0.1.0",
     }
 
 
@@ -124,9 +121,25 @@ def test_devices_schema_excludes_campus_account_columns(tmp_path):
         }
     assert "campus_account_hash" not in columns
     assert "campus_account_masked" not in columns
+    assert "device_name" not in columns
+    assert "os" not in columns
+    assert "app_version" not in columns
 
 
-def test_initialize_database_removes_legacy_campus_account_columns(tmp_path):
+def test_licenses_schema_excludes_revoked_reason(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+
+    initialize_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(licenses)").fetchall()
+        }
+    assert "revoked_reason" not in columns
+
+
+def test_initialize_database_removes_legacy_sensitive_columns(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute(
@@ -173,11 +186,86 @@ def test_initialize_database_removes_legacy_campus_account_columns(tmp_path):
             for row in connection.execute("PRAGMA table_info(devices)").fetchall()
         }
         device = connection.execute(
-            "SELECT device_fingerprint_hash, app_version FROM devices"
+            "SELECT device_fingerprint_hash FROM devices"
         ).fetchone()
     assert "campus_account_hash" not in columns
     assert "campus_account_masked" not in columns
-    assert device == ("device-a", "0.1.0")
+    assert "device_name" not in columns
+    assert "os" not in columns
+    assert "app_version" not in columns
+    assert device == ("device-a",)
+
+
+def test_initialize_database_removes_legacy_license_revoked_reason(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE licenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id INTEGER NOT NULL,
+                license_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                starts_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                source TEXT NOT NULL,
+                order_id TEXT,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT,
+                revoked_reason TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO licenses (
+                device_id, license_type, status, starts_at, expires_at, source,
+                order_id, created_at, revoked_at, revoked_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?)
+            """,
+            (
+                1,
+                "trial",
+                "active",
+                "2026-06-04T00:00:00Z",
+                "2026-06-11T00:00:00Z",
+                "trial",
+                "2026-06-04T00:00:00Z",
+                "legacy reason",
+            ),
+        )
+
+    initialize_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(licenses)").fetchall()
+        }
+        license_row = connection.execute(
+            "SELECT license_type, status FROM licenses"
+        ).fetchone()
+    assert "revoked_reason" not in columns
+    assert license_row == ("trial", "active")
+
+
+def test_register_device_ignores_device_description_fields(tmp_path):
+    client, _public_key_b64_value = _client(tmp_path)
+    payload = _register_payload()
+    payload.update(
+        {
+            "device_name": "dev pc",
+            "os": "Windows",
+            "app_version": "0.1.0",
+        }
+    )
+
+    response = client.post("/device/register", json=payload)
+
+    assert response.status_code == 200
+    assert "device_name" not in response.json()
+    assert "os" not in response.json()
+    assert "app_version" not in response.json()
 
 
 def test_register_device_rejects_campus_account_fields(tmp_path):
@@ -210,6 +298,22 @@ def test_refresh_license_rejects_campus_account_fields(tmp_path):
     assert response.status_code == 422
 
 
+def test_refresh_license_ignores_device_description_fields(tmp_path):
+    client, _public_key_b64_value = _client(tmp_path)
+    client.post("/device/register", json=_register_payload())
+
+    response = client.post(
+        "/license/refresh",
+        json={
+            "product_id": "whut-campus-auto-login",
+            "device_fingerprint_hash": "device-a",
+            "app_version": "0.1.0",
+        },
+    )
+
+    assert response.status_code == 200
+
+
 def test_register_new_device_issues_14_day_trial(tmp_path):
     client, _public_key_b64_value = _client(tmp_path)
 
@@ -220,8 +324,35 @@ def test_register_new_device_issues_14_day_trial(tmp_path):
     assert payload["license_type"] == "trial"
     assert payload["license_status"] == "active"
     assert payload["signed_license_token"]
+    assert "device_name" not in payload
+    assert "os" not in payload
+    assert "app_version" not in payload
     expires_at = datetime.fromisoformat(payload["expires_at"].replace("Z", "+00:00"))
     assert 13 <= (expires_at - datetime.now(timezone.utc)).days <= 14
+
+
+def test_register_device_stores_only_minimal_device_fields(tmp_path):
+    client, _public_key_b64_value = _client(tmp_path)
+
+    response = client.post("/device/register", json=_register_payload())
+
+    assert response.status_code == 200
+    with sqlite3.connect(tmp_path / "license.sqlite3") as connection:
+        columns = [
+            row[1]
+            for row in connection.execute("PRAGMA table_info(devices)").fetchall()
+        ]
+        row = connection.execute("SELECT * FROM devices").fetchone()
+
+    assert columns == [
+        "id",
+        "product_id",
+        "device_fingerprint_hash",
+        "first_seen_at",
+        "last_seen_at",
+    ]
+    assert row[1] == "whut-campus-auto-login"
+    assert row[2] == "device-a"
 
 
 def test_register_existing_device_does_not_duplicate_trial(tmp_path):
@@ -243,7 +374,6 @@ def test_refresh_returns_latest_license(tmp_path):
         json={
             "product_id": "whut-campus-auto-login",
             "device_fingerprint_hash": "device-a",
-            "app_version": "0.1.0",
         },
     )
 
