@@ -6,8 +6,9 @@ from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, PublicFormat, NoEncryption
 from fastapi.testclient import TestClient
+import pytest
 
-from license_server.db import initialize_database
+from license_server.db import connect, initialize_database
 from license_server.app import _default_app, create_app
 from license_server.config import load_config
 
@@ -107,6 +108,42 @@ def test_load_config_keeps_license_db_path_fallback(monkeypatch):
     config = load_config()
 
     assert config.database_path == Path("legacy-license.sqlite3")
+
+
+def test_load_config_wraps_unreadable_private_key_file(monkeypatch, tmp_path):
+    missing_key_file = tmp_path / "missing-private-key.txt"
+    monkeypatch.delenv("LICENSE_PRIVATE_KEY", raising=False)
+    monkeypatch.setenv("LICENSE_PRIVATE_KEY_FILE", str(missing_key_file))
+    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_config()
+
+    assert "Failed to read LICENSE_PRIVATE_KEY_FILE" in str(exc_info.value)
+    assert str(missing_key_file) in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, OSError)
+
+
+def test_database_connection_enforces_license_device_foreign_key(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    initialize_database(database_path)
+
+    with connect(database_path) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO licenses (
+                    device_id, license_type, status, starts_at, expires_at,
+                    source, order_id, created_at, revoked_at
+                ) VALUES (999, 'trial', 'active', ?, ?, 'trial', NULL, ?, NULL)
+                """,
+                (
+                    "2026-06-04T00:00:00Z",
+                    "2026-06-18T00:00:00Z",
+                    "2026-06-04T00:00:00Z",
+                ),
+            )
 
 
 def test_devices_schema_excludes_campus_account_columns(tmp_path):
