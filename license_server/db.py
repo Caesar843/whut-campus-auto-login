@@ -4,9 +4,15 @@ import sqlite3
 from pathlib import Path
 
 
-LEGACY_CAMPUS_ACCOUNT_COLUMNS = (
+LEGACY_REMOVED_DEVICE_COLUMNS = (
     "campus_account_hash",
     "campus_account_masked",
+    "device_name",
+    "os",
+    "app_version",
+)
+LEGACY_REMOVED_LICENSE_COLUMNS = (
+    "revoked_reason",
 )
 
 SCHEMA = """
@@ -14,9 +20,6 @@ CREATE TABLE IF NOT EXISTS devices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id TEXT NOT NULL,
     device_fingerprint_hash TEXT NOT NULL UNIQUE,
-    device_name TEXT,
-    os TEXT,
-    app_version TEXT,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
 );
@@ -32,7 +35,6 @@ CREATE TABLE IF NOT EXISTS licenses (
     order_id TEXT,
     created_at TEXT NOT NULL,
     revoked_at TEXT,
-    revoked_reason TEXT,
     FOREIGN KEY (device_id) REFERENCES devices(id)
 );
 """
@@ -48,10 +50,14 @@ def connect(database_path: Path) -> sqlite3.Connection:
 def initialize_database(database_path: Path) -> None:
     with connect(database_path) as connection:
         connection.executescript(SCHEMA)
-        columns = {
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(devices)").fetchall()
-        }
-        for column in LEGACY_CAMPUS_ACCOUNT_COLUMNS:
-            if column in columns:
-                connection.execute(f'ALTER TABLE devices DROP COLUMN "{column}"')
+        for table, legacy_columns in (
+            ("devices", LEGACY_REMOVED_DEVICE_COLUMNS),
+            ("licenses", LEGACY_REMOVED_LICENSE_COLUMNS),
+        ):
+            columns = {
+                str(row["name"])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column in legacy_columns:
+                if column in columns:
+                    connection.execute(f'ALTER TABLE {table} DROP COLUMN "{column}"')
