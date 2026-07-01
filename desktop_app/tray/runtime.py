@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon, QWidget
 
@@ -28,6 +31,11 @@ STARTUP_INITIAL_DELAY_MS = 5_000
 STARTUP_RETRY_INTERVAL_MS = 12_000
 STARTUP_MAX_ATTEMPTS = 12
 STARTUP_DEVICE_MISMATCH_MAX_ATTEMPTS = 3
+WM_POWERBROADCAST = 0x0218
+PBT_APMRESUMEAUTOMATIC = 18
+PBT_APMRESUMESUSPEND = 7
+RESUME_NETWORK_RESTORE_DELAY_MS = 10_000
+RESUME_EVENT_DEBOUNCE_SECONDS = 10.0
 MainWindowFactory = Callable[[], QWidget]
 ActionFinishedCallback = Callable[[TrayActionResult], None]
 ScheduleOnce = Callable[[int, Callable[[], None]], None]
@@ -139,6 +147,63 @@ class StartupAutoLoginRetryCoordinator:
         self._controller.mark_startup_stopped(result)
 
 
+class ResumeAutoLoginScheduler:
+    def __init__(
+        self,
+        *,
+        start_startup_auto_login: Callable[[], None],
+        schedule_once: ScheduleOnce,
+        clock: Callable[[], float] = time.monotonic,
+        delay_ms: int = RESUME_NETWORK_RESTORE_DELAY_MS,
+        debounce_seconds: float = RESUME_EVENT_DEBOUNCE_SECONDS,
+    ):
+        self._start_startup_auto_login = start_startup_auto_login
+        self._schedule_once = schedule_once
+        self._clock = clock
+        self._delay_ms = delay_ms
+        self._debounce_seconds = debounce_seconds
+        self._last_resume_event_at: Optional[float] = None
+        self._generation = 0
+
+    def handle_resume_event(self) -> bool:
+        now = self._clock()
+        if (
+            self._last_resume_event_at is not None
+            and now - self._last_resume_event_at < self._debounce_seconds
+        ):
+            return False
+        self._last_resume_event_at = now
+        generation = self._generation
+        self._schedule_once(
+            self._delay_ms,
+            lambda: self._start_if_current(generation),
+        )
+        return True
+
+    def cancel(self) -> None:
+        self._generation += 1
+
+    def _start_if_current(self, generation: int) -> None:
+        if generation == self._generation:
+            self._start_startup_auto_login()
+
+
+class WindowsPowerResumeEventFilter(QAbstractNativeEventFilter):
+    def __init__(self, on_resume: Callable[[], None]):
+        super().__init__()
+        self._on_resume = on_resume
+
+    def nativeEventFilter(self, _event_type, message):
+        try:
+            win_message = ctypes.wintypes.MSG.from_address(int(message))
+        except (TypeError, ValueError):
+            return False, 0
+
+        if is_windows_resume_power_message(win_message.message, win_message.wParam):
+            self._on_resume()
+        return False, 0
+
+
 class _ActionWorker(QObject):
     finished = Signal(object)
 
@@ -195,6 +260,14 @@ class TrayRuntime(QObject):
             controller=self._controller,
             start_attempt=self._start_startup_attempt,
             schedule_once=QTimer.singleShot,
+        )
+        self._resume_scheduler = ResumeAutoLoginScheduler(
+            start_startup_auto_login=self.start_startup_auto_login,
+            schedule_once=QTimer.singleShot,
+        )
+        self._power_event_filter = install_windows_resume_event_filter(
+            app,
+            on_resume=self._resume_scheduler.handle_resume_event,
         )
         self._tray = QSystemTrayIcon(_load_icon(app), self)
         self._menu = QMenu()
@@ -270,6 +343,7 @@ class TrayRuntime(QObject):
         exit_action.triggered.connect(self._controller.request_exit)
 
     def _start_manual_action(self, action: Callable[[], TrayActionResult]) -> bool:
+        self._resume_scheduler.cancel()
         self._startup_retry.cancel()
         return self._start_action(action)
 
@@ -397,6 +471,26 @@ def schedule_startup_auto_login_if_requested(
                 safe_message="Startup auto login scheduled.",
             )
         start_startup_auto_login()
+
+
+def is_windows_resume_power_message(message: int, w_param: int) -> bool:
+    return message == WM_POWERBROADCAST and w_param in {
+        PBT_APMRESUMEAUTOMATIC,
+        PBT_APMRESUMESUSPEND,
+    }
+
+
+def install_windows_resume_event_filter(
+    app: QApplication,
+    *,
+    on_resume: Callable[[], None],
+    platform: str = sys.platform,
+) -> Optional[WindowsPowerResumeEventFilter]:
+    if platform != "win32":
+        return None
+    event_filter = WindowsPowerResumeEventFilter(on_resume)
+    app.installNativeEventFilter(event_filter)
+    return event_filter
 
 
 def _qt_argv(argv: Optional[Sequence[str]]) -> list[str]:

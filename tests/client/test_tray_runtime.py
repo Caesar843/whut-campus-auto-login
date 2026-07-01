@@ -185,6 +185,90 @@ def test_startup_tray_argument_logs_scheduled_event_without_changing_coordinator
     ]
 
 
+def test_resume_scheduler_delays_startup_retry():
+    calls = []
+    scheduler = FakeScheduler()
+    resume_scheduler = runtime.ResumeAutoLoginScheduler(
+        start_startup_auto_login=lambda: calls.append("start"),
+        schedule_once=scheduler,
+    )
+
+    assert resume_scheduler.handle_resume_event() is True
+
+    assert calls == []
+    assert scheduler.pending[0][0] == runtime.RESUME_NETWORK_RESTORE_DELAY_MS
+
+    scheduler.run_next()
+
+    assert calls == ["start"]
+
+
+def test_resume_scheduler_debounces_repeated_events():
+    now = [100.0]
+    scheduler = FakeScheduler()
+    resume_scheduler = runtime.ResumeAutoLoginScheduler(
+        start_startup_auto_login=lambda: None,
+        schedule_once=scheduler,
+        clock=lambda: now[0],
+    )
+
+    assert resume_scheduler.handle_resume_event() is True
+    now[0] += runtime.RESUME_EVENT_DEBOUNCE_SECONDS - 1
+    assert resume_scheduler.handle_resume_event() is False
+
+    assert len(scheduler.pending) == 1
+
+
+def test_resume_scheduler_reuses_existing_startup_retry_coordinator():
+    coordinator, _controller, startup_scheduler, starter = make_coordinator()
+    resume_delay_scheduler = FakeScheduler()
+    resume_scheduler = runtime.ResumeAutoLoginScheduler(
+        start_startup_auto_login=coordinator.start,
+        schedule_once=resume_delay_scheduler,
+    )
+
+    assert resume_scheduler.handle_resume_event() is True
+    resume_delay_scheduler.run_next()
+
+    assert startup_scheduler.pending[0][0] == runtime.STARTUP_INITIAL_DELAY_MS
+    startup_scheduler.run_next()
+    assert starter.attempts == [1]
+
+
+def test_windows_resume_power_message_detection():
+    assert runtime.is_windows_resume_power_message(0x0218, 18) is True
+    assert runtime.is_windows_resume_power_message(0x0218, 7) is True
+    assert runtime.is_windows_resume_power_message(0x0218, 4) is False
+    assert runtime.is_windows_resume_power_message(0x0000, 18) is False
+
+
+def test_native_resume_filter_not_installed_outside_windows():
+    app = SimpleNamespace(installNativeEventFilter=lambda _filter: None)
+
+    assert (
+        runtime.install_windows_resume_event_filter(
+            app,
+            on_resume=lambda: None,
+            platform="linux",
+        )
+        is None
+    )
+
+
+def test_native_resume_filter_installed_on_windows():
+    installed = []
+    app = SimpleNamespace(installNativeEventFilter=lambda item: installed.append(item))
+
+    event_filter = runtime.install_windows_resume_event_filter(
+        app,
+        on_resume=lambda: None,
+        platform="win32",
+    )
+
+    assert isinstance(event_filter, runtime.WindowsPowerResumeEventFilter)
+    assert installed == [event_filter]
+
+
 def test_plain_tray_start_does_not_start_retry_coordinator():
     calls = []
 
@@ -329,6 +413,7 @@ def test_cancel_ignores_pending_startup_retry():
 def test_manual_action_cancels_pending_startup_retry():
     calls = []
     fake_runtime = SimpleNamespace(
+        _resume_scheduler=SimpleNamespace(cancel=lambda: None),
         _startup_retry=SimpleNamespace(cancel=lambda: calls.append("cancel")),
         _start_action=lambda action: calls.append(action) or True,
     )
@@ -338,6 +423,28 @@ def test_manual_action_cancels_pending_startup_retry():
 
     assert started is True
     assert calls == ["cancel", action]
+
+
+def test_manual_action_cancels_pending_resume_auto_login():
+    calls = []
+    scheduler = FakeScheduler()
+    resume_scheduler = runtime.ResumeAutoLoginScheduler(
+        start_startup_auto_login=lambda: calls.append("resume-start"),
+        schedule_once=scheduler,
+    )
+    resume_scheduler.handle_resume_event()
+    fake_runtime = SimpleNamespace(
+        _resume_scheduler=resume_scheduler,
+        _startup_retry=SimpleNamespace(cancel=lambda: calls.append("startup-cancel")),
+        _start_action=lambda action: calls.append(action) or True,
+    )
+    action = lambda: None
+
+    started = runtime.TrayRuntime._start_manual_action(fake_runtime, action)
+    scheduler.run_next()
+
+    assert started is True
+    assert calls == ["startup-cancel", action]
 
 
 def test_plain_start_shows_main_window_but_startup_tray_does_not():
