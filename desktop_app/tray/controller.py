@@ -242,9 +242,21 @@ class TrayController:
             )
 
         next_status = TrayStatus.LOGGED_IN if result.ok else TrayStatus.LOGIN_FAILED
-        if result.ok and license_decision.bootstrap_required:
-            self._license_bootstrap_sync(bootstrap_decision=license_decision)
         self.set_status(next_status)
+        if result.ok and license_decision.bootstrap_required:
+            try:
+                self._license_bootstrap_sync(bootstrap_decision=license_decision)
+            except Exception as exc:
+                LOGGER.warning("Tray license bootstrap sync failed: %s", exc.__class__.__name__)
+                self._write_log(
+                    event="license_bootstrap_sync_failed",
+                    action=_log_action(action),
+                    status="failed",
+                    failed_stage="license_bootstrap_sync",
+                    failure_reason="license_bootstrap_sync_error",
+                    retry_count=retry_count,
+                    safe_message=_safe_exception_message(exc),
+                )
         self._write_login_result_log(result, action=action, retry_count=retry_count)
         return TrayActionResult(
             action=action,
@@ -481,7 +493,7 @@ def _login_attempt_event(action: str) -> str:
 
 def _login_result_event(action: str, *, success: bool) -> str:
     if action == "startup_auto_login":
-        return "startup_auto_login_success" if success else "manual_login_failed"
+        return "startup_auto_login_success" if success else "startup_auto_login_failed"
     return "manual_login_success" if success else "manual_login_failed"
 
 
