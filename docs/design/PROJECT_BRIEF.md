@@ -1500,6 +1500,24 @@ signed\_token
 
 
 
+数据最小化规则：
+
+
+
+1\. 原始请求体、完整请求头、签名材料和认证信息只允许在当前请求内用于验签、解密和解析，处理完成后立即丢弃；
+
+2\. 不得将原始回调、完整 headers、signature、authorization 或未经筛选的回调 JSON/XML 写入数据库、普通日志或后台页面；
+
+3\. 只有验签通过后，才能将订单号、交易号、支付状态、金额等业务字段作为可信数据持久化；
+
+4\. 验签失败时最多记录支付渠道、收到时间、verify\_status=failed、safe\_failure\_code、内部请求 ID 或请求长度，不记录未经验证的订单号、交易号、金额或支付状态；
+
+5\. 幂等优先依赖支付平台事件 ID、订单号、交易号和数据库唯一约束，不默认保存请求摘要；
+
+6\. 支付通知审计元数据仅按业务、财务对账和安全审计所需的最短必要期限保存，生产部署前必须明确保留期限和自动清理策略，不得默认永久保存。
+
+
+
 回调处理逻辑：
 
 
@@ -1832,7 +1850,7 @@ closed\_at：
 
 
 
-用于记录支付平台回调。
+用于记录经过白名单筛选后的支付通知审计元数据，不保存原始回调内容、完整请求头、签名材料或认证信息。
 
 
 
@@ -1844,15 +1862,23 @@ notify\_id
 
 channel
 
+provider\_notification\_id
+
 order\_id
 
 transaction\_id
 
-raw\_payload
+normalized\_event\_type
+
+notified\_amount
+
+currency
 
 verify\_status
 
 process\_status
+
+safe\_failure\_code
 
 received\_at
 
@@ -1876,21 +1902,39 @@ channel：
 
 
 
+provider\_notification\_id：
+
+&#x20;   支付平台提供的稳定通知或事件 ID，用于幂等处理；如果平台不提供，则依赖订单号、交易号和唯一约束。
+
+
+
 order\_id：
 
-&#x20;   关联订单号。
+&#x20;   验签通过后解析出的关联订单号。
 
 
 
 transaction\_id：
 
-&#x20;   支付平台交易号。
+&#x20;   验签通过后解析出的支付平台交易号。
 
 
 
-raw\_payload：
+normalized\_event\_type：
 
-&#x20;   原始回调内容。
+&#x20;   规范化后的通知类型，例如支付成功、关闭或退款相关事件。
+
+
+
+notified\_amount：
+
+&#x20;   验签通过后解析出的通知金额，用于与订单金额对账。
+
+
+
+currency：
+
+&#x20;   通知金额币种。
 
 
 
@@ -1903,6 +1947,12 @@ verify\_status：
 process\_status：
 
 &#x20;   处理状态。
+
+
+
+safe\_failure\_code：
+
+&#x20;   可安全持久化的失败原因代码，不包含原始请求内容、签名、认证信息或未验证业务字段。
 
 
 
