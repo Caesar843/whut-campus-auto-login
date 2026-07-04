@@ -155,25 +155,7 @@ class TrayController:
         try:
             license_decision = self._license_check()
         except Exception as exc:
-            LOGGER.exception("Tray license check failed.")
-            self.set_status(TrayStatus.LOGIN_FAILED)
-            self._write_log(
-                event="license_guard_blocked",
-                action=_log_action(action),
-                status="blocked",
-                failed_stage="license_check",
-                failure_reason="license_check_error",
-                retry_count=retry_count,
-                safe_message=_safe_exception_message(exc),
-            )
-            return TrayActionResult(
-                action=action,
-                status=self.status,
-                message=_safe_exception_message(exc),
-                failure_reason="license_check_error",
-                failed_stage="license_check",
-                retry_count=retry_count,
-            )
+            return self._license_check_error_result(action, exc, retry_count=retry_count)
         if not license_decision.allowed:
             self.set_status(TrayStatus.LOGIN_FAILED)
             blocked_result = license_blocked_result(license_decision)
@@ -342,7 +324,10 @@ class TrayController:
         )
 
     def relogin(self) -> TrayActionResult:
-        license_decision = self._license_check()
+        try:
+            license_decision = self._license_check()
+        except Exception as exc:
+            return self._license_check_error_result("relogin", exc)
         if not license_decision.allowed:
             self.set_status(TrayStatus.LOGIN_FAILED)
             blocked_result = license_blocked_result(license_decision)
@@ -376,6 +361,34 @@ class TrayController:
             status=login_result.status,
             message=login_result.message,
             result=login_result.result,
+        )
+
+    def _license_check_error_result(
+        self,
+        action: str,
+        exc: Exception,
+        *,
+        retry_count: int = 0,
+    ) -> TrayActionResult:
+        LOGGER.exception("Tray license check failed.")
+        self.set_status(TrayStatus.LOGIN_FAILED)
+        safe_message = _safe_exception_message(exc)
+        self._write_log(
+            event="license_guard_blocked",
+            action=_log_action(action),
+            status="blocked",
+            failed_stage="license_check",
+            failure_reason="license_check_error",
+            retry_count=retry_count,
+            safe_message=safe_message,
+        )
+        return TrayActionResult(
+            action=action,
+            status=self.status,
+            message=safe_message,
+            failure_reason="license_check_error",
+            failed_stage="license_check",
+            retry_count=retry_count,
         )
 
     def _write_license_decision_log(

@@ -416,6 +416,53 @@ def test_relogin_does_not_login_when_logout_is_still_pending():
     assert controller.status == TrayStatus.LOGOUT_PENDING
 
 
+def test_relogin_converts_license_check_exception_to_failed_result():
+    calls = []
+
+    def login():
+        calls.append("login")
+        return _result(LoginStatus.SUCCESS)
+
+    def logout():
+        calls.append("logout")
+        return _result(LoginStatus.LOGOUT_SUCCESS)
+
+    def license_check():
+        raise RuntimeError(
+            f"license exploded password={FAKE_PASSWORD} "
+            f"token={RAW_TOKEN} signed_token={RAW_SIGNED_TOKEN} account={FAKE_ACCOUNT}"
+        )
+
+    log_store = FakeLogStore()
+    controller = TrayController(
+        login_func=login,
+        logout_func=logout,
+        license_check_func=license_check,
+        log_store=log_store,
+    )
+
+    action_result = controller.relogin()
+
+    assert calls == []
+    assert action_result.action == "relogin"
+    assert action_result.result is None
+    assert action_result.status == TrayStatus.LOGIN_FAILED
+    assert action_result.failure_reason == "license_check_error"
+    assert action_result.failed_stage == "license_check"
+    assert action_result.retryable is False
+    assert controller.status == TrayStatus.LOGIN_FAILED
+    assert FAKE_PASSWORD not in action_result.message
+    assert RAW_TOKEN not in action_result.message
+    assert RAW_SIGNED_TOKEN not in action_result.message
+
+    failed_log = log_store.entries[-1]
+    assert failed_log["event"] == "license_guard_blocked"
+    assert failed_log["action"] == "relogin"
+    assert failed_log["status"] == "blocked"
+    assert failed_log["failed_stage"] == "license_check"
+    assert failed_log["failure_reason"] == "license_check_error"
+
+
 def test_login_exception_is_caught_and_marks_login_failed():
     def login():
         raise RuntimeError("login exploded")
