@@ -24,11 +24,11 @@ def mask_account(account: Optional[str]) -> str:
     if not account:
         return ""
     value = str(account)
-    if len(value) <= 2:
+    if len(value) <= 4:
         return "*" * len(value)
     if len(value) <= 8:
-        return value[:2] + "****" + value[-2:]
-    return value[:4] + "****" + value[-4:]
+        return value[:1] + "****" + value[-1:]
+    return value[:2] + "****" + value[-2:]
 
 
 def sanitize_url(

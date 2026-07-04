@@ -105,7 +105,7 @@ def test_login_config_repr_masks_account_and_password(tmp_path):
     )
 
     rendered = repr(result)
-    assert "36****69" in rendered
+    assert "3****9" in rendered
     assert "<PASSWORD>" in rendered
     assert "366369" not in rendered
     assert "secret-password" not in rendered
@@ -326,7 +326,7 @@ def test_config_cli_save_show_status_and_clear_never_print_plaintext(tmp_path, c
     )
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "username: 36****69" in output
+    assert "username: 3****9" in output
     assert "password_saved: true" in output
     assert "366369" not in output
     assert "secret-password" not in output
@@ -338,7 +338,7 @@ def test_config_cli_save_show_status_and_clear_never_print_plaintext(tmp_path, c
     )
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "username: 36****69" in output
+    assert "username: 3****9" in output
     assert "config_exists: true" in output
     assert "password_saved: true" in output
     assert "366369" not in output
@@ -351,7 +351,7 @@ def test_config_cli_save_show_status_and_clear_never_print_plaintext(tmp_path, c
     )
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "username: 36****69" in output
+    assert "username: 3****9" in output
     assert "config_exists: true" in output
     assert "password_saved: true" in output
     assert "366369" not in output

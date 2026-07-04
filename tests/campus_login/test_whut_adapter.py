@@ -195,7 +195,7 @@ def test_account_login_matches_browser_form_request_and_safe_summary():
     )
     assert result.request_summary["login_payload_keys"] == ["username", "password", "nasId"]
     assert result.request_summary["login_payload_sanitized"] == {
-        "username": "2024****1234",
+        "username": "20****34",
         "password": "<PASSWORD>",
         "nasId": "52",
     }

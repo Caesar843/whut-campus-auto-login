@@ -73,7 +73,7 @@ def test_script_prints_safe_summary_without_password(capsys):
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "status: success" in output
-    assert "account: 2024****1234" in output
+    assert "account: 20****34" in output
     assert "secret-password" not in output
     assert "202400001234" not in output
 
@@ -105,7 +105,7 @@ def test_script_prints_failed_stage_without_password(capsys):
     assert exit_code == 1
     assert "status: timeout" in output
     assert "failed_stage: account_status" in output
-    assert "account: 2024****1234" in output
+    assert "account: 20****34" in output
     assert "secret-password" not in output
     assert "202400001234" not in output
 
@@ -189,7 +189,7 @@ def test_script_prints_error_code_without_password(capsys):
     assert "status: auth_service_unavailable" in output
     assert "error_code: IP_NOT_ONLINE" in output
     assert "failed_stage: portal_context_or_ip_online_check" in output
-    assert "account: 2024****1234" in output
+    assert "account: 20****34" in output
     assert "secret-password" not in output
     assert "202400001234" not in output
 
@@ -255,7 +255,7 @@ def test_script_can_use_saved_config_without_printing_sensitive_values(capsys):
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "status: success" in output
-    assert "account: 2024****1234" in output
+    assert "account: 20****34" in output
     assert "secret-password" not in output
     assert "202400001234" not in output
 
@@ -301,7 +301,7 @@ def test_script_prints_request_summary_without_sensitive_values(capsys):
                     "content_type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "login_payload_keys": ["username", "password", "nasId"],
                     "login_payload_sanitized": {
-                        "username": "2024****1234",
+                        "username": "20****34",
                         "password": "<PASSWORD>",
                         "nasId": "52",
                     },
@@ -330,7 +330,7 @@ def test_script_prints_request_summary_without_sensitive_values(capsys):
     assert "method=POST" in output
     assert "content_type=application/x-www-form-urlencoded; charset=UTF-8" in output
     assert "login_payload_keys=username,password,nasId" in output
-    assert "username=2024****1234" in output
+    assert "username=20****34" in output
     assert "password=<PASSWORD>" in output
     assert "nasId=52" in output
     assert "cookie_present=True" in output
