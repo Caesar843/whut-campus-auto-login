@@ -21,6 +21,13 @@ class LicenseStatus(str, Enum):
     CONFIG_ONLY = "config_only"
 
 
+TOKEN_PERSIST_FAILED_WARNING = "token_persist_failed"
+TOKEN_PERSIST_FAILED_MESSAGE = (
+    "Current license is valid, but the local license token was not saved; "
+    "restart or offline use may require another online check."
+)
+
+
 @dataclass(frozen=True)
 class LicenseDecision:
     status: LicenseStatus
@@ -33,6 +40,7 @@ class LicenseDecision:
     signed_license_token: Optional[str] = None
     bootstrap_required: bool = False
     retryable: bool = False
+    warning_code: Optional[str] = None
 
 
 def evaluate_local_license(

@@ -36,6 +36,16 @@ def _bootstrap_decision() -> LicenseDecision:
     )
 
 
+def _warning_decision() -> LicenseDecision:
+    return LicenseDecision(
+        status=LicenseStatus.TRIAL_ACTIVE,
+        allowed=True,
+        reason="trial_active",
+        message_for_ui="current license is valid but local token was not saved",
+        warning_code="token_persist_failed",
+    )
+
+
 class FakeLogStore:
     def __init__(self):
         self.entries = []
@@ -73,6 +83,31 @@ def test_main_window_login_calls_runner_when_license_allows():
 
     assert calls == [("202400001234", "secret-password")]
     assert result.status == LoginStatus.SUCCESS
+
+
+def test_main_window_login_continues_and_logs_persistence_warning():
+    calls = []
+    log_store = FakeLogStore()
+    controller = MainWindowController(
+        login_runner=lambda username, password: calls.append((username, password))
+        or LoginResult(status=LoginStatus.SUCCESS, message="ok"),
+        license_check_func=_warning_decision,
+        log_store=log_store,
+    )
+
+    result = controller.test_login("202400001234", "secret-password")
+
+    assert result.status == LoginStatus.SUCCESS
+    assert calls == [("202400001234", "secret-password")]
+    events = [entry["event"] for entry in log_store.entries]
+    assert "license_persistence_warning" in events
+    warning_log = next(entry for entry in log_store.entries if entry["event"] == "license_persistence_warning")
+    assert warning_log["action"] == "manual_login"
+    assert warning_log["status"] == "warning"
+    assert warning_log["failure_reason"] == "token_persist_failed"
+    assert "C:/Users" not in warning_log["safe_message"]
+    assert "raw-token" not in warning_log["safe_message"]
+    assert "OSError" not in warning_log["safe_message"]
 
 
 def test_main_window_bootstrap_login_syncs_license_after_success():
@@ -118,6 +153,26 @@ def test_main_window_bootstrap_sync_failure_keeps_login_success():
     assert log_store.entries[-1]["event"] == "license_bootstrap_sync_failed"
     assert log_store.entries[-1]["failed_stage"] == "license_bootstrap_sync"
     assert log_store.entries[-1]["failure_reason"] == "license_bootstrap_sync_error"
+
+
+def test_main_window_bootstrap_sync_warning_keeps_login_success():
+    log_store = FakeLogStore()
+    controller = MainWindowController(
+        login_runner=lambda username, password: LoginResult(
+            status=LoginStatus.SUCCESS,
+            message="ok",
+        ),
+        license_check_func=lambda: _bootstrap_decision(),
+        license_bootstrap_sync_func=lambda **kwargs: _warning_decision(),
+        log_store=log_store,
+    )
+
+    result = controller.test_login("202400001234", "secret-password")
+
+    assert result.status == LoginStatus.SUCCESS
+    warning_log = next(entry for entry in log_store.entries if entry["event"] == "license_persistence_warning")
+    assert warning_log["action"] == "manual_login"
+    assert warning_log["failure_reason"] == "token_persist_failed"
 
 
 def test_main_window_bootstrap_login_failure_does_not_sync_license():
@@ -205,6 +260,32 @@ def test_tray_test_login_bootstrap_syncs_license_after_success():
     assert sync_calls[0]["bootstrap_decision"].bootstrap_required is True
 
 
+def test_tray_login_continues_and_logs_persistence_warning():
+    calls = []
+    log_store = FakeLogStore()
+    controller = TrayController(
+        login_func=lambda: calls.append("login")
+        or LoginResult(status=LoginStatus.SUCCESS, message="ok"),
+        license_check_func=_warning_decision,
+        log_store=log_store,
+    )
+
+    action_result = controller.test_login()
+
+    assert calls == ["login"]
+    assert action_result.status == TrayStatus.LOGGED_IN
+    events = [entry["event"] for entry in log_store.entries]
+    assert "license_guard_blocked" not in events
+    assert "license_persistence_warning" in events
+    warning_log = next(entry for entry in log_store.entries if entry["event"] == "license_persistence_warning")
+    assert warning_log["action"] == "manual_login"
+    assert warning_log["status"] == "warning"
+    assert warning_log["failure_reason"] == "token_persist_failed"
+    assert "C:/Users" not in warning_log["safe_message"]
+    assert "raw-token" not in warning_log["safe_message"]
+    assert "OSError" not in warning_log["safe_message"]
+
+
 def test_tray_bootstrap_sync_failure_keeps_logged_in_status():
     observed = []
     log_store = FakeLogStore()
@@ -230,6 +311,23 @@ def test_tray_bootstrap_sync_failure_keeps_logged_in_status():
     )
     assert sync_log["failed_stage"] == "license_bootstrap_sync"
     assert sync_log["failure_reason"] == "license_bootstrap_sync_error"
+
+
+def test_tray_bootstrap_sync_warning_keeps_logged_in_status():
+    log_store = FakeLogStore()
+    controller = TrayController(
+        login_func=lambda: LoginResult(status=LoginStatus.SUCCESS, message="ok"),
+        license_check_func=lambda: _bootstrap_decision(),
+        license_bootstrap_sync_func=lambda **kwargs: _warning_decision(),
+        log_store=log_store,
+    )
+
+    action_result = controller.test_login()
+
+    assert action_result.status == TrayStatus.LOGGED_IN
+    warning_log = next(entry for entry in log_store.entries if entry["event"] == "license_persistence_warning")
+    assert warning_log["action"] == "manual_login"
+    assert warning_log["failure_reason"] == "token_persist_failed"
 
 
 def test_tray_startup_auto_login_bootstrap_syncs_license_after_success():

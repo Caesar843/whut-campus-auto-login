@@ -1,5 +1,7 @@
 import base64
 import json
+import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from license_client.token_store import (
     load_signed_license_token,
     save_signed_license_token,
 )
+import license_client.license_guard as license_guard
 from license_client.token_verify import verify_signed_license_token
 
 
@@ -136,6 +139,68 @@ def test_token_store_round_trips_signed_license_token(tmp_path):
 
     assert deleted is True
     assert load_signed_license_token(token_path=path).status == "missing"
+
+
+def test_token_store_replaces_existing_token(tmp_path):
+    path = tmp_path / "license_token.json"
+
+    save_signed_license_token("old-signed-value", token_path=path)
+    save_signed_license_token("new-signed-value", token_path=path)
+
+    assert load_signed_license_token(token_path=path).signed_license_token == "new-signed-value"
+
+
+def test_token_store_preserves_json_format_and_utf8_encoding(tmp_path):
+    path = tmp_path / "license_token.json"
+
+    save_signed_license_token("signed-value", token_path=path)
+
+    raw = path.read_bytes()
+    assert raw.endswith(b"\n")
+    assert json.loads(raw.decode("utf-8")) == {"signed_license_token": "signed-value"}
+
+
+def test_token_store_replace_failure_keeps_existing_token_and_cleans_temp_file(tmp_path, monkeypatch):
+    path = tmp_path / "license_token.json"
+    save_signed_license_token("old-signed-value", token_path=path)
+
+    def fail_replace(src, dst):
+        raise OSError("replace failed C:/Users/example/license_token.json")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError):
+        save_signed_license_token("new-signed-value", token_path=path)
+
+    assert load_signed_license_token(token_path=path).signed_license_token == "old-signed-value"
+    assert [item.name for item in path.parent.iterdir()] == ["license_token.json"]
+
+
+def test_token_store_temp_write_failure_keeps_existing_token_and_cleans_temp_file(tmp_path, monkeypatch):
+    path = tmp_path / "license_token.json"
+    temp_path = tmp_path / ".license-token-temp"
+    save_signed_license_token("old-signed-value", token_path=path)
+
+    class FailingTempFile:
+        name = str(temp_path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def write(self, value):
+            temp_path.write_text("partial", encoding="utf-8")
+            raise OSError("write failed C:/Users/example/license_token.json")
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", lambda *args, **kwargs: FailingTempFile())
+
+    with pytest.raises(OSError):
+        save_signed_license_token("new-signed-value", token_path=path)
+
+    assert load_signed_license_token(token_path=path).signed_license_token == "old-signed-value"
+    assert [item.name for item in path.parent.iterdir()] == ["license_token.json"]
 
 
 def test_token_store_reports_corrupt_file_without_crashing(tmp_path):
@@ -300,6 +365,60 @@ def test_guard_registers_device_and_saves_trial_token_when_missing(tmp_path):
     assert decision.allowed is True
     assert decision.status == LicenseStatus.TRIAL_ACTIVE
     assert load_signed_license_token(token_path=token_path).signed_license_token == signed_license_token
+
+
+def test_guard_keeps_allowed_decision_when_token_persist_fails(tmp_path, monkeypatch):
+    private_key, public_key_b64 = _key_pair()
+    signed_license_token = _signed_license_token(private_key)
+
+    def fail_save(token, *, token_path=None):
+        raise OSError(f"persist failed C:/Users/example/{token}")
+
+    monkeypatch.setattr(license_guard, "save_signed_license_token", fail_save)
+
+    decision = check_license_before_login(
+        token_path=tmp_path / "license_token.json",
+        public_key_b64=public_key_b64,
+        device_fingerprint_hash="device-a",
+        api_client=lambda: LicenseApiResult(
+            reachable=True,
+            status="trial_active",
+            signed_license_token=signed_license_token,
+        ),
+    )
+
+    assert decision.allowed is True
+    assert decision.status == LicenseStatus.TRIAL_ACTIVE
+    assert decision.warning_code == "token_persist_failed"
+    assert signed_license_token not in decision.message_for_ui
+    assert "C:/Users/example" not in decision.message_for_ui
+    assert "persist failed" not in decision.message_for_ui
+
+
+def test_guard_does_not_convert_invalid_token_to_allowed_persistence_warning(tmp_path, monkeypatch):
+    _, public_key_b64 = _key_pair()
+    save_calls = []
+    monkeypatch.setattr(
+        license_guard,
+        "save_signed_license_token",
+        lambda *args, **kwargs: save_calls.append(args),
+    )
+
+    decision = check_license_before_login(
+        token_path=tmp_path / "license_token.json",
+        public_key_b64=public_key_b64,
+        device_fingerprint_hash="device-a",
+        api_client=lambda: LicenseApiResult(
+            reachable=True,
+            status="trial_active",
+            signed_license_token="invalid-token",
+        ),
+    )
+
+    assert decision.allowed is False
+    assert decision.status == LicenseStatus.TOKEN_INVALID
+    assert decision.warning_code is None
+    assert save_calls == []
 
 
 def test_guard_allows_bootstrap_when_token_missing_server_unreachable_saved_config_and_campus_network(tmp_path):
@@ -488,6 +607,41 @@ def test_bootstrap_success_initializes_and_saves_license_token(tmp_path):
     assert decision.allowed is True
     assert decision.status == LicenseStatus.TRIAL_ACTIVE
     assert load_signed_license_token(token_path=token_path).signed_license_token == signed_license_token
+
+
+def test_bootstrap_initialize_keeps_allowed_decision_when_token_persist_fails(tmp_path, monkeypatch):
+    private_key, public_key_b64 = _key_pair()
+    signed_license_token = _signed_license_token(private_key)
+    bootstrap_decision = LicenseDecision(
+        status=LicenseStatus.BOOTSTRAP_ALLOWED,
+        allowed=True,
+        reason="bootstrap_allowed",
+        bootstrap_required=True,
+    )
+
+    def fail_save(token, *, token_path=None):
+        raise OSError(f"persist failed C:/Users/example/{token}")
+
+    monkeypatch.setattr(license_guard, "save_signed_license_token", fail_save)
+
+    decision = try_initialize_license_after_bootstrap_login(
+        bootstrap_decision=bootstrap_decision,
+        token_path=tmp_path / "license_token.json",
+        public_key_b64=public_key_b64,
+        device_fingerprint_hash="device-a",
+        api_client=lambda: LicenseApiResult(
+            reachable=True,
+            status="trial_active",
+            signed_license_token=signed_license_token,
+        ),
+    )
+
+    assert decision.allowed is True
+    assert decision.status == LicenseStatus.TRIAL_ACTIVE
+    assert decision.warning_code == "token_persist_failed"
+    assert signed_license_token not in decision.message_for_ui
+    assert "C:/Users/example" not in decision.message_for_ui
+    assert "persist failed" not in decision.message_for_ui
 
 
 def test_bootstrap_failed_login_does_not_create_token(tmp_path):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -15,6 +16,8 @@ from license_client.license_api import LicenseApiClient, LicenseApiResult
 from license_client.license_state import (
     LicenseDecision,
     LicenseStatus,
+    TOKEN_PERSIST_FAILED_MESSAGE,
+    TOKEN_PERSIST_FAILED_WARNING,
     bootstrap_allowed_decision,
     evaluate_local_license,
     server_unreachable_decision,
@@ -88,9 +91,11 @@ def check_license_before_login(
         public_key_b64=public_key,
         device_fingerprint_hash=current_device_hash,
     )
-    if refreshed_decision.allowed:
-        save_signed_license_token(api_result.signed_license_token, token_path=token_path)
-    return refreshed_decision
+    return _save_allowed_token_or_warn(
+        refreshed_decision,
+        api_result.signed_license_token,
+        token_path=token_path,
+    )
 
 
 def try_initialize_license_after_bootstrap_login(
@@ -124,9 +129,11 @@ def try_initialize_license_after_bootstrap_login(
         public_key_b64=public_key,
         device_fingerprint_hash=current_device_hash,
     )
-    if decision.allowed:
-        save_signed_license_token(api_result.signed_license_token, token_path=token_path)
-    return decision
+    return _save_allowed_token_or_warn(
+        decision,
+        api_result.signed_license_token,
+        token_path=token_path,
+    )
 
 
 def default_campus_network_probe(timeout: float = 1.5) -> bool:
@@ -201,6 +208,26 @@ def _verify_to_decision(
         bootstrap_required=decision.bootstrap_required,
         retryable=decision.retryable,
     )
+
+
+def _save_allowed_token_or_warn(
+    decision: LicenseDecision,
+    signed_license_token: str,
+    *,
+    token_path: Optional[Path],
+) -> LicenseDecision:
+    if not decision.allowed:
+        return decision
+    try:
+        save_signed_license_token(signed_license_token, token_path=token_path)
+    except OSError:
+        LOGGER.warning("Local license token persistence failed.")
+        return replace(
+            decision,
+            warning_code=TOKEN_PERSIST_FAILED_WARNING,
+            message_for_ui=decision.message_for_ui or TOKEN_PERSIST_FAILED_MESSAGE,
+        )
+    return decision
 
 
 def _call_api(

@@ -48,7 +48,11 @@ from license_client.license_guard import (
     license_blocked_result,
     try_initialize_license_after_bootstrap_login,
 )
-from license_client.license_state import LicenseDecision
+from license_client.license_state import (
+    LicenseDecision,
+    TOKEN_PERSIST_FAILED_MESSAGE,
+    TOKEN_PERSIST_FAILED_WARNING,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -184,6 +188,7 @@ class MainWindowController:
                 event="bootstrap_allowed",
                 action="manual_login",
                 decision=license_decision,
+                emit_persistence_warning=False,
             )
         result = self._login_runner(clean_username, password)
         self._write_login_result_log(
@@ -195,7 +200,13 @@ class MainWindowController:
         )
         if result.ok and license_decision.bootstrap_required:
             try:
-                self._license_bootstrap_sync(bootstrap_decision=license_decision)
+                sync_decision = self._license_bootstrap_sync(
+                    bootstrap_decision=license_decision
+                )
+                self._write_license_persistence_warning_log(
+                    action="manual_login",
+                    decision=sync_decision,
+                )
             except Exception as exc:
                 LOGGER.warning("License bootstrap sync failed: %s", exc.__class__.__name__)
                 self._write_log(
@@ -219,6 +230,7 @@ class MainWindowController:
         event: str,
         action: str,
         decision: LicenseDecision,
+        emit_persistence_warning: bool = True,
     ) -> None:
         self._write_log(
             event=event,
@@ -226,6 +238,25 @@ class MainWindowController:
             status="allowed" if decision.allowed else "blocked",
             failure_reason=None if decision.allowed else decision.reason,
             safe_message=decision.message_for_ui or decision.reason,
+        )
+        if emit_persistence_warning:
+            self._write_license_persistence_warning_log(action=action, decision=decision)
+
+    def _write_license_persistence_warning_log(
+        self,
+        *,
+        action: str,
+        decision: LicenseDecision,
+    ) -> None:
+        warning_code = getattr(decision, "warning_code", None)
+        if not warning_code:
+            return
+        self._write_log(
+            event="license_persistence_warning",
+            action=action,
+            status="warning",
+            failure_reason=warning_code,
+            safe_message=_license_warning_message(decision),
         )
 
     def _write_login_result_log(
@@ -560,6 +591,12 @@ def _field_label(text: str) -> QLabel:
 
 def _safe_message(exc: Exception) -> str:
     return safe_exception_message(exc)
+
+
+def _license_warning_message(decision: LicenseDecision) -> str:
+    if getattr(decision, "warning_code", None) == TOKEN_PERSIST_FAILED_WARNING:
+        return TOKEN_PERSIST_FAILED_MESSAGE
+    return decision.message_for_ui or str(getattr(decision, "warning_code", "") or "")
 
 
 def _license_variant(decision: LicenseDecision) -> str:

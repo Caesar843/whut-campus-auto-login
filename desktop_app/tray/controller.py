@@ -21,6 +21,10 @@ from license_client.license_guard import (
     license_blocked_result,
     try_initialize_license_after_bootstrap_login,
 )
+from license_client.license_state import (
+    TOKEN_PERSIST_FAILED_MESSAGE,
+    TOKEN_PERSIST_FAILED_WARNING,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -167,11 +171,12 @@ class TrayController:
             )
             if license_decision.reason == "bootstrap_portal_not_ready":
                 self._write_license_decision_log(
-                    event="bootstrap_portal_not_ready",
-                    action=_log_action(action),
-                    decision=license_decision,
-                    retry_count=retry_count,
-                )
+                event="bootstrap_portal_not_ready",
+                action=_log_action(action),
+                decision=license_decision,
+                retry_count=retry_count,
+                emit_persistence_warning=False,
+            )
             return TrayActionResult(
                 action=action,
                 status=self.status,
@@ -194,6 +199,7 @@ class TrayController:
                 action=_log_action(action),
                 decision=license_decision,
                 retry_count=retry_count,
+                emit_persistence_warning=False,
             )
         self._write_log(
             event=_login_attempt_event(action),
@@ -227,7 +233,14 @@ class TrayController:
         self.set_status(next_status)
         if result.ok and license_decision.bootstrap_required:
             try:
-                self._license_bootstrap_sync(bootstrap_decision=license_decision)
+                sync_decision = self._license_bootstrap_sync(
+                    bootstrap_decision=license_decision
+                )
+                self._write_license_persistence_warning_log(
+                    action=_log_action(action),
+                    decision=sync_decision,
+                    retry_count=retry_count,
+                )
             except Exception as exc:
                 LOGGER.warning("Tray license bootstrap sync failed: %s", exc.__class__.__name__)
                 self._write_log(
@@ -398,6 +411,7 @@ class TrayController:
         action: str,
         decision,
         retry_count: int = 0,
+        emit_persistence_warning: bool = True,
     ) -> None:
         self._write_log(
             event=event,
@@ -407,6 +421,31 @@ class TrayController:
             failure_reason=None if decision.allowed else decision.reason,
             retry_count=retry_count,
             safe_message=decision.message_for_ui or decision.reason,
+        )
+        if emit_persistence_warning:
+            self._write_license_persistence_warning_log(
+                action=action,
+                decision=decision,
+                retry_count=retry_count,
+            )
+
+    def _write_license_persistence_warning_log(
+        self,
+        *,
+        action: str,
+        decision,
+        retry_count: int = 0,
+    ) -> None:
+        warning_code = getattr(decision, "warning_code", None)
+        if not warning_code:
+            return
+        self._write_log(
+            event="license_persistence_warning",
+            action=action,
+            status="warning",
+            failure_reason=warning_code,
+            retry_count=retry_count,
+            safe_message=_license_warning_message(decision),
         )
 
     def _write_login_result_log(
@@ -524,6 +563,12 @@ def _response_summary(result: LoginResult) -> tuple[object, str]:
 
 def _safe_exception_message(exc: Exception) -> str:
     return safe_exception_message(exc)
+
+
+def _license_warning_message(decision) -> str:
+    if getattr(decision, "warning_code", None) == TOKEN_PERSIST_FAILED_WARNING:
+        return TOKEN_PERSIST_FAILED_MESSAGE
+    return decision.message_for_ui or str(getattr(decision, "warning_code", "") or "")
 
 
 _RETRYABLE_STARTUP_LOGIN_STATUSES = {
