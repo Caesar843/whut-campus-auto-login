@@ -111,7 +111,7 @@ def load_login_config(
         credential_exists=credential_exists,
         auto_login_enabled=bool(payload.get("auto_login_enabled", True)),
         updated_at=str(payload.get("updated_at") or ""),
-        config_version=int(payload.get("config_version") or CONFIG_VERSION),
+        config_version=_parse_config_version(payload.get("config_version")),
         config_path=path,
     )
 
@@ -176,6 +176,18 @@ def _read_config_payload(path: Path) -> dict:
     if not isinstance(payload, dict):
         raise LocalConfigError("Local login config has an invalid format.")
     return payload
+
+
+def _parse_config_version(value: object) -> int:
+    """Parse and validate config_version from JSON payload.
+
+    Raises LocalConfigError for invalid types or values.
+    """
+    try:
+        version = int(value or CONFIG_VERSION)
+    except (ValueError, TypeError) as exc:
+        raise LocalConfigError("Local login config has invalid config_version.") from exc
+    return version
 
 
 def _utc_now() -> str:

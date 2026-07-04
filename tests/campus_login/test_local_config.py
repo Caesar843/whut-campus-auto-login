@@ -384,3 +384,115 @@ def test_config_cli_rejects_password_argument(tmp_path, capsys):
     assert exit_code == 2
     assert "--password is not supported" in output
     assert "secret-password" not in output
+
+
+def test_load_login_config_raises_local_config_error_for_invalid_config_version(tmp_path):
+    """config_version with non-numeric string raises LocalConfigError, not ValueError."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"username": "366369", "config_version": "not-a-number"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LocalConfigError) as exc_info:
+        load_login_config(config_path=config_path, credential_store=MemoryCredentialStore())
+
+    assert exc_info.value.__cause__ is not None
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+def test_load_login_config_raises_local_config_error_for_list_config_version(tmp_path):
+    """config_version as list raises LocalConfigError, not TypeError."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"username": "366369", "config_version": [1]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LocalConfigError) as exc_info:
+        load_login_config(config_path=config_path, credential_store=MemoryCredentialStore())
+
+    assert exc_info.value.__cause__ is not None
+    assert isinstance(exc_info.value.__cause__, TypeError)
+
+
+def test_load_login_config_raises_local_config_error_for_dict_config_version(tmp_path):
+    """config_version as dict raises LocalConfigError, not TypeError."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"username": "366369", "config_version": {"a": 1}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LocalConfigError) as exc_info:
+        load_login_config(config_path=config_path, credential_store=MemoryCredentialStore())
+
+    assert exc_info.value.__cause__ is not None
+    assert isinstance(exc_info.value.__cause__, TypeError)
+
+
+@pytest.mark.parametrize("config_version", [None, False, 0, ""])
+def test_load_login_config_uses_default_version_for_falsey_config_version(tmp_path, config_version):
+    """Falsey config_version values keep the old fallback behavior."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"username": "366369", "config_version": config_version}),
+        encoding="utf-8",
+    )
+
+    config = load_login_config(config_path=config_path, credential_store=MemoryCredentialStore())
+
+    assert config.config_version == 1
+
+
+def test_load_login_config_uses_default_version_for_missing(tmp_path):
+    """config_version missing uses default CONFIG_VERSION."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"username": "366369"}),
+        encoding="utf-8",
+    )
+
+    config = load_login_config(config_path=config_path, credential_store=MemoryCredentialStore())
+
+    assert config.config_version == 1
+
+
+@pytest.mark.parametrize("config_version", [1, 2])
+def test_load_login_config_accepts_valid_integer_config_version(tmp_path, config_version):
+    """Valid integer config_version is accepted."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"username": "366369", "config_version": config_version}),
+        encoding="utf-8",
+    )
+
+    config = load_login_config(config_path=config_path, credential_store=MemoryCredentialStore())
+
+    assert config.config_version == config_version
+
+
+def test_load_login_config_accepts_numeric_string_config_version(tmp_path):
+    """Numeric string config_version is accepted (int('1') works)."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"username": "366369", "config_version": "1"}),
+        encoding="utf-8",
+    )
+
+    config = load_login_config(config_path=config_path, credential_store=MemoryCredentialStore())
+
+    assert config.config_version == 1
+
+
+def test_load_login_config_accepts_boolean_config_version(tmp_path):
+    """Boolean config_version is accepted (int(True)==1)."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"username": "366369", "config_version": True}),
+        encoding="utf-8",
+    )
+
+    config = load_login_config(config_path=config_path, credential_store=MemoryCredentialStore())
+
+    assert config.config_version == 1
