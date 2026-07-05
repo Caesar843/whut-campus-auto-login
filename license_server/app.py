@@ -9,12 +9,15 @@ from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
 from license_server.config import (
     DEFAULT_PAYMENT_CHANNELS,
     DEFAULT_PAYMENT_ORDER_TTL_MINUTES,
+    is_production_environment,
     load_config,
+    validate_private_key_b64,
 )
 from license_server.db import initialize_database
 from license_server.routes import create_router
 
 
+HEALTHZ_RESPONSE = {"status": "ok"}
 HEALTH_RESPONSE = {"status": "ok", "service": "license_server"}
 
 
@@ -39,6 +42,9 @@ def create_app(
         payment_order_ttl_minutes = (
             payment_order_ttl_minutes or config.payment_order_ttl_minutes
         )
+    validate_private_key_b64(str(private_key_b64), source="private_key_b64")
+    if not str(admin_token or "").strip():
+        raise RuntimeError("admin_token is required.")
     payment_amount = payment_amount or PRICE_AMOUNT
     payment_currency = payment_currency or PRICE_CURRENCY
     payment_channels = payment_channels or DEFAULT_PAYMENT_CHANNELS
@@ -66,12 +72,25 @@ def _default_app() -> FastAPI:
     try:
         return create_app()
     except RuntimeError:
+        if _must_fail_startup():
+            raise
         fallback = FastAPI(title="WHUT Campus Auto Login License Server")
         _add_health_route(fallback)
         return fallback
 
 
+def _must_fail_startup() -> bool:
+    try:
+        return is_production_environment()
+    except RuntimeError:
+        return True
+
+
 def _add_health_route(app: FastAPI) -> None:
+    @app.get("/healthz")
+    def healthz():
+        return HEALTHZ_RESPONSE
+
     @app.get("/health")
     def health():
         return HEALTH_RESPONSE

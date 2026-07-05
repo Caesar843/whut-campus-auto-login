@@ -4,6 +4,7 @@ Development-only authorization server for the WHUT campus auto-login tool.
 
 It implements:
 
+- `GET /healthz`
 - `GET /health`
 - `POST /device/register`
 - `POST /license/refresh`
@@ -35,9 +36,10 @@ python scripts/dev/generate_license_keys.py
 Set environment variables:
 
 ```powershell
+$env:LICENSE_SERVER_ENV = "development"
 $env:LICENSE_PRIVATE_KEY = "<private key from script>"
 $env:LICENSE_PUBLIC_KEY = "<public key from script>"
-$env:LICENSE_ADMIN_TOKEN = "change-me"
+$env:LICENSE_ADMIN_TOKEN = "<local admin token>"
 $env:DATABASE_URL = "sqlite:///./license_server_dev.sqlite3"
 ```
 
@@ -49,5 +51,6 @@ uvicorn license_server.app:app --host 127.0.0.1 --port 8787
 
 The private key must not be committed. The client only needs the public key.
 
-Production deployments can set `DATABASE_URL=sqlite:////var/lib/whut-campus-auto-login/license.sqlite3`.
-`LICENSE_DB_PATH` is still accepted for local compatibility, but `DATABASE_URL` is preferred.
+Production must set `LICENSE_SERVER_ENV=production`, an explicit absolute
+SQLite path, a valid Ed25519 private key, and a strong `LICENSE_ADMIN_TOKEN`.
+See `docs/deploy/LICENSE_SERVER_PRODUCTION_CONFIG.md`.
