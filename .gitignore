@@ -25,6 +25,7 @@ temp/
 build/
 dist/
 *.spec
+!WHUTCampusAutoLogin.spec
 
 .DS_Store
 Thumbs.db

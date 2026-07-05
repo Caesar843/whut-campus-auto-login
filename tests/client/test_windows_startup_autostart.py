@@ -118,6 +118,23 @@ def test_development_shortcut_prefers_path_pythonw_over_current_interpreter(monk
     assert spec.arguments.endswith('desktop_app\\tray_app.py" --startup-tray')
 
 
+def test_frozen_shortcut_uses_packaged_exe_and_startup_tray_argument(monkeypatch):
+    exe_path = Path(r"C:\Program Files\WHUT Campus Login\WHUTCampusLogin.exe")
+
+    monkeypatch.setattr(windows_startup.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(windows_startup.sys, "executable", str(exe_path))
+
+    spec = windows_startup.build_shortcut_spec()
+    display_command = f'"{spec.target}" {spec.arguments}'
+
+    assert spec.target == exe_path.resolve()
+    assert spec.arguments == "--startup-tray"
+    assert spec.working_directory == exe_path.resolve().parent
+    assert display_command == f'"{exe_path.resolve()}" --startup-tray'
+    assert "tray_app.py" not in spec.arguments
+    assert "python" not in spec.target.name.lower()
+
+
 def test_disable_autostart_removes_shortcut_and_is_idempotent(tmp_path):
     backend = FakeShortcutBackend()
     env = _win_env(tmp_path)
