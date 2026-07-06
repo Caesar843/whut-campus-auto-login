@@ -147,7 +147,7 @@ def test_status_lazily_expires_unpaid_order(tmp_path):
     expired_at = datetime.now(timezone.utc) - timedelta(minutes=1)
     with connect(database_path) as connection:
         connection.execute(
-            "UPDATE payment_orders SET expire_at = ? WHERE order_id = ?",
+            "UPDATE payment_orders SET expires_at = ? WHERE order_id = ?",
             (datetime_text(expired_at), created["order_id"]),
         )
         connection.commit()

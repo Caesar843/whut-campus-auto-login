@@ -145,6 +145,55 @@ def test_load_config_accepts_test_mode_with_temporary_config(tmp_path):
     assert config.database_path == tmp_path / "license.sqlite3"
 
 
+def test_payment_provider_unconfigured_keeps_authorization_service_usable(tmp_path):
+    config = load_config(_production_env(tmp_path))
+
+    assert config.payment_provider is None
+    assert config.payment_price_fen == 990
+    assert config.payment_currency == "CNY"
+
+
+def test_development_and_test_allow_mock_payment_provider(tmp_path):
+    for environment in ("development", "test"):
+        config = load_config(
+            {
+                "LICENSE_SERVER_ENV": environment,
+                "DATABASE_URL": _sqlite_url(tmp_path / f"{environment}.sqlite3"),
+                "LICENSE_PRIVATE_KEY": _private_key_b64(),
+                "LICENSE_ADMIN_TOKEN": "admin-token",
+                "PAYMENT_PROVIDER": "mock",
+                "PAYMENT_PRICE_FEN": "990",
+                "PAYMENT_CURRENCY": "cny",
+            }
+        )
+
+        assert config.payment_provider == "mock"
+        assert config.payment_price_fen == 990
+        assert config.payment_currency == "CNY"
+
+
+def test_production_rejects_mock_payment_provider(tmp_path):
+    env = _production_env(tmp_path, PAYMENT_PROVIDER="mock")
+
+    with pytest.raises(RuntimeError, match="PAYMENT_PROVIDER=mock"):
+        load_config(env)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("PAYMENT_PRICE_FEN", "991", "PAYMENT_PRICE_FEN"),
+        ("PAYMENT_PRICE_FEN", "9.9", "PAYMENT_PRICE_FEN"),
+        ("PAYMENT_CURRENCY", "USD", "PAYMENT_CURRENCY"),
+    ],
+)
+def test_payment_config_must_match_product_catalog(tmp_path, key, value, message):
+    env = _production_env(tmp_path, **{key: value})
+
+    with pytest.raises(RuntimeError, match=message):
+        load_config(env)
+
+
 def test_load_config_rejects_invalid_environment():
     with pytest.raises(RuntimeError) as exc_info:
         load_config({"LICENSE_SERVER_ENV": "staging"})

@@ -11,11 +11,13 @@ from urllib.parse import unquote
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
+from license_server.payment import ANNUAL_V1
 
 DEFAULT_ENVIRONMENT = "development"
 VALID_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_PAYMENT_CHANNELS = ("wechat_pay", "alipay")
 DEFAULT_PAYMENT_ORDER_TTL_MINUTES = 15
+VALID_PAYMENT_PROVIDERS = {"mock", "wechat_native"}
 PRODUCTION_ADMIN_TOKEN_MIN_LENGTH = 32
 INSECURE_ADMIN_TOKEN_MARKERS = (
     "change-me",
@@ -34,6 +36,8 @@ class LicenseServerConfig:
     database_path: Path
     private_key_b64: str
     admin_token: str
+    payment_provider: str | None
+    payment_price_fen: int
     payment_amount: str
     payment_currency: str
     payment_channels: tuple[str, ...]
@@ -46,13 +50,17 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
     database_path = _database_path_from_env(values, environment)
     private_key_b64 = _private_key_from_env(values, environment)
     admin_token = _admin_token_from_env(values, environment)
+    payment_price_fen = _payment_price_fen_from_env(values)
+    payment_currency = _payment_currency_from_env(values)
     return LicenseServerConfig(
         environment=environment,
         database_path=database_path,
         private_key_b64=private_key_b64,
         admin_token=admin_token,
-        payment_amount=values.get("PAYMENT_YEARLY_AMOUNT", PRICE_AMOUNT).strip() or PRICE_AMOUNT,
-        payment_currency=values.get("PAYMENT_CURRENCY", PRICE_CURRENCY).strip() or PRICE_CURRENCY,
+        payment_provider=_payment_provider_from_env(values, environment),
+        payment_price_fen=payment_price_fen,
+        payment_amount=_payment_amount_text(payment_price_fen),
+        payment_currency=payment_currency,
         payment_channels=_payment_channels_from_env(values),
         payment_order_ttl_minutes=_payment_order_ttl_minutes_from_env(values),
     )
@@ -164,6 +172,43 @@ def _payment_channels_from_env(values: Mapping[str, str]) -> tuple[str, ...]:
     if not channels:
         raise RuntimeError("PAYMENT_CHANNELS must include at least one channel.")
     return channels
+
+
+def _payment_provider_from_env(values: Mapping[str, str], environment: str) -> str | None:
+    provider = values.get("PAYMENT_PROVIDER", "").strip().lower()
+    if not provider:
+        if environment == "production" and values.get("MOCK_PAYMENT_ADMIN_TOKEN", "").strip():
+            raise RuntimeError("MOCK_PAYMENT_ADMIN_TOKEN is not allowed in production.")
+        return None
+    if provider not in VALID_PAYMENT_PROVIDERS:
+        allowed = ", ".join(sorted(VALID_PAYMENT_PROVIDERS))
+        raise RuntimeError(f"PAYMENT_PROVIDER must be one of: {allowed}.")
+    if environment == "production" and provider == "mock":
+        raise RuntimeError("PAYMENT_PROVIDER=mock is not allowed in production.")
+    return provider
+
+
+def _payment_price_fen_from_env(values: Mapping[str, str]) -> int:
+    raw_value = values.get("PAYMENT_PRICE_FEN", str(ANNUAL_V1.amount_fen)).strip()
+    try:
+        price_fen = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError("PAYMENT_PRICE_FEN must be an integer number of fen.") from exc
+    if price_fen != ANNUAL_V1.amount_fen:
+        raise RuntimeError("PAYMENT_PRICE_FEN must match annual_v1 product catalog.")
+    return price_fen
+
+
+def _payment_currency_from_env(values: Mapping[str, str]) -> str:
+    currency = (values.get("PAYMENT_CURRENCY", ANNUAL_V1.currency).strip() or PRICE_CURRENCY).upper()
+    if currency != ANNUAL_V1.currency:
+        raise RuntimeError("PAYMENT_CURRENCY must match annual_v1 product catalog.")
+    return currency
+
+
+def _payment_amount_text(amount_fen: int) -> str:
+    whole, cents = divmod(amount_fen, 100)
+    return f"{whole}.{cents:02d}".rstrip("0").rstrip(".")
 
 
 def _payment_order_ttl_minutes_from_env(values: Mapping[str, str]) -> int:

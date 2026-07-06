@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from license_client.constants import PAID_LICENSE_DAYS, PRODUCT_ID, TRIAL_DAYS
 from license_server.db import connect
+from license_server.payment import ANNUAL_V1, OrderStatus
 from license_server.signer import datetime_text, sign_license_payload, utc_now_text
 
 
@@ -338,10 +339,13 @@ def _expire_open_payment_orders(connection, *, now: datetime) -> None:
     connection.execute(
         """
         UPDATE payment_orders
-        SET order_status = 'expired', closed_at = ?, updated_at = ?
-        WHERE payment_status = 'unpaid'
-          AND order_status IN ('created', 'pending_payment')
-          AND expire_at <= ?
+        SET status = 'CLOSED',
+            open_slot = NULL,
+            closed_at = ?,
+            updated_at = ?,
+            security_error_code = 'expired'
+        WHERE status IN ('CREATED', 'WAITING_PAYMENT')
+          AND expires_at <= ?
         """,
         (now_text, now_text, now_text),
     )
@@ -357,15 +361,15 @@ def _latest_open_payment_order(
     return connection.execute(
         """
         SELECT * FROM payment_orders
-        WHERE product_id = ?
+        WHERE product_code = ?
           AND device_fingerprint_hash = ?
-          AND payment_status = 'unpaid'
-          AND order_status IN ('created', 'pending_payment')
-          AND expire_at > ?
+          AND open_slot = 'open'
+          AND status IN ('CREATED', 'WAITING_PAYMENT', 'ABNORMAL')
+          AND (status = 'ABNORMAL' OR expires_at > ?)
         ORDER BY id DESC
         LIMIT 1
         """,
-        (product_id, device_fingerprint_hash, datetime_text(now)),
+        (ANNUAL_V1.product_code, device_fingerprint_hash, datetime_text(now)),
     ).fetchone()
 
 
@@ -386,23 +390,23 @@ def _create_payment_order(
     cursor = connection.execute(
         """
         INSERT INTO payment_orders (
-            order_id, product_id, device_fingerprint_hash, amount, currency,
-            payment_channel, order_status, payment_status, provider_status,
-            provider_order_id, transaction_id, created_at, expire_at, paid_at,
-            closed_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'created', 'unpaid', 'not_configured',
-                  NULL, NULL, ?, ?, NULL, NULL, ?)
+            order_id, device_fingerprint_hash, product_code, amount_fen,
+            currency, provider, status, open_slot, provider_order_id,
+            provider_transaction_id, provider_trade_state, created_at,
+            updated_at, expires_at, paid_at, closed_at, security_error_code
+        ) VALUES (?, ?, ?, ?, ?, ?, 'CREATED', 'open', NULL, NULL,
+                  'not_configured', ?, ?, ?, NULL, NULL, NULL)
         """,
         (
             order_id,
-            product_id,
             device_fingerprint_hash,
-            amount,
-            currency,
+            ANNUAL_V1.product_code,
+            ANNUAL_V1.amount_fen,
+            ANNUAL_V1.currency,
             payment_channel,
             now_text,
-            expire_at,
             now_text,
+            expire_at,
         ),
     )
     return connection.execute(
@@ -414,13 +418,13 @@ def _create_payment_order(
 def _payment_create_response(order_row) -> dict[str, object]:
     return {
         "order_id": str(order_row["order_id"]),
-        "amount": str(order_row["amount"]),
+        "amount": _amount_text(int(order_row["amount_fen"])),
         "currency": str(order_row["currency"]),
-        "payment_channel": str(order_row["payment_channel"]),
-        "order_status": str(order_row["order_status"]),
-        "payment_status": str(order_row["payment_status"]),
-        "provider_status": str(order_row["provider_status"]),
-        "expire_at": str(order_row["expire_at"]),
+        "payment_channel": str(order_row["provider"]),
+        "order_status": _legacy_order_status(order_row),
+        "payment_status": _legacy_payment_status(order_row),
+        "provider_status": str(order_row["provider_trade_state"] or "not_configured"),
+        "expire_at": str(order_row["expires_at"]),
         "payment_url": None,
         "qr_code_url": None,
         "message": "order_created_payment_provider_not_configured",
@@ -428,20 +432,38 @@ def _payment_create_response(order_row) -> dict[str, object]:
 
 
 def _payment_status_response(order_row) -> dict[str, object]:
-    order_status = str(order_row["order_status"])
+    order_status = _legacy_order_status(order_row)
     message = "order_expired" if order_status == "expired" else "order_waiting_for_payment_provider"
     return {
         "order_id": str(order_row["order_id"]),
         "order_status": order_status,
-        "payment_status": str(order_row["payment_status"]),
-        "provider_status": str(order_row["provider_status"]),
-        "amount": str(order_row["amount"]),
+        "payment_status": _legacy_payment_status(order_row),
+        "provider_status": str(order_row["provider_trade_state"] or "not_configured"),
+        "amount": _amount_text(int(order_row["amount_fen"])),
         "currency": str(order_row["currency"]),
-        "payment_channel": str(order_row["payment_channel"]),
-        "expire_at": str(order_row["expire_at"]),
+        "payment_channel": str(order_row["provider"]),
+        "expire_at": str(order_row["expires_at"]),
         "paid_at": order_row["paid_at"],
         "message": message,
     }
+
+
+def _legacy_order_status(order_row) -> str:
+    status = str(order_row["status"])
+    if status == OrderStatus.CLOSED.value and order_row["security_error_code"] == "expired":
+        return "expired"
+    if status == OrderStatus.WAITING_PAYMENT.value:
+        return "pending_payment"
+    return status.lower()
+
+
+def _legacy_payment_status(order_row) -> str:
+    return "paid" if str(order_row["status"]) == OrderStatus.PAID.value else "unpaid"
+
+
+def _amount_text(amount_fen: int) -> str:
+    whole, cents = divmod(amount_fen, 100)
+    return f"{whole}.{cents:02d}".rstrip("0").rstrip(".")
 
 
 def _license_response(*, product_id: str, device_fingerprint_hash: str, license_row, private_key_b64: str):
