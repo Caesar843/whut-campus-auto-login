@@ -22,6 +22,11 @@ Payment support is only an order skeleton:
 - it does not simulate payment success;
 - it does not issue paid licenses from payment orders.
 
+The current `/payment/create` and `/payment/status` routes are skeleton or
+compatibility routes. Payment V1 target contracts, states, schema, amount rules,
+and WeChat Native-only scope are defined in
+`docs/design/PAYMENT_V1_IMPLEMENTATION.md`.
+
 Orders can only become `paid` after a future real payment callback verifies the
 provider signature, amount, order status, and idempotency rules.
 

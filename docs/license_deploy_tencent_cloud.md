@@ -1,6 +1,6 @@
 # 授权服务腾讯云部署说明
 
-本文档只说明授权服务部署配置，不包含真实服务器登录、真实部署、支付接入或后台管理。
+本文档只说明授权服务部署配置。授权服务已完成预生产部署；本文不包含支付接入或后台管理闭环。
 
 ## 部署目标
 
@@ -46,7 +46,7 @@ LICENSE_PRIVATE_KEY=replace_with_base64_or_configured_private_key
 LICENSE_PUBLIC_KEY=replace_with_public_key
 LICENSE_ADMIN_TOKEN=replace_with_strong_admin_token
 DATABASE_URL=sqlite:////var/lib/whut-campus-auto-login/license.sqlite3
-SERVER_ENV=production
+LICENSE_SERVER_ENV=production
 ```
 
 `DATABASE_URL` 第一版只使用 SQLite。生产数据库文件建议放在：
@@ -76,13 +76,13 @@ uvicorn license_server.app:app --host 127.0.0.1 --port 8787
 健康检查：
 
 ```bash
-curl http://127.0.0.1:8787/health
+curl http://127.0.0.1:8787/healthz
 ```
 
 期望返回：
 
 ```json
-{"status":"ok","service":"license_server"}
+{"status":"ok"}
 ```
 
 ## systemd
@@ -118,8 +118,8 @@ sudo systemctl reload nginx
 公网 HTTP 测试：
 
 ```bash
-curl http://124.223.7.147/health
-curl http://license.whutlogin.cn/health
+curl http://124.223.7.147/healthz
+curl http://license.whutlogin.cn/healthz
 ```
 
 ## HTTPS 后续配置
@@ -159,4 +159,4 @@ LICENSE_SERVER_URL=https://license.whutlogin.cn
 - 用户上网内容
 - 本地运行日志
 
-授权服务只处理设备授权状态、试用时间和后续支付订单状态。当前部署配置不接支付，不提交支付密钥。
+授权服务只处理设备授权状态、试用时间和后续支付订单状态。当前部署配置不接支付，不提交支付密钥。支付 V1 仅支持微信 Native；支付表、Mock 网关、支付客户端和真实微信商户联调仍以 `docs/design/PAYMENT_V1_IMPLEMENTATION.md` 为准。

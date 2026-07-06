@@ -1,6 +1,6 @@
 # 授权服务生产配置准备
 
-本文件只说明 `license_server` 的生产配置边界。它不是云服务器部署手册，本轮尚未完成 Nginx、HTTPS、systemd、数据库迁移、支付接入和备份。
+本文件只说明 `license_server` 的生产配置边界。授权服务已完成预生产部署；本文不是完整云服务器部署手册，不展开 Nginx、HTTPS、systemd、数据库迁移、支付接入和备份细节。
 
 ## 运行环境
 
@@ -22,10 +22,12 @@
 - `LICENSE_PRIVATE_KEY`：Base64 编码的 32 字节 Ed25519 私钥。
 - `LICENSE_PRIVATE_KEY_FILE`：保存上述私钥内容的文件路径。生产建议使用这个变量，路径必须是绝对路径。
 - `LICENSE_ADMIN_TOKEN`：管理员接口 token。生产必须显式配置，至少 32 个字符，不能使用占位符。
-- `PAYMENT_YEARLY_AMOUNT`：年费金额，当前默认 `9.9`。
+- `PAYMENT_YEARLY_AMOUNT`：既有订单骨架使用的年费金额，当前默认 `9.9`。
 - `PAYMENT_CURRENCY`：币种，当前默认 `CNY`。
-- `PAYMENT_CHANNELS`：允许的支付渠道列表，当前只是订单骨架。
+- `PAYMENT_CHANNELS`：既有订单骨架使用的支付渠道列表，当前只是订单骨架。
 - `PAYMENT_ORDER_TTL_MINUTES`：未支付订单有效分钟数。
+
+支付 V1 的产品目录、`PAYMENT_PRICE_FEN=990` 启动校验、微信 Native-only 范围、支付表和回调幂等规则以 `docs/design/PAYMENT_V1_IMPLEMENTATION.md` 为准。当前预生产授权服务完成，不代表支付预生产闭环完成。
 
 客户端相关配置：
 
@@ -109,13 +111,14 @@ GET /healthz
 
 `license_server/.env.example` 只是模板，只能提交变量名和占位符。实际 `.env`、私钥、SQLite 数据库和 token 文件不得进入 Git。
 
-## 尚未完成
+## 后续部署与支付事项
 
-本轮没有完成真实云服务器部署。后续仍需要：
+授权服务预生产部署已完成。后续仍需要补齐或确认：
 
 - Nginx 反向代理；
 - HTTPS 证书；
 - systemd 或其他进程管理；
 - 数据库备份；
 - 支付平台真实接入；
-- 支付回调验签和幂等处理。
+- 支付回调验签和幂等处理；
+- 支付相关数据库表、Mock 网关和支付客户端。
