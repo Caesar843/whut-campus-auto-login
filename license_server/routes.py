@@ -10,6 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from license_client.constants import PAID_LICENSE_DAYS, PRODUCT_ID, TRIAL_DAYS
 from license_server.db import connect
+from license_server.license_service import (
+    create_license,
+    latest_license,
+    paid_active_license_exists,
+)
 from license_server.payment import ANNUAL_V1, OrderStatus
 from license_server.signer import datetime_text, sign_license_payload, utc_now_text
 
@@ -94,7 +99,7 @@ def create_router(
                     ),
                 )
                 device_id = int(cursor.lastrowid)
-                license_row = _create_license(
+                license_row = create_license(
                     connection,
                     device_id=device_id,
                     license_type="trial",
@@ -115,9 +120,9 @@ def create_router(
                         device_id,
                     ),
                 )
-                license_row = _latest_license(connection, device_id)
+                license_row = latest_license(connection, device_id)
                 if license_row is None:
-                    license_row = _create_license(
+                    license_row = create_license(
                         connection,
                         device_id=device_id,
                         license_type="trial",
@@ -148,7 +153,7 @@ def create_router(
                 "UPDATE devices SET last_seen_at = ? WHERE id = ?",
                 (datetime_text(now), int(device["id"])),
             )
-            license_row = _latest_license(connection, int(device["id"]))
+            license_row = latest_license(connection, int(device["id"]))
             if license_row is None:
                 raise HTTPException(status_code=404, detail="license_not_found")
             connection.commit()
@@ -174,7 +179,7 @@ def create_router(
             ).fetchone()
             if device is None:
                 raise HTTPException(status_code=404, detail="device_not_found")
-            license_row = _create_license(
+            license_row = create_license(
                 connection,
                 device_id=int(device["id"]),
                 license_type="paid",
@@ -202,7 +207,7 @@ def create_router(
         now = datetime.now(timezone.utc).replace(microsecond=0)
         with connect(database_path) as connection:
             _expire_open_payment_orders(connection, now=now)
-            if _paid_active_license_exists(
+            if paid_active_license_exists(
                 connection,
                 device_fingerprint_hash=request.device_fingerprint_hash,
                 now=now,
@@ -270,68 +275,6 @@ def _drop_legacy_device_description_fields(data: Any) -> Any:
 def _validate_not_blank(value: str, detail: str) -> None:
     if not str(value or "").strip():
         raise HTTPException(status_code=400, detail=detail)
-
-
-def _create_license(connection, *, device_id: int, license_type: str, source: str, starts_at: datetime, expires_at: datetime):
-    cursor = connection.execute(
-        """
-        INSERT INTO licenses (
-            device_id, license_type, status, starts_at, expires_at, source, order_id,
-            created_at, revoked_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)
-        """,
-        (
-            device_id,
-            license_type,
-            "active",
-            datetime_text(starts_at),
-            datetime_text(expires_at),
-            source,
-            datetime_text(starts_at),
-        ),
-    )
-    return connection.execute(
-        "SELECT * FROM licenses WHERE id = ?",
-        (int(cursor.lastrowid),),
-    ).fetchone()
-
-
-def _latest_license(connection, device_id: int):
-    paid = connection.execute(
-        """
-        SELECT * FROM licenses
-        WHERE device_id = ? AND license_type = 'paid'
-        ORDER BY id DESC LIMIT 1
-        """,
-        (device_id,),
-    ).fetchone()
-    if paid is not None:
-        return paid
-    return connection.execute(
-        """
-        SELECT * FROM licenses
-        WHERE device_id = ?
-        ORDER BY id DESC LIMIT 1
-        """,
-        (device_id,),
-    ).fetchone()
-
-
-def _paid_active_license_exists(connection, *, device_fingerprint_hash: str, now: datetime) -> bool:
-    row = connection.execute(
-        """
-        SELECT licenses.id
-        FROM licenses
-        JOIN devices ON devices.id = licenses.device_id
-        WHERE devices.device_fingerprint_hash = ?
-          AND licenses.license_type = 'paid'
-          AND licenses.status = 'active'
-          AND licenses.expires_at > ?
-        LIMIT 1
-        """,
-        (device_fingerprint_hash, datetime_text(now)),
-    ).fetchone()
-    return row is not None
 
 
 def _expire_open_payment_orders(connection, *, now: datetime) -> None:

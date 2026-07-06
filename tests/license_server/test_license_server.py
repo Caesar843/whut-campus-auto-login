@@ -34,12 +34,13 @@ def _public_key_b64(private_key_b64: str) -> str:
     ).decode("ascii")
 
 
-def _client(tmp_path):
+def _client(tmp_path, **app_kwargs):
     private_key_b64 = _private_key_b64()
     app = create_app(
         database_path=tmp_path / "license.sqlite3",
         private_key_b64=private_key_b64,
         admin_token="admin-token",
+        **app_kwargs,
     )
     return TestClient(app), _public_key_b64(private_key_b64)
 
@@ -162,12 +163,14 @@ def test_development_and_test_allow_mock_payment_provider(tmp_path):
                 "LICENSE_PRIVATE_KEY": _private_key_b64(),
                 "LICENSE_ADMIN_TOKEN": "admin-token",
                 "PAYMENT_PROVIDER": "mock",
+                "PAYMENT_MOCK_ADMIN_TOKEN": "mockR4ndomValue123456",
                 "PAYMENT_PRICE_FEN": "990",
                 "PAYMENT_CURRENCY": "cny",
             }
         )
 
         assert config.payment_provider == "mock"
+        assert config.payment_mock_admin_token == "mockR4ndomValue123456"
         assert config.payment_price_fen == 990
         assert config.payment_currency == "CNY"
 
@@ -176,6 +179,19 @@ def test_production_rejects_mock_payment_provider(tmp_path):
     env = _production_env(tmp_path, PAYMENT_PROVIDER="mock")
 
     with pytest.raises(RuntimeError, match="PAYMENT_PROVIDER=mock"):
+        load_config(env)
+
+
+def test_mock_payment_provider_requires_admin_token(tmp_path):
+    env = {
+        "LICENSE_SERVER_ENV": "test",
+        "DATABASE_URL": _sqlite_url(tmp_path / "license.sqlite3"),
+        "LICENSE_PRIVATE_KEY": _private_key_b64(),
+        "LICENSE_ADMIN_TOKEN": "admin-token",
+        "PAYMENT_PROVIDER": "mock",
+    }
+
+    with pytest.raises(RuntimeError, match="PAYMENT_MOCK_ADMIN_TOKEN"):
         load_config(env)
 
 
@@ -328,6 +344,16 @@ def test_production_rejects_short_admin_token(tmp_path):
     message = str(exc_info.value)
     assert "at least 32 characters" in message
     assert secret not in message
+
+
+def test_create_app_direct_production_rejects_short_admin_token(tmp_path):
+    with pytest.raises(RuntimeError, match="at least 32 characters"):
+        create_app(
+            database_path=tmp_path / "license.sqlite3",
+            private_key_b64=_private_key_b64(),
+            admin_token="short-token",
+            environment="production",
+        )
 
 
 def test_production_rejects_low_entropy_admin_token(tmp_path):
@@ -746,6 +772,7 @@ def test_env_example_contains_only_placeholders():
     assert "DATABASE_URL=sqlite:///ABSOLUTE_PATH_TO_LICENSE_SERVER_DB.sqlite3" in content
     assert "LICENSE_PRIVATE_KEY_FILE=ABSOLUTE_PATH_TO_ED25519_PRIVATE_KEY_B64_FILE" in content
     assert "LICENSE_ADMIN_TOKEN=REPLACE_WITH_RANDOM_TOKEN_AT_LEAST_32_CHARS" in content
+    assert "PAYMENT_MOCK_ADMIN_TOKEN=REPLACE_WITH_RANDOM_MOCK_TOKEN_AT_LEAST_16_CHARS" in content
     assert "LICENSE_SERVER_URL=http://127.0.0.1:8787" in content
     assert "LICENSE_PUBLIC_KEY=REPLACE_WITH_ED25519_PUBLIC_KEY_B64" in content
     assert "\nSERVER_ENV=" not in content

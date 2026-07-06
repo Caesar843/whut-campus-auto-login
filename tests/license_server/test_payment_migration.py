@@ -60,6 +60,21 @@ def test_initialize_database_is_idempotent(tmp_path):
     assert _table_sql(database_path) == before
 
 
+def test_initialize_database_rolls_back_schema_setup(tmp_path, monkeypatch):
+    database_path = tmp_path / "license.sqlite3"
+
+    def fail_payment_orders(_connection):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("license_server.db._ensure_payment_orders", fail_payment_orders)
+    with pytest.raises(RuntimeError, match="boom"):
+        initialize_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert "devices" not in _tables(connection)
+        assert "schema_meta" not in _tables(connection)
+
+
 def test_future_schema_version_refuses_startup(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     initialize_database(database_path)

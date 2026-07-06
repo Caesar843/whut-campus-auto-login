@@ -171,20 +171,20 @@ def initialize_database(database_path: Path) -> None:
                 f"database schema version {schema_version} is newer than supported "
                 f"{SUPPORTED_SCHEMA_VERSION}"
             )
-        connection.executescript(CORE_SCHEMA)
+        _execute_script(connection, CORE_SCHEMA)
         _drop_legacy_sensitive_columns(connection)
         _ensure_payment_orders(connection)
-        connection.executescript(PAYMENT_NOTIFICATION_SCHEMA)
-        connection.executescript(LICENSE_GRANT_SCHEMA)
+        _execute_script(connection, PAYMENT_NOTIFICATION_SCHEMA)
+        _execute_script(connection, LICENSE_GRANT_SCHEMA)
         _set_schema_version(connection, SUPPORTED_SCHEMA_VERSION)
 
 
 def _ensure_payment_orders(connection: sqlite3.Connection) -> None:
     if not _table_exists(connection, "payment_orders"):
-        connection.executescript(PAYMENT_ORDER_SCHEMA)
+        _execute_script(connection, PAYMENT_ORDER_SCHEMA)
         return
     if _payment_orders_is_v1(connection):
-        connection.executescript(PAYMENT_ORDER_SCHEMA)
+        _execute_script(connection, PAYMENT_ORDER_SCHEMA)
         return
     _migrate_legacy_payment_orders(connection)
 
@@ -193,7 +193,7 @@ def _migrate_legacy_payment_orders(connection: sqlite3.Connection) -> None:
     rows = connection.execute("SELECT * FROM payment_orders ORDER BY id").fetchall()
     migrated_rows = [_legacy_payment_order(row) for row in rows]
     connection.execute("ALTER TABLE payment_orders RENAME TO payment_orders_legacy_v0")
-    connection.executescript(PAYMENT_ORDER_SCHEMA)
+    _execute_script(connection, PAYMENT_ORDER_SCHEMA)
     connection.executemany(
         """
         INSERT INTO payment_orders (
@@ -309,6 +309,13 @@ def _set_schema_version(connection: sqlite3.Connection, version: int) -> None:
         """,
         (str(version),),
     )
+
+
+def _execute_script(connection: sqlite3.Connection, script: str) -> None:
+    for statement in script.split(";"):
+        statement = statement.strip()
+        if statement:
+            connection.execute(statement)
 
 
 def _payment_orders_is_v1(connection: sqlite3.Connection) -> bool:

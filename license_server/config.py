@@ -19,6 +19,7 @@ DEFAULT_PAYMENT_CHANNELS = ("wechat_pay", "alipay")
 DEFAULT_PAYMENT_ORDER_TTL_MINUTES = 15
 VALID_PAYMENT_PROVIDERS = {"mock", "wechat_native"}
 PRODUCTION_ADMIN_TOKEN_MIN_LENGTH = 32
+MOCK_ADMIN_TOKEN_MIN_LENGTH = 16
 INSECURE_ADMIN_TOKEN_MARKERS = (
     "change-me",
     "changeme",
@@ -37,6 +38,7 @@ class LicenseServerConfig:
     private_key_b64: str
     admin_token: str
     payment_provider: str | None
+    payment_mock_admin_token: str | None
     payment_price_fen: int
     payment_amount: str
     payment_currency: str
@@ -58,6 +60,7 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
         private_key_b64=private_key_b64,
         admin_token=admin_token,
         payment_provider=_payment_provider_from_env(values, environment),
+        payment_mock_admin_token=_payment_mock_admin_token_from_env(values, environment),
         payment_price_fen=payment_price_fen,
         payment_amount=_payment_amount_text(payment_price_fen),
         payment_currency=payment_currency,
@@ -146,11 +149,11 @@ def _admin_token_from_env(values: Mapping[str, str], environment: str) -> str:
     if not admin_token:
         raise RuntimeError("LICENSE_ADMIN_TOKEN is required.")
     if environment == "production":
-        _validate_production_admin_token(admin_token)
+        validate_production_admin_token(admin_token)
     return admin_token
 
 
-def _validate_production_admin_token(admin_token: str) -> None:
+def validate_production_admin_token(admin_token: str) -> None:
     normalized = admin_token.lower()
     if len(admin_token) < PRODUCTION_ADMIN_TOKEN_MIN_LENGTH:
         raise RuntimeError(
@@ -177,8 +180,8 @@ def _payment_channels_from_env(values: Mapping[str, str]) -> tuple[str, ...]:
 def _payment_provider_from_env(values: Mapping[str, str], environment: str) -> str | None:
     provider = values.get("PAYMENT_PROVIDER", "").strip().lower()
     if not provider:
-        if environment == "production" and values.get("MOCK_PAYMENT_ADMIN_TOKEN", "").strip():
-            raise RuntimeError("MOCK_PAYMENT_ADMIN_TOKEN is not allowed in production.")
+        if environment == "production" and _raw_mock_admin_token(values):
+            raise RuntimeError("PAYMENT_MOCK_ADMIN_TOKEN is not allowed in production.")
         return None
     if provider not in VALID_PAYMENT_PROVIDERS:
         allowed = ", ".join(sorted(VALID_PAYMENT_PROVIDERS))
@@ -186,6 +189,38 @@ def _payment_provider_from_env(values: Mapping[str, str], environment: str) -> s
     if environment == "production" and provider == "mock":
         raise RuntimeError("PAYMENT_PROVIDER=mock is not allowed in production.")
     return provider
+
+
+def _payment_mock_admin_token_from_env(
+    values: Mapping[str, str],
+    environment: str,
+) -> str | None:
+    token = _raw_mock_admin_token(values)
+    if environment == "production" and token:
+        raise RuntimeError("PAYMENT_MOCK_ADMIN_TOKEN is not allowed in production.")
+    if values.get("PAYMENT_PROVIDER", "").strip().lower() != "mock":
+        return None
+    if not token:
+        raise RuntimeError("PAYMENT_MOCK_ADMIN_TOKEN is required when PAYMENT_PROVIDER=mock.")
+    validate_mock_admin_token(token)
+    return token
+
+
+def _raw_mock_admin_token(values: Mapping[str, str]) -> str:
+    return (
+        values.get("PAYMENT_MOCK_ADMIN_TOKEN", "").strip()
+        or values.get("MOCK_PAYMENT_ADMIN_TOKEN", "").strip()
+    )
+
+
+def validate_mock_admin_token(token: str) -> None:
+    normalized = token.lower()
+    if len(token) < MOCK_ADMIN_TOKEN_MIN_LENGTH:
+        raise RuntimeError("PAYMENT_MOCK_ADMIN_TOKEN is too short.")
+    if any(marker in normalized for marker in INSECURE_ADMIN_TOKEN_MARKERS):
+        raise RuntimeError("PAYMENT_MOCK_ADMIN_TOKEN uses an insecure placeholder value.")
+    if len(set(token)) < 8:
+        raise RuntimeError("PAYMENT_MOCK_ADMIN_TOKEN is too weak.")
 
 
 def _payment_price_fen_from_env(values: Mapping[str, str]) -> int:
