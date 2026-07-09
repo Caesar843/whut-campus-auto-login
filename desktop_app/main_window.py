@@ -43,13 +43,16 @@ from desktop_app.widgets import AccountLineEdit, PasswordLineEdit, StatusLabel
 from license_client.license_guard import (
     LicenseBootstrapSyncFunc,
     LicenseCheckFunc,
+    LicenseInitializeFunc,
     check_license_before_login,
     get_current_license_state,
+    initialize_license,
     license_blocked_result,
     try_initialize_license_after_bootstrap_login,
 )
 from license_client.license_state import (
     LicenseDecision,
+    LicenseStatus,
     TOKEN_PERSIST_FAILED_MESSAGE,
     TOKEN_PERSIST_FAILED_WARNING,
 )
@@ -73,6 +76,9 @@ class MainWindowState:
     credential_exists: bool = False
     license_message: str = LICENSE_PLACEHOLDER
     license_variant: str = "neutral"
+    payment_button_text: str = "暂无法购买"
+    payment_button_enabled: bool = False
+    payment_button_action: str = "disabled"
 
 
 class MainWindowController:
@@ -88,6 +94,7 @@ class MainWindowController:
         login_runner: Optional[LoginRunner] = None,
         license_check_func: Optional[LicenseCheckFunc] = None,
         license_bootstrap_sync_func: Optional[LicenseBootstrapSyncFunc] = None,
+        license_initialize_func: Optional[LicenseInitializeFunc] = None,
         license_state_func: Optional[Callable[[], LicenseDecision]] = None,
         log_store: Optional[RuntimeLogStore] = None,
     ):
@@ -102,6 +109,7 @@ class MainWindowController:
         self._license_bootstrap_sync = (
             license_bootstrap_sync_func or try_initialize_license_after_bootstrap_login
         )
+        self._license_initialize = license_initialize_func or initialize_license
         self._license_state = license_state_func or get_current_license_state
         self._log_store = log_store or get_default_log_store()
 
@@ -121,7 +129,13 @@ class MainWindowController:
             credential_exists=bool(getattr(config, "credential_exists", False)),
             license_message=license_decision.message_for_ui or LICENSE_PLACEHOLDER,
             license_variant=_license_variant(license_decision),
+            payment_button_text=_payment_button_text(license_decision),
+            payment_button_enabled=_payment_button_enabled(license_decision),
+            payment_button_action=_payment_button_action(license_decision),
         )
+
+    def initialize_license(self) -> LicenseDecision:
+        return self._license_initialize()
 
     def save(self, username: str, password: str, autostart_enabled: bool) -> str:
         clean_username = str(username or "").strip()
@@ -323,18 +337,49 @@ class _LoginWorker(QObject):
         self.finished.emit(result)
 
 
+class _LicenseInitializeWorker(QObject):
+    finished = Signal(int, object, object)
+
+    def __init__(self, generation: int, controller: MainWindowController):
+        super().__init__()
+        self._generation = generation
+        self._controller = controller
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.finished.emit(self._generation, self._controller.initialize_license(), None)
+        except Exception as exc:
+            LOGGER.exception("License initialization failed.")
+            self.finished.emit(self._generation, None, exc)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
         *,
         controller: Optional[MainWindowController] = None,
+        auto_initialize_license: Optional[bool] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
+        controller_provided = controller is not None
         self._controller = controller or MainWindowController()
         self._thread: Optional[QThread] = None
         self._worker: Optional[_LoginWorker] = None
+        self._license_thread: Optional[QThread] = None
+        self._license_worker: Optional[_LicenseInitializeWorker] = None
+        self._license_generation = 0
+        self._auto_initialize_license = (
+            (not controller_provided)
+            if auto_initialize_license is None
+            else bool(auto_initialize_license)
+        )
+        self._auto_initialize_attempted = False
         self._log_window: Optional[RuntimeLogWindow] = None
+        self._payment_window: Optional[QWidget] = None
+        self._payment_button_enabled = False
+        self._payment_button_action = "disabled"
         self._build_ui()
         self.load_state()
 
@@ -343,6 +388,10 @@ class MainWindow(QMainWindow):
             state = self._controller.load_state()
         except Exception as exc:
             self._set_status("读取本地配置失败：" + _safe_message(exc), "error")
+            self._payment_button_enabled = False
+            self._payment_button_action = "disabled"
+            self.payment_button.setText("暂无法购买")
+            self.payment_button.setEnabled(False)
             return
 
         self.username_input.setText(state.username)
@@ -354,8 +403,15 @@ class MainWindow(QMainWindow):
             self._set_status("尚未保存配置，请输入校园网账号和密码。", "neutral")
         self.license_label.setText(state.license_message)
         self.license_label.set_variant(state.license_variant)
+        self._payment_button_enabled = state.payment_button_enabled
+        self._payment_button_action = state.payment_button_action
+        self.payment_button.setText(state.payment_button_text)
+        self.payment_button.setEnabled(state.payment_button_enabled)
+        if self._should_auto_initialize_license(state):
+            self._start_license_initialization(auto=True)
 
     def closeEvent(self, event) -> None:
+        self._license_generation += 1
         if self.isVisible():
             self.hide()
             event.ignore()
@@ -408,6 +464,12 @@ class MainWindow(QMainWindow):
         self.license_label = StatusLabel(LICENSE_PLACEHOLDER)
         card_layout.addWidget(self.license_label)
 
+        self.payment_button = QPushButton("购买一年授权")
+        self.payment_button.setMinimumHeight(38)
+        self.payment_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.payment_button.setEnabled(False)
+        card_layout.addWidget(self.payment_button)
+
         actions = QHBoxLayout()
         actions.setSpacing(10)
         self.save_button = QPushButton("保存配置")
@@ -442,6 +504,7 @@ class MainWindow(QMainWindow):
         self.test_button.clicked.connect(self._start_test_login)
         self.clear_button.clicked.connect(self._confirm_clear_config)
         self.runtime_logs_button.clicked.connect(self._show_runtime_logs)
+        self.payment_button.clicked.connect(self._show_payment_window)
 
         self.setCentralWidget(root)
         self.setStyleSheet(_style_sheet())
@@ -487,6 +550,95 @@ class MainWindow(QMainWindow):
         self._worker = worker
         thread.start()
 
+    def _should_auto_initialize_license(self, state: MainWindowState) -> bool:
+        return (
+            self._auto_initialize_license
+            and not self._auto_initialize_attempted
+            and state.payment_button_action == "initialize"
+        )
+
+    def _start_license_initialization(self, *, auto: bool = False) -> None:
+        if self._license_thread is not None:
+            return
+        if auto:
+            self._auto_initialize_attempted = True
+        self._license_generation += 1
+        generation = self._license_generation
+        self._payment_button_action = "initialize"
+        self._payment_button_enabled = False
+        self.payment_button.setText("正在初始化授权…")
+        self.payment_button.setEnabled(False)
+        self.license_label.setText("正在连接授权服务并初始化本机授权…")
+        self.license_label.set_variant("neutral")
+
+        thread = QThread(self)
+        worker = _LicenseInitializeWorker(generation, self._controller)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._finish_license_initialization)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._release_license_worker)
+        self._license_thread = thread
+        self._license_worker = worker
+        thread.start()
+
+    @Slot(int, object, object)
+    def _finish_license_initialization(
+        self,
+        generation: int,
+        decision: object,
+        error: object,
+    ) -> None:
+        if generation != self._license_generation:
+            return
+        if error is not None:
+            LOGGER.warning("License initialization request failed: %s", error.__class__.__name__)
+            self._show_license_initialization_retry("授权初始化失败，请检查网络后重试。")
+            return
+        if not isinstance(decision, LicenseDecision):
+            self._show_license_initialization_retry("授权响应格式异常，请稍后重试。")
+            return
+        if decision.allowed:
+            self.load_state()
+            return
+        self.license_label.setText(_license_initialization_message(decision))
+        self.license_label.set_variant(_license_variant(decision))
+        if decision.status == LicenseStatus.REVOKED:
+            self._payment_button_action = "disabled"
+            self._payment_button_enabled = False
+            self.payment_button.setText("授权已撤销")
+            self.payment_button.setEnabled(False)
+            return
+        self._show_license_initialization_retry(_license_initialization_message(decision))
+
+    @Slot()
+    def _release_license_worker(self) -> None:
+        self._license_thread = None
+        self._license_worker = None
+
+    @Slot(object)
+    def _apply_payment_activation(self, decision: object) -> None:
+        self._license_generation += 1
+        if not isinstance(decision, LicenseDecision):
+            self.load_state()
+            return
+        self.license_label.setText(decision.message_for_ui or LICENSE_PLACEHOLDER)
+        self.license_label.set_variant(_license_variant(decision))
+        self._payment_button_action = _payment_button_action(decision)
+        self._payment_button_enabled = _payment_button_enabled(decision)
+        self.payment_button.setText(_payment_button_text(decision))
+        self.payment_button.setEnabled(self._payment_button_enabled)
+
+    def _show_license_initialization_retry(self, message: str) -> None:
+        self.license_label.setText(message)
+        self.license_label.set_variant("warning")
+        self._payment_button_action = "initialize"
+        self._payment_button_enabled = True
+        self.payment_button.setText("重试初始化")
+        self.payment_button.setEnabled(True)
+
     @Slot(object)
     def _finish_test_login(self, result: LoginResult) -> None:
         text, variant = login_result_display(result)
@@ -517,9 +669,8 @@ class MainWindow(QMainWindow):
             return
         self.username_input.clear()
         self.password_input.clear()
+        self.load_state()
         self._set_status(message, "success")
-        self.license_label.setText(LICENSE_PLACEHOLDER)
-        self.license_label.set_variant("neutral")
 
     @Slot()
     def _show_runtime_logs(self) -> None:
@@ -527,6 +678,33 @@ class MainWindow(QMainWindow):
             self._log_window = RuntimeLogWindow(log_store=self._controller.log_store)
         self._log_window.refresh_logs()
         self._log_window.show_for_owner(self)
+
+    @Slot()
+    def _show_payment_window(self) -> None:
+        if self._payment_button_action == "initialize":
+            self._start_license_initialization()
+            return
+        if self._payment_button_action != "payment" or not self._payment_button_enabled:
+            self._set_status("当前授权状态暂不允许直接购买或续费。", "warning")
+            return
+        try:
+            if self._payment_window is None:
+                from desktop_app.payment_window import PaymentWindow
+
+                window = PaymentWindow(parent=self)
+                window.activated.connect(self._apply_payment_activation)
+                window.finished.connect(self._release_payment_window)
+                self._payment_window = window
+            self._payment_window.show()
+            self._payment_window.raise_()
+            self._payment_window.activateWindow()
+        except Exception as exc:
+            LOGGER.exception("Failed to open payment window.")
+            self._set_status("打开支付窗口失败：" + _safe_message(exc), "error")
+
+    @Slot()
+    def _release_payment_window(self) -> None:
+        self._payment_window = None
 
     def _set_status(self, text: str, variant: str) -> None:
         self.status_label.setText(text)
@@ -536,6 +714,7 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(not busy)
         self.test_button.setEnabled(not busy)
         self.clear_button.setEnabled(not busy)
+        self.payment_button.setEnabled((not busy) and self._payment_button_enabled)
         self.test_button.setText("登录中" if busy else "测试登录")
 
 
@@ -605,6 +784,56 @@ def _license_variant(decision: LicenseDecision) -> str:
     if decision.status.value in {"uninitialized", "server_unreachable", "config_only"}:
         return "warning"
     return "error"
+
+
+def _payment_button_text(decision: LicenseDecision) -> str:
+    status = decision.status.value
+    return {
+        "trial_active": "购买一年授权",
+        "trial_expired": "立即购买授权",
+        "paid_active": "续费一年",
+        "paid_expired": "续费授权",
+        "revoked": "授权已撤销",
+        "uninitialized": "初始化授权",
+        "server_unreachable": "重试初始化",
+    }.get(status, "暂无法购买")
+
+
+def _payment_button_enabled(decision: LicenseDecision) -> bool:
+    return _payment_button_action(decision) in {"initialize", "payment"}
+
+
+def _payment_button_action(decision: LicenseDecision) -> str:
+    if decision.status in {LicenseStatus.UNINITIALIZED, LicenseStatus.SERVER_UNREACHABLE}:
+        return "initialize"
+    if decision.status.value in {
+        "trial_active",
+        "trial_expired",
+        "paid_active",
+        "paid_expired",
+    }:
+        return "payment"
+    return "disabled"
+
+
+def _license_initialization_message(decision: LicenseDecision) -> str:
+    if decision.status == LicenseStatus.SERVER_UNREACHABLE:
+        return {
+            "request_timeout": "授权请求超时，请稍后点击“重试初始化”。",
+            "network_unreachable": "无法连接授权服务器，请检查网络后点击“重试初始化”。",
+            "server_error": "授权服务暂不可用，请稍后点击“重试初始化”。",
+        }.get(decision.reason, "无法连接授权服务器，请检查网络后点击“重试初始化”。")
+    if decision.status == LicenseStatus.UNINITIALIZED:
+        return "授权响应格式异常，请稍后点击“重试初始化”。"
+    if decision.status == LicenseStatus.TOKEN_INVALID:
+        return {
+            "signature_invalid": "授权签名验证失败，请稍后点击“重试初始化”。",
+            "device_mismatch": "授权凭证与当前设备不匹配，请点击“重试初始化”。",
+            "missing_public_key": "客户端缺少授权验签公钥，请检查配置后重试。",
+        }.get(decision.reason, "授权签名验证失败，请稍后点击“重试初始化”。")
+    if decision.status == LicenseStatus.REVOKED:
+        return "设备授权已撤销，暂不可继续使用。"
+    return decision.message_for_ui or "授权初始化失败，请稍后点击“重试初始化”。"
 
 
 def _style_sheet() -> str:

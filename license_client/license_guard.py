@@ -23,6 +23,7 @@ from license_client.license_state import (
     server_unreachable_decision,
     uninitialized_decision,
 )
+from license_client.public_key import resolve_license_public_key
 from license_client.token_store import (
     load_signed_license_token,
     save_signed_license_token,
@@ -33,6 +34,7 @@ from license_client.token_verify import verify_signed_license_token
 LOGGER = logging.getLogger(__name__)
 LicenseCheckFunc = Callable[..., LicenseDecision]
 LicenseBootstrapSyncFunc = Callable[..., LicenseDecision]
+LicenseInitializeFunc = Callable[..., LicenseDecision]
 
 
 def check_license_before_login(
@@ -46,7 +48,7 @@ def check_license_before_login(
 ) -> LicenseDecision:
     current_device_hash = device_fingerprint_hash or generate_device_fingerprint_hash()
     loaded = load_signed_license_token(token_path=token_path)
-    public_key = public_key_b64 or _public_key_from_env()
+    public_key = resolve_license_public_key(public_key_b64)
 
     if loaded.signed_license_token:
         if not public_key:
@@ -120,7 +122,44 @@ def try_initialize_license_after_bootstrap_login(
     if not api_result.signed_license_token:
         return uninitialized_decision()
 
-    public_key = public_key_b64 or _public_key_from_env()
+    public_key = resolve_license_public_key(public_key_b64)
+    if not public_key:
+        return _missing_public_key_decision()
+
+    decision = _verify_to_decision(
+        api_result.signed_license_token,
+        public_key_b64=public_key,
+        device_fingerprint_hash=current_device_hash,
+    )
+    return _save_allowed_token_or_warn(
+        decision,
+        api_result.signed_license_token,
+        token_path=token_path,
+    )
+
+
+def initialize_license(
+    *,
+    token_path: Optional[Path] = None,
+    public_key_b64: Optional[str] = None,
+    device_fingerprint_hash: Optional[str] = None,
+    api_client: Optional[Callable[[], LicenseApiResult]] = None,
+) -> LicenseDecision:
+    current_device_hash = device_fingerprint_hash or generate_device_fingerprint_hash()
+    api_result = _call_api(
+        api_client,
+        device_fingerprint_hash=current_device_hash,
+        needs_register=True,
+    )
+    if not api_result.reachable:
+        return server_unreachable_decision(
+            reason=api_result.error or api_result.status or "server_unreachable",
+            retryable=True,
+        )
+    if not api_result.signed_license_token:
+        return uninitialized_decision(reason=api_result.error or api_result.status or "invalid_response")
+
+    public_key = resolve_license_public_key(public_key_b64)
     if not public_key:
         return _missing_public_key_decision()
 
@@ -161,7 +200,7 @@ def get_current_license_state(
                 message_for_ui="本地授权凭证无效，请联网刷新授权。",
             )
         return uninitialized_decision()
-    public_key = public_key_b64 or _public_key_from_env()
+    public_key = resolve_license_public_key(public_key_b64)
     if not public_key:
         return _missing_public_key_decision()
     return _verify_to_decision(
@@ -267,9 +306,3 @@ def _missing_public_key_decision() -> LicenseDecision:
         reason="missing_public_key",
         message_for_ui="本地授权凭证无效，请联网刷新授权。",
     )
-
-
-def _public_key_from_env() -> str:
-    import os
-
-    return os.environ.get("LICENSE_PUBLIC_KEY", "").strip()
