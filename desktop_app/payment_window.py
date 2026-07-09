@@ -270,9 +270,9 @@ class PaymentWindow(QDialog):
         error: object,
     ) -> None:
         self._request_in_flight = False
-        self._refresh_buttons()
         if generation != self._generation or self._closed:
             return
+        self._refresh_buttons()
         if error is not None:
             self._handle_error(kind, error)
             return

@@ -286,8 +286,12 @@ def test_close_stops_timer_and_ignores_late_result(tmp_path):
     activated = []
     window.activated.connect(lambda decision: activated.append(decision))
     old_generation = window._generation
+    create_enabled = window.create_button.isEnabled()
+    refresh_enabled = window.refresh_button.isEnabled()
+    refresh_calls = []
 
     window.close()
+    window._refresh_buttons = lambda: refresh_calls.append("refresh_buttons")
     window._finish_request(
         old_generation,
         "get_order",
@@ -296,6 +300,10 @@ def test_close_stops_timer_and_ignores_late_result(tmp_path):
     )
 
     assert window._poll_timer.isActive() is False
+    assert window._request_in_flight is False
+    assert window.create_button.isEnabled() is create_enabled
+    assert window.refresh_button.isEnabled() is refresh_enabled
+    assert refresh_calls == []
     assert activated == []
 
 
