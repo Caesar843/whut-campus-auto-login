@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import requests
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
@@ -13,6 +14,7 @@ from license_client.license_api import LicenseApiClient, LicenseApiResult
 from license_client.constants import DEFAULT_LICENSE_SERVER_URL
 from license_client.license_guard import (
     check_license_before_login,
+    initialize_license,
     try_initialize_license_after_bootstrap_login,
 )
 from license_client.license_state import LicenseDecision, LicenseStatus, evaluate_local_license
@@ -123,6 +125,41 @@ def test_register_device_payload_excludes_campus_account_fields(monkeypatch):
         "password",
     }
     assert forbidden_keys.isdisjoint(set(captured["payload"]))
+
+
+def test_license_api_client_classifies_timeout_and_invalid_response(monkeypatch):
+    monkeypatch.setattr(
+        "license_client.license_api.requests.post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(requests.Timeout("slow")),
+    )
+
+    timeout = LicenseApiClient(base_url="http://license.local").register_device(
+        device_fingerprint_hash="device-a",
+    )
+
+    assert timeout.reachable is False
+    assert timeout.status == "request_timeout"
+    assert timeout.error == "request_timeout"
+
+    class InvalidJsonResponse:
+        status_code = 200
+        content = b"not-json"
+
+        def json(self):
+            raise ValueError("not-json")
+
+    monkeypatch.setattr(
+        "license_client.license_api.requests.post",
+        lambda *args, **kwargs: InvalidJsonResponse(),
+    )
+
+    invalid = LicenseApiClient(base_url="http://license.local").register_device(
+        device_fingerprint_hash="device-a",
+    )
+
+    assert invalid.reachable is True
+    assert invalid.status == "invalid_response"
+    assert invalid.error == "invalid_response"
 
 
 def test_token_store_round_trips_signed_license_token(tmp_path):
@@ -365,6 +402,97 @@ def test_guard_registers_device_and_saves_trial_token_when_missing(tmp_path):
     assert decision.allowed is True
     assert decision.status == LicenseStatus.TRIAL_ACTIVE
     assert load_signed_license_token(token_path=token_path).signed_license_token == signed_license_token
+
+
+def test_initialize_license_registers_device_verifies_and_saves_token(tmp_path):
+    private_key, public_key_b64 = _key_pair()
+    signed_license_token = _signed_license_token(private_key)
+    token_path = tmp_path / "license_token.json"
+    calls = []
+
+    decision = initialize_license(
+        token_path=token_path,
+        public_key_b64=public_key_b64,
+        device_fingerprint_hash="device-a",
+        api_client=lambda: calls.append("register")
+        or LicenseApiResult(
+            reachable=True,
+            status="trial_active",
+            signed_license_token=signed_license_token,
+        ),
+    )
+
+    assert calls == ["register"]
+    assert decision.status == LicenseStatus.TRIAL_ACTIVE
+    assert load_signed_license_token(token_path=token_path).signed_license_token == signed_license_token
+
+
+def test_initialize_license_timeout_is_retryable_without_saving_token(tmp_path):
+    token_path = tmp_path / "license_token.json"
+
+    decision = initialize_license(
+        token_path=token_path,
+        public_key_b64="unused",
+        device_fingerprint_hash="device-a",
+        api_client=lambda: LicenseApiResult(
+            reachable=False,
+            status="request_timeout",
+            error="request_timeout",
+        ),
+    )
+
+    assert decision.status == LicenseStatus.SERVER_UNREACHABLE
+    assert decision.reason == "request_timeout"
+    assert decision.retryable is True
+    assert load_signed_license_token(token_path=token_path).status == "missing"
+
+
+def test_initialize_license_rejects_bad_signature_without_saving(tmp_path):
+    private_key, public_key_b64 = _key_pair()
+    signed_license_token = _signed_license_token(private_key)
+    payload_segment, signature_segment = signed_license_token.split(".")
+    payload = json.loads(base64.urlsafe_b64decode(payload_segment + "==").decode("utf-8"))
+    payload["license_type"] = "paid"
+    tampered = _b64url(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    token_path = tmp_path / "license_token.json"
+
+    decision = initialize_license(
+        token_path=token_path,
+        public_key_b64=public_key_b64,
+        device_fingerprint_hash="device-a",
+        api_client=lambda: LicenseApiResult(
+            reachable=True,
+            status="trial_active",
+            signed_license_token=f"{tampered}.{signature_segment}",
+        ),
+    )
+
+    assert decision.status == LicenseStatus.TOKEN_INVALID
+    assert decision.reason == "signature_invalid"
+    assert load_signed_license_token(token_path=token_path).status == "missing"
+
+
+def test_initialize_license_rejects_device_mismatch_without_saving(tmp_path):
+    private_key, public_key_b64 = _key_pair()
+    signed_license_token = _signed_license_token(private_key, device_fingerprint_hash="device-b")
+    token_path = tmp_path / "license_token.json"
+
+    decision = initialize_license(
+        token_path=token_path,
+        public_key_b64=public_key_b64,
+        device_fingerprint_hash="device-a",
+        api_client=lambda: LicenseApiResult(
+            reachable=True,
+            status="trial_active",
+            signed_license_token=signed_license_token,
+        ),
+    )
+
+    assert decision.status == LicenseStatus.TOKEN_INVALID
+    assert decision.reason == "device_mismatch"
+    assert load_signed_license_token(token_path=token_path).status == "missing"
 
 
 def test_guard_keeps_allowed_decision_when_token_persist_fails(tmp_path, monkeypatch):

@@ -23,6 +23,7 @@ tmp/
 temp/
 
 build/
+build/generated/
 dist/
 *.spec
 !WHUTCampusAutoLogin.spec

@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional
 import requests
 
 from license_client.constants import APP_VERSION, PRODUCT_ID, resolve_license_server_url
+from license_client.http_transport import request as http_request
 
 
 LOGGER = logging.getLogger(__name__)
@@ -53,17 +54,55 @@ class LicenseApiClient:
     def _post(self, path: str, payload: Mapping[str, Any]) -> LicenseApiResult:
         url = f"{self.base_url}{path}"
         try:
-            response = requests.post(url, json=payload, timeout=self.timeout)
-            response_payload = response.json() if response.content else {}
-        except (requests.RequestException, ValueError) as exc:
+            response = http_request(
+                "post",
+                url,
+                json=payload,
+                timeout=self.timeout,
+                requests_module=requests,
+            )
+        except requests.Timeout:
+            LOGGER.warning("License server request failed: Timeout")
+            return LicenseApiResult(
+                reachable=False,
+                status="request_timeout",
+                error="request_timeout",
+            )
+        except requests.RequestException as exc:
             LOGGER.warning("License server request failed: %s", exc.__class__.__name__)
             return LicenseApiResult(
                 reachable=False,
-                status="server_unreachable",
-                error=exc.__class__.__name__,
+                status="network_unreachable",
+                error="network_unreachable",
+            )
+        try:
+            response_payload = response.json() if response.content else {}
+        except ValueError:
+            LOGGER.warning("License server response was not JSON.")
+            if response.status_code >= 500:
+                return LicenseApiResult(
+                    reachable=False,
+                    status="server_error",
+                    error="server_error",
+                )
+            return LicenseApiResult(
+                reachable=True,
+                status="invalid_response",
+                error="invalid_response",
+            )
+        if not isinstance(response_payload, dict):
+            return LicenseApiResult(
+                reachable=True,
+                status="invalid_response",
+                error="invalid_response",
             )
         if response.status_code >= 500:
-            return LicenseApiResult(reachable=False, status="server_unreachable", payload=response_payload)
+            return LicenseApiResult(
+                reachable=False,
+                status="server_error",
+                payload=response_payload,
+                error="server_error",
+            )
         if response.status_code >= 400:
             return LicenseApiResult(reachable=True, status=str(response_payload.get("status") or "error"), payload=response_payload)
         return LicenseApiResult(

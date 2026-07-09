@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [switch]$Clean,
-    [switch]$BuildDebug
+    [switch]$BuildDebug,
+    [string]$LicensePublicKey = "",
+    [string]$BuildEnvironment = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,9 +34,31 @@ try {
         throw "PyInstaller is not installed. Run: python -m pip install -r requirements-build.txt"
     }
 
+    $buildEnvironmentValue = $BuildEnvironment.Trim().ToLowerInvariant()
+    if (-not $buildEnvironmentValue) {
+        throw "BuildEnvironment is required. Pass -BuildEnvironment development, preproduction, or production."
+    }
+    if (@('development', 'preproduction', 'production') -notcontains $buildEnvironmentValue) {
+        throw "BuildEnvironment must be one of: development, preproduction, production."
+    }
+
+    $publicKey = $LicensePublicKey.Trim()
+    if (-not $publicKey) {
+        throw "LicensePublicKey is required for Windows build. Pass -LicensePublicKey."
+    }
+
     $buildDir = Join-Path $repoRoot 'build'
     if (Test-Path -LiteralPath $buildDir) {
         Remove-Item -LiteralPath $buildDir -Recurse -Force
+    }
+
+    $generatedConfigModule = Join-Path $buildDir 'generated\_license_client_embedded_build_config.py'
+    & $python.Source -m license_client.public_key `
+        --public-key $publicKey `
+        --build-environment $buildEnvironmentValue `
+        --output $generatedConfigModule
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to prepare embedded license build config."
     }
 
     $distAppDir = Join-Path $repoRoot 'dist\WHUTCampusAutoLogin'
@@ -62,6 +86,7 @@ try {
         Measure-Object -Property Length -Sum).Sum
 
     Write-Output "EXE: $exePath"
+    Write-Output ("BuildEnvironment: {0}" -f $buildEnvironmentValue)
     Write-Output ("SizeBytes: {0}" -f $sizeBytes)
 }
 finally {

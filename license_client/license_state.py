@@ -117,12 +117,13 @@ def evaluate_local_license(
     )
 
 
-def uninitialized_decision() -> LicenseDecision:
+def uninitialized_decision(reason: str = "missing_signed_license_token") -> LicenseDecision:
     return LicenseDecision(
         status=LicenseStatus.UNINITIALIZED,
         allowed=False,
-        reason="missing_signed_license_token",
-        message_for_ui="授权未初始化，且当前无法连接授权服务。请确认已连接武汉理工校园网，或先手动联网后重试。",
+        reason=reason,
+        retryable=True,
+        message_for_ui="授权尚未初始化，或当前无法连接授权服务。请检查网络后点击“重试初始化”。",
     )
 
 
@@ -149,7 +150,7 @@ def server_unreachable_decision(
         allowed=False,
         reason=reason,
         retryable=retryable,
-        message_for_ui="授权未初始化，且当前无法连接授权服务。请确认已连接武汉理工校园网，或先手动联网后重试。",
+        message_for_ui="授权尚未初始化，或当前无法连接授权服务。请检查网络后点击“重试初始化”。",
     )
 
 
