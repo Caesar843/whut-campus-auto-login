@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import os
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -20,6 +21,9 @@ DEFAULT_PAYMENT_ORDER_TTL_MINUTES = 15
 VALID_PAYMENT_PROVIDERS = {"mock", "wechat_native"}
 PRODUCTION_ADMIN_TOKEN_MIN_LENGTH = 32
 MOCK_ADMIN_TOKEN_MIN_LENGTH = 16
+SHA256_HEX_LENGTH = 64
+TRUE_VALUES = {"1", "true", "yes", "on"}
+FALSE_VALUES = {"0", "false", "no", "off", ""}
 INSECURE_ADMIN_TOKEN_MARKERS = (
     "change-me",
     "changeme",
@@ -44,6 +48,9 @@ class LicenseServerConfig:
     payment_currency: str
     payment_channels: tuple[str, ...]
     payment_order_ttl_minutes: int
+    admin_enabled: bool
+    admin_operator_name: str
+    admin_access_token_sha256: str | None
 
 
 def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
@@ -66,6 +73,9 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
         payment_currency=payment_currency,
         payment_channels=_payment_channels_from_env(values),
         payment_order_ttl_minutes=_payment_order_ttl_minutes_from_env(values),
+        admin_enabled=_admin_enabled_from_env(values),
+        admin_operator_name=values.get("ADMIN_OPERATOR_NAME", "").strip(),
+        admin_access_token_sha256=_admin_access_token_sha256_from_env(values),
     )
 
 
@@ -223,6 +233,14 @@ def validate_mock_admin_token(token: str) -> None:
         raise RuntimeError("PAYMENT_MOCK_ADMIN_TOKEN is too weak.")
 
 
+def validate_admin_access_token_sha256(value: str | None) -> None:
+    digest = str(value or "").strip().lower()
+    if len(digest) != SHA256_HEX_LENGTH or any(
+        character not in string.hexdigits for character in digest
+    ):
+        raise RuntimeError("ADMIN_ACCESS_TOKEN_SHA256 must be a 64-character SHA-256 hex digest.")
+
+
 def _payment_price_fen_from_env(values: Mapping[str, str]) -> int:
     raw_value = values.get("PAYMENT_PRICE_FEN", str(ANNUAL_V1.amount_fen)).strip()
     try:
@@ -258,3 +276,20 @@ def _payment_order_ttl_minutes_from_env(values: Mapping[str, str]) -> int:
     if ttl_minutes < 1:
         raise RuntimeError("PAYMENT_ORDER_TTL_MINUTES must be at least 1.")
     return ttl_minutes
+
+
+def _admin_enabled_from_env(values: Mapping[str, str]) -> bool:
+    raw_value = values.get("ADMIN_ENABLED", "").strip().lower()
+    if raw_value in TRUE_VALUES:
+        return True
+    if raw_value in FALSE_VALUES:
+        return False
+    raise RuntimeError("ADMIN_ENABLED must be true or false.")
+
+
+def _admin_access_token_sha256_from_env(values: Mapping[str, str]) -> str | None:
+    if not _admin_enabled_from_env(values):
+        return None
+    digest = values.get("ADMIN_ACCESS_TOKEN_SHA256", "").strip().lower()
+    validate_admin_access_token_sha256(digest)
+    return digest
