@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import FastAPI
 
 from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
+from license_server.admin_routes import create_admin_router
 from license_server.config import (
     DEFAULT_PAYMENT_CHANNELS,
     DEFAULT_PAYMENT_ORDER_TTL_MINUTES,
@@ -13,6 +14,7 @@ from license_server.config import (
     is_production_environment,
     load_config,
     validate_mock_admin_token,
+    validate_admin_access_token_sha256,
     validate_production_admin_token,
     validate_private_key_b64,
 )
@@ -37,6 +39,9 @@ def create_app(
     payment_mock_admin_token: Optional[str] = None,
     payment_order_ttl_minutes: Optional[int] = None,
     environment: Optional[str] = None,
+    admin_enabled: Optional[bool] = None,
+    admin_operator_name: Optional[str] = None,
+    admin_access_token_sha256: Optional[str] = None,
 ) -> FastAPI:
     if database_path is None or private_key_b64 is None or admin_token is None:
         config = load_config()
@@ -53,6 +58,11 @@ def create_app(
         )
         payment_order_ttl_minutes = (
             payment_order_ttl_minutes or config.payment_order_ttl_minutes
+        )
+        admin_enabled = config.admin_enabled if admin_enabled is None else admin_enabled
+        admin_operator_name = admin_operator_name or config.admin_operator_name
+        admin_access_token_sha256 = (
+            admin_access_token_sha256 or config.admin_access_token_sha256
         )
     environment = environment or DEFAULT_ENVIRONMENT
     validate_private_key_b64(str(private_key_b64), source="private_key_b64")
@@ -72,6 +82,9 @@ def create_app(
     payment_order_ttl_minutes = (
         payment_order_ttl_minutes or DEFAULT_PAYMENT_ORDER_TTL_MINUTES
     )
+    admin_enabled = bool(admin_enabled)
+    if admin_enabled:
+        validate_admin_access_token_sha256(admin_access_token_sha256)
     initialize_database(Path(database_path))
     app = FastAPI(title="WHUT Campus Auto Login License Server")
     _add_health_route(app)
@@ -95,6 +108,14 @@ def create_app(
             payment_order_ttl_minutes=int(payment_order_ttl_minutes),
         )
     )
+    if admin_enabled:
+        app.include_router(
+            create_admin_router(
+                database_path=Path(database_path),
+                operator_name=str(admin_operator_name or ""),
+                access_token_sha256=str(admin_access_token_sha256),
+            )
+        )
     return app
 
 

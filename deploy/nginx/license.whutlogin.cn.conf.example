@@ -2,6 +2,10 @@ server {
     listen 80;
     server_name license.whutlogin.cn;
 
+    location ^~ /internal/admin {
+        return 404;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8787;
         proxy_http_version 1.1;
@@ -21,6 +25,10 @@ server {
 #
 #     ssl_certificate /path/to/fullchain.pem;
 #     ssl_certificate_key /path/to/privkey.pem;
+#
+#     location ^~ /internal/admin {
+#         return 404;
+#     }
 #
 #     location / {
 #         proxy_pass http://127.0.0.1:8787;
