@@ -12,7 +12,7 @@ from license_server.db import (
 )
 
 
-def test_empty_database_initializes_to_schema_version_1(tmp_path):
+def test_empty_database_initializes_to_schema_version_2(tmp_path):
     database_path = tmp_path / "license.sqlite3"
 
     initialize_database(database_path)

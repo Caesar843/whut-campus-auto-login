@@ -8,7 +8,7 @@ from pathlib import Path
 from license_server.payment import ANNUAL_V1, OrderStatus
 
 
-SUPPORTED_SCHEMA_VERSION = 1
+SUPPORTED_SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 
 LEGACY_REMOVED_DEVICE_COLUMNS = (
@@ -138,6 +138,36 @@ CREATE INDEX IF NOT EXISTS idx_license_grants_device
 ON license_grants(device_fingerprint_hash);
 """
 
+ADMIN_AUDIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS admin_audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT NOT NULL CHECK(length(trim(actor)) > 0),
+    source_ip TEXT NOT NULL CHECK(length(trim(source_ip)) > 0),
+    request_id TEXT NOT NULL CHECK(length(trim(request_id)) > 0),
+    action TEXT NOT NULL CHECK(length(trim(action)) > 0),
+    target_type TEXT NOT NULL CHECK(length(trim(target_type)) > 0),
+    target_id TEXT NOT NULL CHECK(length(trim(target_id)) > 0),
+    result TEXT NOT NULL CHECK(result IN ('SUCCESS', 'REJECTED', 'FAILED')),
+    before_state_json TEXT,
+    after_state_json TEXT,
+    reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+    failure_code TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_target_created
+ON admin_audit_logs(target_type, target_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_created_at
+ON admin_audit_logs(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_request_id
+ON admin_audit_logs(request_id);
+
+CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_result
+ON admin_audit_logs(result);
+"""
+
 
 def connect(database_path: Path) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +206,7 @@ def initialize_database(database_path: Path) -> None:
         _ensure_payment_orders(connection)
         _execute_script(connection, PAYMENT_NOTIFICATION_SCHEMA)
         _execute_script(connection, LICENSE_GRANT_SCHEMA)
+        _execute_script(connection, ADMIN_AUDIT_SCHEMA)
         _set_schema_version(connection, SUPPORTED_SCHEMA_VERSION)
 
 
