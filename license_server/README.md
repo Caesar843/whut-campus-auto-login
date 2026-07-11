@@ -8,7 +8,6 @@ It implements:
 - `GET /health`
 - `POST /device/register`
 - `POST /license/refresh`
-- `POST /admin/grant`
 - `POST /payment/create`
 - `GET /payment/status`
 
@@ -44,7 +43,6 @@ Set environment variables:
 $env:LICENSE_SERVER_ENV = "development"
 $env:LICENSE_PRIVATE_KEY = "<private key from script>"
 $env:LICENSE_PUBLIC_KEY = "<public key from script>"
-$env:LICENSE_ADMIN_TOKEN = "<local admin token>"
 $env:DATABASE_URL = "sqlite:///./license_server_dev.sqlite3"
 ```
 
@@ -57,5 +55,5 @@ uvicorn license_server.app:app --host 127.0.0.1 --port 8787
 The private key must not be committed. The client only needs the public key.
 
 Production must set `LICENSE_SERVER_ENV=production`, an explicit absolute
-SQLite path, a valid Ed25519 private key, and a strong `LICENSE_ADMIN_TOKEN`.
+SQLite path, and a valid Ed25519 private key.
 See `docs/deploy/LICENSE_SERVER_PRODUCTION_CONFIG.md`.

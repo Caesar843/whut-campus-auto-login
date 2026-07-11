@@ -318,7 +318,6 @@ def test_pyinstaller_config_freezes_embedded_config_module_not_external_txt():
     assert "build/generated/" in gitignore
     for forbidden in (
         "LICENSE_PRIVATE_KEY",
-        "LICENSE_ADMIN_TOKEN",
         "PAYMENT_MOCK_ADMIN_TOKEN",
         "MOCK_PAYMENT_ADMIN_TOKEN",
         "WECHAT_PAY_MERCHANT_PRIVATE_KEY",

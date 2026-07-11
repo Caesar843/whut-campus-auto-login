@@ -38,7 +38,6 @@ _SENSITIVE_KEYS = (
     "signed_token",
     "signed_license_token",
     "license_private_key",
-    "license_admin_token",
     "cookie",
     "session",
     "authcode",
@@ -52,7 +51,7 @@ _SENSITIVE_KEYS = (
 _SENSITIVE_PAIR_RE = re.compile(
     r"(?i)\b("
     r"password|passwd|token|signed_token|signed_license_token|LICENSE_PRIVATE_KEY|"
-    r"LICENSE_ADMIN_TOKEN|cookie|session|authCode|authorization|payment_key|pay_key|"
+    r"cookie|session|authCode|authorization|payment_key|pay_key|"
     r"private_key|secret"
     r")\b\s*[:=]\s*([^\s;&,]+)"
 )

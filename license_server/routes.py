@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, ConfigDict, model_validator
 
-from license_client.constants import PAID_LICENSE_DAYS, PRODUCT_ID, TRIAL_DAYS
+from license_client.constants import PRODUCT_ID, TRIAL_DAYS
 from license_server.db import connect
 from license_server.license_service import (
     create_license,
@@ -46,14 +46,6 @@ class LicenseRefreshRequest(BaseModel):
         return _drop_legacy_device_description_fields(data)
 
 
-class AdminGrantRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    device_fingerprint_hash: str
-    license_days: int = Field(default=PAID_LICENSE_DAYS, ge=1, le=3660)
-    reason: str
-
-
 class PaymentCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -67,7 +59,6 @@ def create_router(
     *,
     database_path: Path,
     private_key_b64: str,
-    admin_token: str,
     payment_amount: str,
     payment_currency: str,
     payment_channels: tuple[str, ...],
@@ -159,37 +150,6 @@ def create_router(
             connection.commit()
         return _license_response(
             product_id=request.product_id,
-            device_fingerprint_hash=request.device_fingerprint_hash,
-            license_row=license_row,
-            private_key_b64=private_key_b64,
-        )
-
-    @router.post("/admin/grant")
-    def admin_grant(
-        request: AdminGrantRequest,
-        x_license_admin_token: str = Header(default=""),
-    ):
-        if x_license_admin_token != admin_token:
-            raise HTTPException(status_code=403, detail="invalid_admin_token")
-        now = datetime.now(timezone.utc).replace(microsecond=0)
-        with connect(database_path) as connection:
-            device = connection.execute(
-                "SELECT * FROM devices WHERE device_fingerprint_hash = ?",
-                (request.device_fingerprint_hash,),
-            ).fetchone()
-            if device is None:
-                raise HTTPException(status_code=404, detail="device_not_found")
-            license_row = create_license(
-                connection,
-                device_id=int(device["id"]),
-                license_type="paid",
-                source="admin",
-                starts_at=now,
-                expires_at=now + timedelta(days=request.license_days),
-            )
-            connection.commit()
-        return _license_response(
-            product_id=PRODUCT_ID,
             device_fingerprint_hash=request.device_fingerprint_hash,
             license_row=license_row,
             private_key_b64=private_key_b64,

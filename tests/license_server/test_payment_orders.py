@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from license_server.db import connect
+from license_server.license_service import create_license
 from license_server.signer import datetime_text
 from tests.license_server.test_license_server import _client, _register_payload
 
@@ -171,15 +172,20 @@ def test_status_lazily_expires_unpaid_order(tmp_path):
 def test_paid_active_device_cannot_create_payment_order(tmp_path):
     client, _public_key = _client(tmp_path)
     client.post("/device/register", json=_register_payload())
-    client.post(
-        "/admin/grant",
-        headers={"X-License-Admin-Token": "admin-token"},
-        json={
-            "device_fingerprint_hash": "device-a",
-            "license_days": 365,
-            "reason": "dev grant",
-        },
-    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    with connect(tmp_path / "license.sqlite3") as connection:
+        device = connection.execute(
+            "SELECT id FROM devices WHERE device_fingerprint_hash = 'device-a'"
+        ).fetchone()
+        create_license(
+            connection,
+            device_id=int(device["id"]),
+            license_type="paid",
+            source="payment",
+            starts_at=now,
+            expires_at=now + timedelta(days=365),
+        )
+        connection.commit()
 
     response = client.post("/payment/create", json=_payment_payload())
 

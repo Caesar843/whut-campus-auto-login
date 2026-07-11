@@ -39,7 +39,6 @@ def _client(tmp_path, **app_kwargs):
     app = create_app(
         database_path=tmp_path / "license.sqlite3",
         private_key_b64=private_key_b64,
-        admin_token="admin-token",
         **app_kwargs,
     )
     return TestClient(app), _public_key_b64(private_key_b64)
@@ -56,16 +55,11 @@ def _sqlite_url(path: Path) -> str:
     return "sqlite:///" + path.as_posix()
 
 
-def _production_admin_token() -> str:
-    return "unit_test_admin_value_1234567890ABCDE"
-
-
 def _production_env(tmp_path, **overrides):
     env = {
         "LICENSE_SERVER_ENV": "production",
         "DATABASE_URL": _sqlite_url(tmp_path / "license.sqlite3"),
         "LICENSE_PRIVATE_KEY": _private_key_b64(),
-        "LICENSE_ADMIN_TOKEN": _production_admin_token(),
     }
     env.update(overrides)
     return env
@@ -97,7 +91,6 @@ def test_default_app_health_works_without_sensitive_env(monkeypatch):
     monkeypatch.delenv("SERVER_ENV", raising=False)
     monkeypatch.delenv("LICENSE_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("LICENSE_PRIVATE_KEY_FILE", raising=False)
-    monkeypatch.delenv("LICENSE_ADMIN_TOKEN", raising=False)
 
     client = TestClient(_default_app())
     response = client.get("/health")
@@ -112,7 +105,6 @@ def test_default_app_refuses_invalid_production_config(monkeypatch):
     monkeypatch.delenv("LICENSE_DB_PATH", raising=False)
     monkeypatch.delenv("LICENSE_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("LICENSE_PRIVATE_KEY_FILE", raising=False)
-    monkeypatch.delenv("LICENSE_ADMIN_TOKEN", raising=False)
 
     with pytest.raises(RuntimeError) as exc_info:
         _default_app()
@@ -124,7 +116,6 @@ def test_load_config_accepts_development_mode(monkeypatch):
     monkeypatch.setenv("LICENSE_SERVER_ENV", "development")
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./license_server_dev.sqlite3")
     monkeypatch.setenv("LICENSE_PRIVATE_KEY", _private_key_b64())
-    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
 
     config = load_config()
 
@@ -138,7 +129,6 @@ def test_load_config_accepts_test_mode_with_temporary_config(tmp_path):
             "LICENSE_SERVER_ENV": "test",
             "DATABASE_URL": _sqlite_url(tmp_path / "license.sqlite3"),
             "LICENSE_PRIVATE_KEY": _private_key_b64(),
-            "LICENSE_ADMIN_TOKEN": "admin-token",
         }
     )
 
@@ -161,7 +151,6 @@ def test_development_and_test_allow_mock_payment_provider(tmp_path):
                 "LICENSE_SERVER_ENV": environment,
                 "DATABASE_URL": _sqlite_url(tmp_path / f"{environment}.sqlite3"),
                 "LICENSE_PRIVATE_KEY": _private_key_b64(),
-                "LICENSE_ADMIN_TOKEN": "admin-token",
                 "PAYMENT_PROVIDER": "mock",
                 "PAYMENT_MOCK_ADMIN_TOKEN": "mockR4ndomValue123456",
                 "PAYMENT_PRICE_FEN": "990",
@@ -182,12 +171,11 @@ def test_production_rejects_mock_payment_provider(tmp_path):
         load_config(env)
 
 
-def test_mock_payment_provider_requires_admin_token(tmp_path):
+def test_mock_payment_provider_requires_mock_admin_token(tmp_path):
     env = {
         "LICENSE_SERVER_ENV": "test",
         "DATABASE_URL": _sqlite_url(tmp_path / "license.sqlite3"),
         "LICENSE_PRIVATE_KEY": _private_key_b64(),
-        "LICENSE_ADMIN_TOKEN": "admin-token",
         "PAYMENT_PROVIDER": "mock",
     }
 
@@ -303,82 +291,16 @@ def test_production_loads_valid_private_key_file(tmp_path):
     assert config.private_key_b64 == private_key_b64
 
 
-def test_production_requires_admin_token(tmp_path):
-    env = _production_env(tmp_path)
-    env.pop("LICENSE_ADMIN_TOKEN")
-
-    with pytest.raises(RuntimeError) as exc_info:
-        load_config(env)
-
-    assert "LICENSE_ADMIN_TOKEN is required" in str(exc_info.value)
-
-
-def test_production_rejects_empty_admin_token(tmp_path):
-    env = _production_env(tmp_path, LICENSE_ADMIN_TOKEN="   ")
-
-    with pytest.raises(RuntimeError) as exc_info:
-        load_config(env)
-
-    assert "LICENSE_ADMIN_TOKEN is required" in str(exc_info.value)
-
-
-def test_production_rejects_placeholder_admin_token(tmp_path):
-    secret = "replace_with_strong_admin_token_1234567890"
-    env = _production_env(tmp_path, LICENSE_ADMIN_TOKEN=secret)
-
-    with pytest.raises(RuntimeError) as exc_info:
-        load_config(env)
-
-    message = str(exc_info.value)
-    assert "insecure placeholder" in message
-    assert secret not in message
-
-
-def test_production_rejects_short_admin_token(tmp_path):
-    secret = "short-token"
-    env = _production_env(tmp_path, LICENSE_ADMIN_TOKEN=secret)
-
-    with pytest.raises(RuntimeError) as exc_info:
-        load_config(env)
-
-    message = str(exc_info.value)
-    assert "at least 32 characters" in message
-    assert secret not in message
-
-
-def test_create_app_direct_production_rejects_short_admin_token(tmp_path):
-    with pytest.raises(RuntimeError, match="at least 32 characters"):
-        create_app(
-            database_path=tmp_path / "license.sqlite3",
-            private_key_b64=_private_key_b64(),
-            admin_token="short-token",
-            environment="production",
-        )
-
-
-def test_production_rejects_low_entropy_admin_token(tmp_path):
-    secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    env = _production_env(tmp_path, LICENSE_ADMIN_TOKEN=secret)
-
-    with pytest.raises(RuntimeError) as exc_info:
-        load_config(env)
-
-    message = str(exc_info.value)
-    assert "too weak" in message
-    assert secret not in message
-
-
-def test_production_accepts_strong_admin_token(tmp_path):
+def test_production_no_longer_requires_legacy_license_admin_token(tmp_path):
     config = load_config(_production_env(tmp_path))
 
-    assert config.admin_token == _production_admin_token()
+    assert not hasattr(config, "admin_token")
 
 
 def test_load_config_uses_relative_sqlite_database_url(monkeypatch):
     monkeypatch.setenv("LICENSE_SERVER_ENV", "development")
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./license_server_dev.sqlite3")
     monkeypatch.setenv("LICENSE_PRIVATE_KEY", _private_key_b64())
-    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
     monkeypatch.delenv("LICENSE_DB_PATH", raising=False)
 
     config = load_config()
@@ -393,7 +315,6 @@ def test_load_config_uses_absolute_sqlite_database_url(monkeypatch):
         "sqlite:////var/lib/whut-campus-auto-login/license.sqlite3",
     )
     monkeypatch.setenv("LICENSE_PRIVATE_KEY", _private_key_b64())
-    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
     monkeypatch.delenv("LICENSE_DB_PATH", raising=False)
 
     config = load_config()
@@ -408,7 +329,6 @@ def test_load_config_keeps_license_db_path_fallback(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("LICENSE_DB_PATH", "legacy-license.sqlite3")
     monkeypatch.setenv("LICENSE_PRIVATE_KEY", _private_key_b64())
-    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
 
     config = load_config()
 
@@ -420,7 +340,6 @@ def test_load_config_wraps_unreadable_private_key_file(monkeypatch, tmp_path):
     missing_key_file = tmp_path / "missing-private-key.txt"
     monkeypatch.delenv("LICENSE_PRIVATE_KEY", raising=False)
     monkeypatch.setenv("LICENSE_PRIVATE_KEY_FILE", str(missing_key_file))
-    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-placeholder")
 
     with pytest.raises(RuntimeError) as exc_info:
         load_config()
@@ -726,7 +645,7 @@ def test_refresh_returns_latest_license(tmp_path):
     assert payload["signed_license_token"]
 
 
-def test_admin_grant_issues_365_day_paid_license(tmp_path):
+def test_legacy_admin_grant_route_is_removed(tmp_path):
     client, _public_key_b64_value = _client(tmp_path)
     client.post("/device/register", json=_register_payload())
 
@@ -740,29 +659,15 @@ def test_admin_grant_issues_365_day_paid_license(tmp_path):
         },
     )
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["license_type"] == "paid"
-    assert payload["license_status"] == "active"
-    expires_at = datetime.fromisoformat(payload["expires_at"].replace("Z", "+00:00"))
-    assert 364 <= (expires_at - datetime.now(timezone.utc)).days <= 365
+    assert response.status_code == 404
 
 
-def test_admin_grant_requires_admin_token(tmp_path):
+def test_openapi_excludes_legacy_admin_grant_route(tmp_path):
     client, _public_key_b64_value = _client(tmp_path)
-    client.post("/device/register", json=_register_payload())
 
-    response = client.post(
-        "/admin/grant",
-        headers={"X-License-Admin-Token": "wrong"},
-        json={
-            "device_fingerprint_hash": "device-a",
-            "license_days": 365,
-            "reason": "dev grant",
-        },
-    )
+    schema = client.get("/openapi.json").json()
 
-    assert response.status_code == 403
+    assert "/admin/grant" not in schema["paths"]
 
 
 def test_env_example_contains_only_placeholders():
@@ -771,10 +676,10 @@ def test_env_example_contains_only_placeholders():
     assert "LICENSE_SERVER_ENV=development" in content
     assert "DATABASE_URL=sqlite:///ABSOLUTE_PATH_TO_LICENSE_SERVER_DB.sqlite3" in content
     assert "LICENSE_PRIVATE_KEY_FILE=ABSOLUTE_PATH_TO_ED25519_PRIVATE_KEY_B64_FILE" in content
-    assert "LICENSE_ADMIN_TOKEN=REPLACE_WITH_RANDOM_TOKEN_AT_LEAST_32_CHARS" in content
     assert "PAYMENT_MOCK_ADMIN_TOKEN=REPLACE_WITH_RANDOM_MOCK_TOKEN_AT_LEAST_16_CHARS" in content
     assert "LICENSE_SERVER_URL=http://127.0.0.1:8787" in content
     assert "LICENSE_PUBLIC_KEY=REPLACE_WITH_ED25519_PUBLIC_KEY_B64" in content
+    assert "LICENSE_ADMIN_TOKEN" not in content
     assert "\nSERVER_ENV=" not in content
     assert "LICENSE_DB_PATH" not in content
     forbidden_fragments = [
@@ -820,7 +725,7 @@ def test_production_config_doc_exists_without_secrets():
     assert "LICENSE_SERVER_ENV" in content
     assert "DATABASE_URL" in content
     assert "LICENSE_PRIVATE_KEY_FILE" in content
-    assert "LICENSE_ADMIN_TOKEN" in content
+    assert "LICENSE_ADMIN_TOKEN" not in content
     assert "GET /healthz" in content
     assert "Nginx" in content
     forbidden_fragments = [

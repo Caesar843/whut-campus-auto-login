@@ -340,7 +340,6 @@ def _set_admin_env(tmp_path, monkeypatch, *, access_hash=ADMIN_HASH):
     monkeypatch.setenv("LICENSE_SERVER_ENV", "test")
     monkeypatch.setenv("DATABASE_URL", _sqlite_url(tmp_path / "license.sqlite3"))
     monkeypatch.setenv("LICENSE_PRIVATE_KEY", _private_key_b64())
-    monkeypatch.setenv("LICENSE_ADMIN_TOKEN", "admin-token")
     monkeypatch.setenv("ADMIN_ENABLED", "true")
     monkeypatch.setenv("ADMIN_OPERATOR_NAME", "tester")
     if access_hash is None:
