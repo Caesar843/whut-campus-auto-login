@@ -44,7 +44,6 @@ python3 scripts/dev/generate_license_keys.py
 LICENSE_SERVER_URL=http://127.0.0.1:8787
 LICENSE_PRIVATE_KEY=replace_with_base64_or_configured_private_key
 LICENSE_PUBLIC_KEY=replace_with_public_key
-LICENSE_ADMIN_TOKEN=replace_with_strong_admin_token
 DATABASE_URL=sqlite:////var/lib/whut-campus-auto-login/license.sqlite3
 LICENSE_SERVER_ENV=production
 ```

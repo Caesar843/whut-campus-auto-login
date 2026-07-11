@@ -15,7 +15,6 @@ from license_server.config import (
     load_config,
     validate_mock_admin_token,
     validate_admin_access_token_sha256,
-    validate_production_admin_token,
     validate_private_key_b64,
 )
 from license_server.db import initialize_database
@@ -31,7 +30,6 @@ def create_app(
     *,
     database_path: Optional[Path] = None,
     private_key_b64: Optional[str] = None,
-    admin_token: Optional[str] = None,
     payment_amount: Optional[str] = None,
     payment_currency: Optional[str] = None,
     payment_channels: Optional[tuple[str, ...]] = None,
@@ -43,12 +41,11 @@ def create_app(
     admin_operator_name: Optional[str] = None,
     admin_access_token_sha256: Optional[str] = None,
 ) -> FastAPI:
-    if database_path is None or private_key_b64 is None or admin_token is None:
+    if database_path is None or private_key_b64 is None:
         config = load_config()
         environment = environment or config.environment
         database_path = database_path or config.database_path
         private_key_b64 = private_key_b64 or config.private_key_b64
-        admin_token = admin_token or config.admin_token
         payment_amount = payment_amount or config.payment_amount
         payment_currency = payment_currency or config.payment_currency
         payment_channels = payment_channels or config.payment_channels
@@ -66,10 +63,6 @@ def create_app(
         )
     environment = environment or DEFAULT_ENVIRONMENT
     validate_private_key_b64(str(private_key_b64), source="private_key_b64")
-    if not str(admin_token or "").strip():
-        raise RuntimeError("admin_token is required.")
-    if environment == "production":
-        validate_production_admin_token(str(admin_token))
     if environment == "production" and payment_provider == "mock":
         raise RuntimeError("PAYMENT_PROVIDER=mock is not allowed in production.")
     if payment_provider == "mock" and not str(payment_mock_admin_token or "").strip():
@@ -92,7 +85,6 @@ def create_app(
         create_router(
             database_path=Path(database_path),
             private_key_b64=str(private_key_b64),
-            admin_token=str(admin_token),
             payment_amount=str(payment_amount),
             payment_currency=str(payment_currency),
             payment_channels=tuple(payment_channels),

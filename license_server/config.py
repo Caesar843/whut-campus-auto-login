@@ -19,7 +19,6 @@ VALID_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_PAYMENT_CHANNELS = ("wechat_pay", "alipay")
 DEFAULT_PAYMENT_ORDER_TTL_MINUTES = 15
 VALID_PAYMENT_PROVIDERS = {"mock", "wechat_native"}
-PRODUCTION_ADMIN_TOKEN_MIN_LENGTH = 32
 MOCK_ADMIN_TOKEN_MIN_LENGTH = 16
 SHA256_HEX_LENGTH = 64
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -40,7 +39,6 @@ class LicenseServerConfig:
     environment: str
     database_path: Path
     private_key_b64: str
-    admin_token: str
     payment_provider: str | None
     payment_mock_admin_token: str | None
     payment_price_fen: int
@@ -58,14 +56,12 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
     environment = _environment_from_env(values)
     database_path = _database_path_from_env(values, environment)
     private_key_b64 = _private_key_from_env(values, environment)
-    admin_token = _admin_token_from_env(values, environment)
     payment_price_fen = _payment_price_fen_from_env(values)
     payment_currency = _payment_currency_from_env(values)
     return LicenseServerConfig(
         environment=environment,
         database_path=database_path,
         private_key_b64=private_key_b64,
-        admin_token=admin_token,
         payment_provider=_payment_provider_from_env(values, environment),
         payment_mock_admin_token=_payment_mock_admin_token_from_env(values, environment),
         payment_price_fen=payment_price_fen,
@@ -152,27 +148,6 @@ def _private_key_from_env(values: Mapping[str, str], environment: str) -> str:
         source="LICENSE_PRIVATE_KEY_FILE" if private_key_file and not values.get("LICENSE_PRIVATE_KEY", "").strip() else "LICENSE_PRIVATE_KEY",
     )
     return private_key_b64
-
-
-def _admin_token_from_env(values: Mapping[str, str], environment: str) -> str:
-    admin_token = values.get("LICENSE_ADMIN_TOKEN", "").strip()
-    if not admin_token:
-        raise RuntimeError("LICENSE_ADMIN_TOKEN is required.")
-    if environment == "production":
-        validate_production_admin_token(admin_token)
-    return admin_token
-
-
-def validate_production_admin_token(admin_token: str) -> None:
-    normalized = admin_token.lower()
-    if len(admin_token) < PRODUCTION_ADMIN_TOKEN_MIN_LENGTH:
-        raise RuntimeError(
-            "LICENSE_ADMIN_TOKEN must be at least 32 characters in production."
-        )
-    if any(marker in normalized for marker in INSECURE_ADMIN_TOKEN_MARKERS):
-        raise RuntimeError("LICENSE_ADMIN_TOKEN uses an insecure placeholder value.")
-    if len(set(admin_token)) < 8:
-        raise RuntimeError("LICENSE_ADMIN_TOKEN is too weak for production.")
 
 
 def _is_absolute_path(path: Path) -> bool:

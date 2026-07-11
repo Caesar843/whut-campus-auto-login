@@ -21,7 +21,6 @@
 - `LICENSE_DB_PATH`：兼容用数据库文件路径。生产必须是绝对路径。优先使用 `DATABASE_URL`。
 - `LICENSE_PRIVATE_KEY`：Base64 编码的 32 字节 Ed25519 私钥。
 - `LICENSE_PRIVATE_KEY_FILE`：保存上述私钥内容的文件路径。生产建议使用这个变量，路径必须是绝对路径。
-- `LICENSE_ADMIN_TOKEN`：管理员接口 token。生产必须显式配置，至少 32 个字符，不能使用占位符。
 - `PAYMENT_YEARLY_AMOUNT`：既有订单骨架使用的年费金额，当前默认 `9.9`。
 - `PAYMENT_CURRENCY`：币种，当前默认 `CNY`。
 - `PAYMENT_CHANNELS`：既有订单骨架使用的支付渠道列表，当前只是订单骨架。
@@ -39,7 +38,6 @@
 - `LICENSE_SERVER_ENV=production`
 - `DATABASE_URL` 或 `LICENSE_DB_PATH`
 - `LICENSE_PRIVATE_KEY` 或 `LICENSE_PRIVATE_KEY_FILE`
-- `LICENSE_ADMIN_TOKEN`
 
 ## Ed25519 私钥
 
@@ -56,16 +54,6 @@ python scripts/dev/generate_license_keys.py
 ```
 
 不要把私钥文件放进仓库，不要复制到客户端。客户端只需要 `LICENSE_PUBLIC_KEY`。
-
-## 管理员 Token
-
-生产 token 用随机值生成，例如：
-
-```powershell
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-不要使用 `change-me`、`admin-token`、`replace_with...` 或其他占位符。配置校验失败时只会提示配置项名称，不会输出 token 内容。
 
 ## 数据库路径
 
@@ -86,8 +74,6 @@ sqlite:////srv/APP_NAME/license.sqlite3
 - 生产数据库路径不是绝对路径。
 - 缺少私钥配置。
 - 私钥文件不存在、不可读或内容不是 Base64 Ed25519 raw 私钥。
-- 缺少管理员 token。
-- 管理员 token 过短或使用明显占位符。
 
 错误信息只包含配置项名称或文件路径，不包含私钥和 token 内容。
 

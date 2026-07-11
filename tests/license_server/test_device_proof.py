@@ -170,7 +170,6 @@ def _proof_client(tmp_path, private_key_b64: str) -> TestClient:
         create_app(
             database_path=tmp_path / "license.sqlite3",
             private_key_b64=private_key_b64,
-            admin_token="admin-token",
         )
     )
 
