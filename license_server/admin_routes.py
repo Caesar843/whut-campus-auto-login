@@ -694,6 +694,42 @@ _ADMIN_HTML = """<!doctype html>
       <button id="orders-next" type="button">下一页</button>
       <p id="orders-page">offset 0</p>
       <div id="orders-output"></div>
+      <h3>追加售后备注</h3>
+      <label for="order-note-order-id">order_id</label>
+      <input id="order-note-order-id" autocomplete="off">
+      <label for="order-note-text">备注</label>
+      <textarea id="order-note-text" maxlength="500"></textarea>
+      <button id="order-note-submit" type="button">追加备注</button>
+      <p id="order-note-status" role="status"></p>
+    </section>
+
+    <section aria-labelledby="audit-title">
+      <h2 id="audit-title">审计记录</h2>
+      <label for="audit-target-type">target_type</label>
+      <input id="audit-target-type" autocomplete="off">
+      <label for="audit-target-id">target_id</label>
+      <input id="audit-target-id" autocomplete="off">
+      <label for="audit-action">action</label>
+      <input id="audit-action" autocomplete="off">
+      <label for="audit-result">result</label>
+      <input id="audit-result" autocomplete="off">
+      <label for="audit-request-id">request_id</label>
+      <input id="audit-request-id" autocomplete="off">
+      <label for="audit-created-from">created_from</label>
+      <input id="audit-created-from" autocomplete="off">
+      <label for="audit-created-to">created_to</label>
+      <input id="audit-created-to" autocomplete="off">
+      <label for="audit-limit">limit</label>
+      <input id="audit-limit" type="number" min="1" max="100" value="50">
+      <label for="audit-offset">offset</label>
+      <input id="audit-offset" type="number" min="0" value="0">
+      <button id="audit-load" type="button">加载审计记录</button>
+      <button id="audit-prev" type="button">上一页</button>
+      <button id="audit-next" type="button">下一页</button>
+      <p id="audit-page">offset 0</p>
+      <div id="audit-output"></div>
+      <h3>审计详情</h3>
+      <div id="audit-detail-output"></div>
     </section>
 
     <section aria-labelledby="notifications-title">
@@ -758,9 +794,11 @@ _ADMIN_JS = """
   const API_BASE = "/internal/admin/api/";
   const state = {
     orders: { offset: 0, lastCount: null },
+    audit: { offset: 0, lastCount: null },
     notifications: { offset: 0, lastCount: null },
     grants: { offset: 0, lastCount: null },
     licenses: { offset: 0, lastCount: null },
+    noteSubmitting: false,
   };
   const config = {
     orders: {
@@ -788,6 +826,35 @@ _ADMIN_JS = """
         ["orders-status", "status"],
         ["orders-order-id", "order_id"],
         ["orders-out-trade-no", "out_trade_no"],
+      ],
+    },
+    audit: {
+      path: "audit-logs",
+      output: "audit-output",
+      page: "audit-page",
+      detailOutput: "audit-detail-output",
+      detail: true,
+      fields: [
+        "id",
+        "actor",
+        "source_ip",
+        "request_id",
+        "action",
+        "target_type",
+        "target_id",
+        "result",
+        "reason",
+        "failure_code",
+        "created_at",
+      ],
+      filters: [
+        ["audit-target-type", "target_type"],
+        ["audit-target-id", "target_id"],
+        ["audit-action", "action"],
+        ["audit-result", "result"],
+        ["audit-request-id", "request_id"],
+        ["audit-created-from", "created_from"],
+        ["audit-created-to", "created_to"],
       ],
     },
     notifications: {
@@ -883,7 +950,7 @@ _ADMIN_JS = """
     return (sessionStorage.getItem(KEY) || "").trim();
   }
 
-  async function adminFetch(path) {
+  async function adminFetch(path, options = {}) {
     if (!path.startsWith(API_BASE)) {
       throw new Error("blocked");
     }
@@ -891,14 +958,25 @@ _ADMIN_JS = """
     if (!secret) {
       throw new Error("empty-secret");
     }
-    const response = await fetch(path, {
-      method: "GET",
+    const request = {
+      method: options.method || "GET",
       cache: "no-store",
       credentials: "omit",
       headers: { Authorization: "Bearer " + secret },
-    });
+    };
+    if (options.body !== undefined) {
+      request.headers["Content-Type"] = "application/json";
+      request.body = options.body;
+    }
+    const response = await fetch(path, request);
     if (response.status === 401) {
       throw new Error("unauthorized");
+    }
+    if (response.status === 400 || response.status === 422) {
+      throw new Error("invalid-request");
+    }
+    if (response.status === 404) {
+      throw new Error("not-found");
     }
     if (!response.ok) {
       throw new Error("request-failed");
@@ -913,6 +991,14 @@ _ADMIN_JS = """
     }
     if (error.message === "empty-secret") {
       setStatus("请输入管理员令牌。");
+      return;
+    }
+    if (error.message === "invalid-request") {
+      setStatus("请求参数无效。");
+      return;
+    }
+    if (error.message === "not-found") {
+      setStatus("资源不存在。");
       return;
     }
     setStatus("请求失败，请检查筛选条件或稍后重试。");
@@ -956,6 +1042,27 @@ _ADMIN_JS = """
     }
   }
 
+  function formatValue(value) {
+    if (value === null || value === undefined) {
+      return "";
+    }
+    if (typeof value === "object") {
+      return JSON.stringify(value);
+    }
+    return String(value);
+  }
+
+  function clearAuditDetail() {
+    clearNode(byId("audit-detail-output"));
+  }
+
+  function resetListOffset(kind) {
+    state[kind].offset = 0;
+    state[kind].lastCount = null;
+    byId(kind + "-offset").value = "0";
+    byId(kind + "-page").textContent = "offset 0";
+  }
+
   function renderSummary(data) {
     const output = byId("summary-output");
     clearNode(output);
@@ -984,6 +1091,11 @@ _ADMIN_JS = """
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
+    if (item.detail) {
+      const detailHead = document.createElement("th");
+      detailHead.textContent = "detail";
+      headRow.appendChild(detailHead);
+    }
     for (const field of item.fields) {
       const th = document.createElement("th");
       th.textContent = field;
@@ -995,16 +1107,86 @@ _ADMIN_JS = """
     const tbody = document.createElement("tbody");
     for (const row of rows) {
       const tr = document.createElement("tr");
+      if (item.detail) {
+        const td = document.createElement("td");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = "查看";
+        button.addEventListener("click", () => loadAuditDetail(String(row.id || "")));
+        td.appendChild(button);
+        tr.appendChild(td);
+      }
       for (const field of item.fields) {
         const td = document.createElement("td");
-        const value = row[field];
-        td.textContent = value === null || value === undefined ? "" : String(value);
+        td.textContent = formatValue(row[field]);
         tr.appendChild(td);
       }
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
     output.appendChild(table);
+  }
+
+  function renderAuditDetail(data) {
+    const output = byId("audit-detail-output");
+    clearAuditDetail();
+    const list = document.createElement("dl");
+    for (const field of config.audit.fields.concat(["before_state", "after_state"])) {
+      const term = document.createElement("dt");
+      const detail = document.createElement("dd");
+      term.textContent = field;
+      detail.textContent = formatValue(data[field]);
+      list.appendChild(term);
+      list.appendChild(detail);
+    }
+    output.appendChild(list);
+  }
+
+  async function loadAuditDetail(auditId) {
+    clearAuditDetail();
+    if (!auditId) {
+      setStatus("资源不存在。");
+      return;
+    }
+    try {
+      const data = await adminFetch(API_BASE + "audit-logs/" + encodeURIComponent(auditId));
+      renderAuditDetail(data);
+      setStatus("审计详情已加载。");
+    } catch (error) {
+      handleError(error);
+    }
+  }
+
+  async function submitOrderNote() {
+    if (state.noteSubmitting) {
+      return;
+    }
+    const orderId = byId("order-note-order-id").value.trim();
+    const note = byId("order-note-text").value.trim();
+    if (!orderId || note.length < 1 || note.length > 500) {
+      byId("order-note-status").textContent = "备注要求 1-500 字符。";
+      setStatus("请求参数无效。");
+      return;
+    }
+    state.noteSubmitting = true;
+    byId("order-note-submit").disabled = true;
+    try {
+      const data = await adminFetch(API_BASE + "orders/" + encodeURIComponent(orderId) + "/notes", {
+        method: "POST",
+        body: JSON.stringify({ note: note }),
+      });
+      byId("order-note-text").value = "";
+      renderAuditDetail(data);
+      await loadList("audit", 0);
+      byId("order-note-status").textContent = "备注已追加。";
+      setStatus("备注已追加。");
+    } catch (error) {
+      byId("order-note-status").textContent = "备注提交失败。";
+      handleError(error);
+    } finally {
+      state.noteSubmitting = false;
+      byId("order-note-submit").disabled = false;
+    }
   }
 
   async function loadSummary() {
@@ -1043,11 +1225,20 @@ _ADMIN_JS = """
     byId(kind + "-next").addEventListener("click", () => loadList(kind, 1));
   }
 
+  function bindFilterReset(kind) {
+    for (const pair of config[kind].filters.concat([[kind + "-limit", "limit"]])) {
+      byId(pair[0]).addEventListener("change", () => resetListOffset(kind));
+    }
+  }
+
   function init() {
     byId("save-secret").addEventListener("click", saveSecret);
     byId("clear-secret").addEventListener("click", clearSecret);
     byId("load-summary").addEventListener("click", loadSummary);
+    byId("order-note-submit").addEventListener("click", submitOrderNote);
     bindList("orders");
+    bindList("audit");
+    bindFilterReset("audit");
     bindList("notifications");
     bindList("grants");
     bindList("licenses");
