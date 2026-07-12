@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import sqlite3
+import unicodedata
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, ConfigDict
 
-from license_server.db import connect
+from license_server.admin_audit import AdminAuditEntry, AuditResult, insert_admin_audit
+from license_server.db import connect, write_transaction
 from license_server.payment import OrderStatus
 from license_server.signer import datetime_text
 
@@ -30,6 +36,34 @@ NOTIFICATION_STATUSES = {
     "ORPHAN",
 }
 LICENSE_STATUSES = {"active", "revoked"}
+AUDIT_RESULTS = {item.value for item in AuditResult}
+SENSITIVE_TEXT_PATTERNS = (
+    "token",
+    "authorization",
+    "bearer",
+    "password",
+    "passwd",
+    "privatekey",
+    "apikey",
+    "apiv3key",
+    "codeurl",
+    "wechatpaysignature",
+    "weixinwxpay",
+    "密码",
+    "私钥",
+    "二维码",
+    "rawpayload",
+    "bodyraw",
+    "bodydecrypted",
+    "callbackbody",
+    "回调正文",
+)
+
+
+class AdminNoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str
 
 
 def create_admin_router(
@@ -69,26 +103,29 @@ def create_admin_router(
 
     @router.get("/api/summary", dependencies=admin_dependency)
     def summary():
-        with _connection(database_path) as connection:
-            return {
-                "orders_by_status": _count_by(connection, "payment_orders", "status"),
-                "notifications_by_status": _count_by(
-                    connection,
-                    "payment_notifications",
-                    "process_status",
-                ),
-                "license_grants_total": _count(connection, "license_grants"),
-                "active_paid_licenses": connection.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM licenses
-                    WHERE license_type = 'paid'
-                      AND status = 'active'
-                      AND expires_at > ?
-                    """,
-                    (datetime_text(datetime.now(timezone.utc)),),
-                ).fetchone()[0],
-            }
+        try:
+            with _connection(database_path) as connection:
+                return {
+                    "orders_by_status": _count_by(connection, "payment_orders", "status"),
+                    "notifications_by_status": _count_by(
+                        connection,
+                        "payment_notifications",
+                        "process_status",
+                    ),
+                    "license_grants_total": _count(connection, "license_grants"),
+                    "active_paid_licenses": connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM licenses
+                        WHERE license_type = 'paid'
+                          AND status = 'active'
+                          AND expires_at > ?
+                        """,
+                        (datetime_text(datetime.now(timezone.utc)),),
+                    ).fetchone()[0],
+                }
+        except sqlite3.Error as exc:
+            raise _admin_error(500, "ADMIN_INTERNAL_ERROR") from exc
 
     @router.get("/api/orders", dependencies=admin_dependency)
     def orders(
@@ -133,6 +170,115 @@ def create_admin_router(
         if row is None:
             raise _admin_error(404, "ADMIN_RESOURCE_NOT_FOUND")
         return _order(row)
+
+    @router.get("/api/audit-logs", dependencies=admin_dependency)
+    def audit_logs(
+        target_type: str | None = None,
+        target_id: str | None = None,
+        action: str | None = None,
+        result: str | None = None,
+        request_id: str | None = None,
+        created_from: str | None = None,
+        created_to: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        limit, offset = _page(limit, offset)
+        result = _enum(result, AUDIT_RESULTS)
+        clauses: list[str] = []
+        params: list[object] = []
+        _eq(clauses, params, "target_type", target_type)
+        _eq(clauses, params, "target_id", target_id)
+        _eq(clauses, params, "action", action)
+        _eq(clauses, params, "result", result)
+        _eq(clauses, params, "request_id", request_id)
+        _range(clauses, params, "created_at", created_from, created_to)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = _select(
+            database_path,
+            f"""
+            SELECT id, actor, source_ip, request_id, action, target_type,
+                   target_id, result, before_state_json, after_state_json,
+                   reason, failure_code, created_at
+            FROM admin_audit_logs
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        )
+        return {"items": [_audit(row) for row in rows], "limit": limit, "offset": offset}
+
+    @router.get("/api/audit-logs/{audit_id}", dependencies=admin_dependency)
+    def audit_log_detail(audit_id: str):
+        row = _one(
+            database_path,
+            """
+            SELECT id, actor, source_ip, request_id, action, target_type,
+                   target_id, result, before_state_json, after_state_json,
+                   reason, failure_code, created_at
+            FROM admin_audit_logs
+            WHERE id = ?
+            """,
+            (audit_id,),
+        )
+        if row is None:
+            raise _admin_error(404, "ADMIN_RESOURCE_NOT_FOUND")
+        return _audit(row)
+
+    @router.post("/api/orders/{order_id}/notes", status_code=201)
+    def add_order_note(
+        order_id: str,
+        body: AdminNoteRequest,
+        request: Request,
+        operator: str = Depends(require_admin),
+    ):
+        if not operator.strip():
+            raise _admin_error(503, "ADMIN_OPERATOR_REQUIRED")
+        note = _note(body.note)
+        source_ip = request.client.host if request.client else ""
+        if not source_ip:
+            raise _admin_error(500, "ADMIN_INTERNAL_ERROR")
+        try:
+            with write_transaction(database_path) as connection:
+                order = connection.execute(
+                    "SELECT order_id FROM payment_orders WHERE order_id = ?",
+                    (order_id,),
+                ).fetchone()
+                if order is None:
+                    raise _admin_error(404, "ADMIN_RESOURCE_NOT_FOUND")
+                audit_id = insert_admin_audit(
+                    connection,
+                    AdminAuditEntry(
+                        actor=operator,
+                        source_ip=source_ip,
+                        request_id=str(uuid4()),
+                        action="ORDER_NOTE_ADDED",
+                        target_type="PAYMENT_ORDER",
+                        target_id=order_id,
+                        result=AuditResult.SUCCESS,
+                        before_state=None,
+                        after_state=None,
+                        reason=note,
+                        failure_code=None,
+                        created_at=datetime.now(timezone.utc),
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT id, actor, source_ip, request_id, action, target_type,
+                           target_id, result, before_state_json, after_state_json,
+                           reason, failure_code, created_at
+                    FROM admin_audit_logs
+                    WHERE id = ?
+                    """,
+                    (audit_id,),
+                ).fetchone()
+        except HTTPException:
+            raise
+        except (sqlite3.Error, RuntimeError, ValueError) as exc:
+            raise _admin_error(500, "ADMIN_INTERNAL_ERROR") from exc
+        return _audit(row)
 
     @router.get("/api/notifications", dependencies=admin_dependency)
     def notifications(
@@ -287,6 +433,33 @@ def _bool(value: str | None) -> int | None:
     raise _admin_error(400, "ADMIN_QUERY_INVALID")
 
 
+def _note(value: str) -> str:
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > 500
+        or any(unicodedata.category(character) in {"Cc", "Zl", "Zp"} for character in normalized)
+    ):
+        raise _admin_error(400, "ADMIN_NOTE_INVALID")
+    if _is_sensitive_text(normalized):
+        raise _admin_error(400, "ADMIN_NOTE_SENSITIVE")
+    return normalized
+
+
+def _is_sensitive_text(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    compact = "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character)[0] not in {"C", "P", "Z"}
+    )
+    return (
+        any(pattern in compact for pattern in SENSITIVE_TEXT_PATTERNS)
+        or "weixin://wxpay/" in normalized
+        or (normalized.startswith("{") and normalized.endswith("}"))
+    )
+
+
 def _time(value: str | None) -> str | None:
     if value is None:
         return None
@@ -346,7 +519,7 @@ def _one(database_path: Path, sql: str, params: tuple[object, ...]):
 
 def _select(database_path: Path, sql: str, params: tuple[object, ...] = ()):
     try:
-        with connect(database_path) as connection:
+        with closing(connect(database_path)) as connection:
             return connection.execute(sql, params).fetchall()
     except sqlite3.Error as exc:
         raise _admin_error(500, "ADMIN_INTERNAL_ERROR") from exc
@@ -354,7 +527,7 @@ def _select(database_path: Path, sql: str, params: tuple[object, ...] = ()):
 
 def _connection(database_path: Path):
     try:
-        return connect(database_path)
+        return closing(connect(database_path))
     except sqlite3.Error as exc:
         raise _admin_error(500, "ADMIN_INTERNAL_ERROR") from exc
 
@@ -452,6 +625,29 @@ def _license(row) -> dict[str, object]:
         "created_at": str(row["created_at"]),
         "revoked_at": row["revoked_at"],
     }
+
+
+def _audit(row) -> dict[str, object]:
+    reason = str(row["reason"])
+    return {
+        "id": str(row["id"]),
+        "actor": str(row["actor"]),
+        "source_ip": str(row["source_ip"]),
+        "request_id": str(row["request_id"]),
+        "action": str(row["action"]),
+        "target_type": str(row["target_type"]),
+        "target_id": str(row["target_id"]),
+        "result": str(row["result"]),
+        "before_state": _json(row["before_state_json"]),
+        "after_state": _json(row["after_state_json"]),
+        "reason": "[REDACTED]" if _is_sensitive_text(reason) else reason,
+        "failure_code": row["failure_code"],
+        "created_at": str(row["created_at"]),
+    }
+
+
+def _json(value: str | None):
+    return json.loads(value) if value is not None else None
 
 
 _ADMIN_HTML = """<!doctype html>

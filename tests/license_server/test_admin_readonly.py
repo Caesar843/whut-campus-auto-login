@@ -1,9 +1,11 @@
 import hashlib
 from pathlib import Path
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
 
+import license_server.admin_routes as admin_routes
 from license_server.app import create_app
 from license_server.db import connect
 from tests.license_server.test_license_server import (
@@ -246,6 +248,44 @@ def test_admin_summary_and_page_have_security_headers(tmp_path, monkeypatch):
         _assert_security_headers(response)
 
 
+@pytest.mark.parametrize("helper", ["_count_by", "_count"])
+def test_admin_summary_maps_stats_helper_sqlite_errors(tmp_path, monkeypatch, helper):
+    client, _database_path = _admin_client(tmp_path, monkeypatch)
+
+    def fail_stats_query(*_args):
+        raise sqlite3.OperationalError("summary query failed")
+
+    monkeypatch.setattr(admin_routes, helper, fail_stats_query)
+    response = client.get("/internal/admin/api/summary", headers=_auth())
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "ADMIN_INTERNAL_ERROR"}
+    _assert_security_headers(response)
+
+
+def test_admin_summary_maps_direct_sqlite_query_error(tmp_path, monkeypatch):
+    client, _database_path = _admin_client(tmp_path, monkeypatch)
+
+    class FailingConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *_args):
+            raise sqlite3.OperationalError("summary query failed")
+
+    monkeypatch.setattr(admin_routes, "_connection", lambda _database_path: FailingConnection())
+    monkeypatch.setattr(admin_routes, "_count_by", lambda *_args: {})
+    monkeypatch.setattr(admin_routes, "_count", lambda *_args: 0)
+    response = client.get("/internal/admin/api/summary", headers=_auth())
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "ADMIN_INTERNAL_ERROR"}
+    _assert_security_headers(response)
+
+
 def test_admin_script_uses_session_storage_and_authorized_same_origin_api_only(
     tmp_path,
     monkeypatch,
@@ -301,24 +341,31 @@ def test_admin_script_avoids_unsafe_dom_injection_and_has_basic_controls(
     assert "rows.length === 0 && direction > 0" in script
 
 
-def test_admin_router_is_get_only_and_queries_do_not_modify_database(tmp_path, monkeypatch):
+def test_admin_router_only_exposes_note_post_and_queries_do_not_modify_database(
+    tmp_path,
+    monkeypatch,
+):
     client, database_path = _admin_client(tmp_path, monkeypatch)
     _seed_admin_rows(database_path)
     before = _table_counts(database_path)
     before_paid = _paid_license_expires(database_path)
 
-    app_methods = {
-        method
+    write_routes = {
+        (route.path, method)
         for route in client.app.routes
         if getattr(route, "path", "").startswith("/internal/admin")
         for method in getattr(route, "methods", set())
+        if method not in {"GET", "HEAD"}
     }
     client.get("/internal/admin/api/orders", headers=_auth())
     client.get("/internal/admin/api/notifications", headers=_auth())
     client.get("/internal/admin/api/grants", headers=_auth())
     client.get("/internal/admin/api/licenses", headers=_auth())
+    client.get("/internal/admin/api/audit-logs", headers=_auth())
 
-    assert app_methods <= {"GET", "HEAD"}
+    assert write_routes == {
+        ("/internal/admin/api/orders/{order_id}/notes", "POST"),
+    }
     assert _table_counts(database_path) == before
     assert _paid_license_expires(database_path) == before_paid
 
