@@ -21,10 +21,12 @@
 - `LICENSE_DB_PATH`：兼容用数据库文件路径。生产必须是绝对路径。优先使用 `DATABASE_URL`。
 - `LICENSE_PRIVATE_KEY`：Base64 编码的 32 字节 Ed25519 私钥。
 - `LICENSE_PRIVATE_KEY_FILE`：保存上述私钥内容的文件路径。生产建议使用这个变量，路径必须是绝对路径。
-- `PAYMENT_YEARLY_AMOUNT`：既有订单骨架使用的年费金额，当前默认 `9.9`。
 - `PAYMENT_CURRENCY`：币种，当前默认 `CNY`。
 - `PAYMENT_CHANNELS`：既有订单骨架使用的支付渠道列表，当前只是订单骨架。
 - `PAYMENT_ORDER_TTL_MINUTES`：未支付订单有效分钟数。
+- `ADMIN_ENABLED`：是否启用 `/internal/admin` 最小后台。生产默认必须为 `false`。
+- `ADMIN_OPERATOR_NAME`：后台追加售后备注时写入审计的操作人名称。启用后台写操作前必须配置为非空值。
+- `ADMIN_ACCESS_TOKEN_SHA256`：管理员 Bearer Token 的 SHA-256 十六进制摘要。只保存摘要，不保存原始 Token。
 
 支付 V1 的产品目录、`PAYMENT_PRICE_FEN=990` 启动校验、微信 Native-only 范围、支付表和回调幂等规则以 `docs/design/PAYMENT_V1_IMPLEMENTATION.md` 为准。当前预生产授权服务完成，不代表支付预生产闭环完成。
 
@@ -38,6 +40,16 @@
 - `LICENSE_SERVER_ENV=production`
 - `DATABASE_URL` 或 `LICENSE_DB_PATH`
 - `LICENSE_PRIVATE_KEY` 或 `LICENSE_PRIVATE_KEY_FILE`
+
+后台管理配置默认关闭：
+
+```bash
+ADMIN_ENABLED=false
+ADMIN_OPERATOR_NAME=
+ADMIN_ACCESS_TOKEN_SHA256=
+```
+
+只有在 SSH 隧道、受控内网入口或等效访问隔离已经验证完成后，才允许把 `ADMIN_ENABLED` 改为 `true`。启用时必须同时提供非空 `ADMIN_OPERATOR_NAME` 和 64 位十六进制 `ADMIN_ACCESS_TOKEN_SHA256`。不要把真实管理员 Token 或摘要写入文档、仓库、Nginx 配置或浏览器书签。
 
 ## Ed25519 私钥
 

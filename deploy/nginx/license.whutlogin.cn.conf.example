@@ -1,6 +1,10 @@
+# Template only. Replace every REPLACE_WITH_* value before production use.
+# Production requires HTTPS with a valid certificate.
+# Do not put administrator tokens or token hashes in Nginx config.
+
 server {
     listen 80;
-    server_name license.whutlogin.cn;
+    server_name REPLACE_WITH_LICENSE_DOMAIN;
 
     location ^~ /internal/admin {
         return 404;
@@ -16,15 +20,16 @@ server {
     }
 }
 
-# Enable HTTPS after ICP filing and certificate issuance.
-# Example only. Replace paths with real certificate files on the server.
+# Required for production after ICP filing and certificate issuance.
+# Example only; do not deploy this commented block without replacing domain
+# and certificate placeholders with server-local values.
 #
 # server {
 #     listen 443 ssl http2;
-#     server_name license.whutlogin.cn;
+#     server_name REPLACE_WITH_LICENSE_DOMAIN;
 #
-#     ssl_certificate /path/to/fullchain.pem;
-#     ssl_certificate_key /path/to/privkey.pem;
+#     ssl_certificate REPLACE_WITH_FULLCHAIN_PEM_PATH;
+#     ssl_certificate_key REPLACE_WITH_PRIVKEY_PEM_PATH;
 #
 #     location ^~ /internal/admin {
 #         return 404;
