@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
-from license_server.admin_routes import create_admin_router
+from license_server.admin_routes import SECURITY_HEADERS, create_admin_router
 from license_server.config import (
     DEFAULT_PAYMENT_CHANNELS,
     DEFAULT_PAYMENT_ORDER_TTL_MINUTES,
@@ -80,6 +80,7 @@ def create_app(
         validate_admin_access_token_sha256(admin_access_token_sha256)
     initialize_database(Path(database_path))
     app = FastAPI(title="WHUT Campus Auto Login License Server")
+    _add_admin_security_headers(app)
     _add_health_route(app)
     app.include_router(
         create_router(
@@ -137,6 +138,16 @@ def _add_health_route(app: FastAPI) -> None:
     @app.get("/health")
     def health():
         return HEALTH_RESPONSE
+
+
+def _add_admin_security_headers(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def add_admin_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/internal/admin"):
+            for name, value in SECURITY_HEADERS.items():
+                response.headers[name] = value
+        return response
 
 
 app = _default_app()
