@@ -89,31 +89,22 @@ def test_future_schema_version_refuses_startup(tmp_path):
         initialize_database(database_path)
 
 
-def test_legacy_payment_orders_migrate_to_v1_without_granting_license(tmp_path):
+def test_nonempty_unknown_legacy_database_requires_manual_migration(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     _create_legacy_database(database_path)
+    before = _database_snapshot(database_path)
 
-    initialize_database(database_path)
+    with pytest.raises(RuntimeError, match="manual migration required"):
+        initialize_database(database_path)
 
-    with connect(database_path) as connection:
-        assert _schema_version(connection) == SUPPORTED_SCHEMA_VERSION
-        rows = connection.execute(
-            "SELECT order_id, amount_fen, currency, status, open_slot, provider FROM payment_orders ORDER BY order_id"
-        ).fetchall()
-        assert [tuple(row) for row in rows] == [
-            ("legacy-1", 990, "CNY", "CLOSED", None, "wechat_pay"),
-            ("legacy-2", 990, "CNY", "ABNORMAL", "open", "wechat_pay"),
-        ]
-        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM licenses").fetchone()[0] == 0
-        assert "legacy_note" in _columns(connection, "payment_orders_legacy_v0")
+    assert _database_snapshot(database_path) == before
 
 
-def test_legacy_unknown_amount_rolls_back_migration(tmp_path):
+def test_unknown_legacy_database_does_not_reach_order_mapping(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     _create_legacy_database(database_path, amount="unknown")
 
-    with pytest.raises(RuntimeError, match="legacy payment amount"):
+    with pytest.raises(RuntimeError, match="manual migration required"):
         initialize_database(database_path)
 
     with sqlite3.connect(database_path) as connection:
@@ -378,3 +369,14 @@ def _table_sql(database_path: Path) -> list[tuple[str, str]]:
         return connection.execute(
             "SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ).fetchall()
+
+
+def _database_snapshot(database_path: Path) -> list[tuple[object, ...]]:
+    with sqlite3.connect(database_path) as connection:
+        schema = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        rows = []
+        for table in ("devices", "licenses", "payment_orders"):
+            rows.extend((table, *row) for row in connection.execute(f"SELECT * FROM {table}"))
+        return [*schema, *rows]
