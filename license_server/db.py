@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
@@ -21,6 +22,148 @@ LEGACY_REMOVED_DEVICE_COLUMNS = (
 LEGACY_REMOVED_LICENSE_COLUMNS = (
     "revoked_reason",
 )
+
+LEGACY_UNVERSIONED_COLUMNS = {
+    "devices": (
+        ("id", "INTEGER", 0, None, 1, 0),
+        ("product_id", "TEXT", 1, None, 0, 0),
+        ("device_fingerprint_hash", "TEXT", 1, None, 0, 0),
+        ("first_seen_at", "TEXT", 1, None, 0, 0),
+        ("last_seen_at", "TEXT", 1, None, 0, 0),
+    ),
+    "licenses": (
+        ("id", "INTEGER", 0, None, 1, 0),
+        ("device_id", "INTEGER", 1, None, 0, 0),
+        ("license_type", "TEXT", 1, None, 0, 0),
+        ("status", "TEXT", 1, None, 0, 0),
+        ("starts_at", "TEXT", 1, None, 0, 0),
+        ("expires_at", "TEXT", 1, None, 0, 0),
+        ("source", "TEXT", 1, None, 0, 0),
+        ("order_id", "TEXT", 0, None, 0, 0),
+        ("created_at", "TEXT", 1, None, 0, 0),
+        ("revoked_at", "TEXT", 0, None, 0, 0),
+    ),
+    "payment_orders": (
+        ("id", "INTEGER", 0, None, 1, 0),
+        ("order_id", "TEXT", 1, None, 0, 0),
+        ("product_id", "TEXT", 1, None, 0, 0),
+        ("device_fingerprint_hash", "TEXT", 1, None, 0, 0),
+        ("amount", "TEXT", 1, None, 0, 0),
+        ("currency", "TEXT", 1, None, 0, 0),
+        ("payment_channel", "TEXT", 1, None, 0, 0),
+        ("order_status", "TEXT", 1, None, 0, 0),
+        ("payment_status", "TEXT", 1, None, 0, 0),
+        ("provider_status", "TEXT", 1, None, 0, 0),
+        ("provider_order_id", "TEXT", 0, None, 0, 0),
+        ("transaction_id", "TEXT", 0, None, 0, 0),
+        ("created_at", "TEXT", 1, None, 0, 0),
+        ("expire_at", "TEXT", 1, None, 0, 0),
+        ("paid_at", "TEXT", 0, None, 0, 0),
+        ("closed_at", "TEXT", 0, None, 0, 0),
+        ("updated_at", "TEXT", 1, None, 0, 0),
+    ),
+}
+
+SCHEMA_META_COLUMNS = (
+    ("key", "TEXT", 0, None, 1, 0),
+    ("value", "TEXT", 1, None, 0, 0),
+)
+
+LEGACY_UNVERSIONED_FOREIGN_KEYS = {
+    "devices": set(),
+    "licenses": {
+        ("devices", "device_id", "id", "NO ACTION", "NO ACTION", "NONE"),
+    },
+    "payment_orders": set(),
+}
+
+LEGACY_UNVERSIONED_INDEXES = {
+    "devices": {
+        (None, 1, "u", 0, (("device_fingerprint_hash", 0, "BINARY"),)),
+    },
+    "licenses": set(),
+    "payment_orders": {
+        (None, 1, "u", 0, (("order_id", 0, "BINARY"),)),
+        (
+            "idx_payment_orders_device_open",
+            0,
+            "c",
+            0,
+            (
+                ("device_fingerprint_hash", 0, "BINARY"),
+                ("payment_status", 0, "BINARY"),
+                ("order_status", 0, "BINARY"),
+                ("expire_at", 0, "BINARY"),
+            ),
+        ),
+    },
+}
+
+SCHEMA_META_INDEXES = {
+    (None, 1, "pk", 0, (("key", 0, "BINARY"),)),
+}
+
+LEGACY_UNVERSIONED_OBJECTS = {
+    ("table", "devices"),
+    ("table", "licenses"),
+    ("table", "payment_orders"),
+    ("index", "idx_payment_orders_device_open"),
+}
+
+LEGACY_UNVERSIONED_TABLE_SQL = {
+    "devices": """
+        CREATE TABLE devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id TEXT NOT NULL,
+            device_fingerprint_hash TEXT NOT NULL UNIQUE,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )
+    """,
+    "licenses": """
+        CREATE TABLE licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id INTEGER NOT NULL,
+            license_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            starts_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            order_id TEXT,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT,
+            FOREIGN KEY (device_id) REFERENCES devices(id)
+        )
+    """,
+    "payment_orders": """
+        CREATE TABLE payment_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT NOT NULL UNIQUE,
+            product_id TEXT NOT NULL,
+            device_fingerprint_hash TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            payment_channel TEXT NOT NULL,
+            order_status TEXT NOT NULL,
+            payment_status TEXT NOT NULL,
+            provider_status TEXT NOT NULL,
+            provider_order_id TEXT,
+            transaction_id TEXT,
+            created_at TEXT NOT NULL,
+            expire_at TEXT NOT NULL,
+            paid_at TEXT,
+            closed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """,
+}
+
+SCHEMA_META_SQL = """
+    CREATE TABLE schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+"""
 
 CORE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -195,19 +338,59 @@ def write_transaction(database_path: Path):
 
 def initialize_database(database_path: Path) -> None:
     with write_transaction(database_path) as connection:
-        schema_version = _schema_version(connection)
-        if schema_version > SUPPORTED_SCHEMA_VERSION:
-            raise RuntimeError(
-                f"database schema version {schema_version} is newer than supported "
-                f"{SUPPORTED_SCHEMA_VERSION}"
-            )
+        unversioned_legacy = False
+        if _table_exists(connection, "schema_meta"):
+            schema_version = _schema_version(connection)
+        else:
+            schema_version = 0
+            if _has_user_schema_objects(connection):
+                _require_exact_empty_legacy_database(connection)
+                unversioned_legacy = True
         _execute_script(connection, CORE_SCHEMA)
         _drop_legacy_sensitive_columns(connection)
         _ensure_payment_orders(connection)
+        if unversioned_legacy:
+            connection.execute("DROP TABLE payment_orders_legacy_v0")
         _execute_script(connection, PAYMENT_NOTIFICATION_SCHEMA)
         _execute_script(connection, LICENSE_GRANT_SCHEMA)
+        if unversioned_legacy:
+            _set_schema_version(connection, 1)
         _execute_script(connection, ADMIN_AUDIT_SCHEMA)
         _set_schema_version(connection, SUPPORTED_SCHEMA_VERSION)
+
+
+def _require_exact_empty_legacy_database(connection: sqlite3.Connection) -> None:
+    expected_tables = set(LEGACY_UNVERSIONED_COLUMNS)
+    if _user_schema_objects(connection) != LEGACY_UNVERSIONED_OBJECTS:
+        raise RuntimeError(
+            "unversioned database schema does not match the supported empty "
+            "legacy schema; manual migration required"
+        )
+
+    for table in expected_tables:
+        if (
+            _table_signature(connection, table) != LEGACY_UNVERSIONED_COLUMNS[table]
+            or _foreign_key_signature(connection, table)
+            != LEGACY_UNVERSIONED_FOREIGN_KEYS[table]
+            or _index_signature(connection, table) != LEGACY_UNVERSIONED_INDEXES[table]
+            or _table_options(connection, table) != (0, 0)
+            or not _table_sql_matches(
+                connection, table, LEGACY_UNVERSIONED_TABLE_SQL[table]
+            )
+        ):
+            raise RuntimeError(
+                "unversioned database schema does not match the supported empty "
+                "legacy schema; manual migration required"
+            )
+
+    if any(
+        connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        for table in expected_tables
+    ):
+        raise RuntimeError(
+            "unversioned legacy database contains business data; "
+            "manual migration required"
+        )
 
 
 def _ensure_payment_orders(connection: sqlite3.Connection) -> None:
@@ -317,10 +500,32 @@ def _drop_legacy_sensitive_columns(connection: sqlite3.Connection) -> None:
 def _schema_version(connection: sqlite3.Connection) -> int:
     if not _table_exists(connection, "schema_meta"):
         return 0
-    row = connection.execute(
+    if (
+        _table_signature(connection, "schema_meta") != SCHEMA_META_COLUMNS
+        or _index_signature(connection, "schema_meta") != SCHEMA_META_INDEXES
+        or _table_options(connection, "schema_meta") != (0, 0)
+        or not _table_sql_matches(connection, "schema_meta", SCHEMA_META_SQL)
+    ):
+        raise RuntimeError("schema_meta structure is invalid")
+
+    rows = connection.execute(
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-    ).fetchone()
-    return int(row["value"]) if row is not None else 0
+    ).fetchall()
+    if len(rows) != 1:
+        raise RuntimeError("schema_meta must contain exactly one schema_version row")
+    raw_version = str(rows[0]["value"])
+    try:
+        schema_version = int(raw_version)
+    except ValueError as exc:
+        raise RuntimeError("schema_meta schema_version is not a valid integer") from exc
+    if raw_version != str(schema_version) or schema_version <= 0:
+        raise RuntimeError("schema_meta schema_version is invalid")
+    if schema_version > SUPPORTED_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema version {schema_version} is newer than supported "
+            f"{SUPPORTED_SCHEMA_VERSION}"
+        )
+    return schema_version
 
 
 def _set_schema_version(connection: sqlite3.Connection, version: int) -> None:
@@ -365,6 +570,104 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
         (table,),
     ).fetchone()
     return row is not None
+
+
+def _has_user_schema_objects(connection: sqlite3.Connection) -> bool:
+    return bool(_user_schema_objects(connection))
+
+
+def _user_schema_objects(connection: sqlite3.Connection) -> set[tuple[str, str]]:
+    return {
+        (str(row["type"]), str(row["name"]))
+        for row in connection.execute(
+            """
+            SELECT type, name
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index', 'view', 'trigger')
+            """
+        )
+    }
+
+
+def _table_signature(
+    connection: sqlite3.Connection, table: str
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            str(row["name"]),
+            str(row["type"]),
+            int(row["notnull"]),
+            row["dflt_value"],
+            int(row["pk"]),
+            int(row["hidden"]),
+        )
+        for row in connection.execute(f'PRAGMA table_xinfo("{table}")')
+    )
+
+
+def _table_sql_matches(
+    connection: sqlite3.Connection, table: str, expected_sql: str
+) -> bool:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    if row is None or not isinstance(row["sql"], str):
+        return False
+    return _normalize_sql(row["sql"]) == _normalize_sql(expected_sql)
+
+
+def _normalize_sql(sql: str) -> str:
+    return re.sub(r"\s+", "", sql).casefold()
+
+
+def _foreign_key_signature(
+    connection: sqlite3.Connection, table: str
+) -> set[tuple[object, ...]]:
+    return {
+        (
+            str(row["table"]),
+            str(row["from"]),
+            str(row["to"]),
+            str(row["on_update"]),
+            str(row["on_delete"]),
+            str(row["match"]),
+        )
+        for row in connection.execute(f'PRAGMA foreign_key_list("{table}")')
+    }
+
+
+def _index_signature(
+    connection: sqlite3.Connection, table: str
+) -> set[tuple[object, ...]]:
+    indexes = set()
+    for row in connection.execute(f'PRAGMA index_list("{table}")'):
+        name = str(row["name"])
+        quoted_name = name.replace('"', '""')
+        columns = tuple(
+            (str(column["name"]), int(column["desc"]), str(column["coll"]))
+            for column in connection.execute(f'PRAGMA index_xinfo("{quoted_name}")')
+            if int(column["key"])
+        )
+        indexes.add(
+            (
+                name if str(row["origin"]) == "c" else None,
+                int(row["unique"]),
+                str(row["origin"]),
+                int(row["partial"]),
+                columns,
+            )
+        )
+    return indexes
+
+
+def _table_options(connection: sqlite3.Connection, table: str) -> tuple[int, int]:
+    row = connection.execute(
+        "SELECT wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?",
+        (table,),
+    ).fetchone()
+    return (int(row["wr"]), int(row["strict"])) if row is not None else (-1, -1)
 
 
 def _columns(connection: sqlite3.Connection, table: str) -> set[str]:

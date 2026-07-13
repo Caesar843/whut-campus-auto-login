@@ -405,6 +405,12 @@ def test_initialize_database_removes_legacy_sensitive_columns(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')"
+        )
+        connection.execute(
             """
             CREATE TABLE devices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -461,6 +467,12 @@ def test_initialize_database_removes_legacy_sensitive_columns(tmp_path):
 def test_initialize_database_removes_legacy_license_revoked_reason(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')"
+        )
         connection.execute(
             """
             CREATE TABLE licenses (
@@ -710,11 +722,14 @@ def test_deploy_examples_exist_and_include_required_settings():
     assert "--host 127.0.0.1 --port 8787" in service_content
     assert "Restart=always" in service_content
 
-    assert "server_name license.whutlogin.cn;" in nginx_content
+    assert "server_name REPLACE_WITH_LICENSE_DOMAIN;" in nginx_content
     assert "listen 80;" in nginx_content
+    assert "listen 443 ssl http2;" in nginx_content
+    assert "location ^~ /internal/admin {" in nginx_content
+    assert "return 404;" in nginx_content
     assert "proxy_pass http://127.0.0.1:8787;" in nginx_content
-    assert "/path/to/fullchain.pem" in nginx_content
-    assert "/path/to/privkey.pem" in nginx_content
+    assert "REPLACE_WITH_FULLCHAIN_PEM_PATH" in nginx_content
+    assert "REPLACE_WITH_PRIVKEY_PEM_PATH" in nginx_content
 
 
 def test_production_config_doc_exists_without_secrets():
