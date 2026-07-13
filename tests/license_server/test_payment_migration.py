@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import license_server.db as db
 from license_server.db import (
     BUSY_TIMEOUT_MS,
     SUPPORTED_SCHEMA_VERSION,
@@ -12,7 +13,7 @@ from license_server.db import (
 )
 
 
-def test_empty_database_initializes_to_schema_version_2(tmp_path):
+def test_empty_database_initializes_to_schema_version_3(tmp_path):
     database_path = tmp_path / "license.sqlite3"
 
     initialize_database(database_path)
@@ -29,6 +30,12 @@ def test_empty_database_initializes_to_schema_version_2(tmp_path):
             "status",
             "open_slot",
             "provider_transaction_id",
+            "provider_create_claimed_at",
+            "provider_create_attempt_count",
+            "provider_code_url",
+            "last_provider_query_at",
+            "next_provider_query_at",
+            "provider_query_attempt_count",
             "security_error_code",
         }
         assert _columns(connection, "payment_notifications") >= {
@@ -132,6 +139,20 @@ def test_foreign_keys_and_payment_constraints(tmp_path):
         )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
+                "UPDATE payment_orders SET provider_query_attempt_count = -1 "
+                "WHERE order_id = 'order-a'"
+            )
+
+        for invalid_attempt_count in (-1, 2):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE payment_orders SET provider_create_attempt_count = ? "
+                    "WHERE order_id = 'order-a'",
+                    (invalid_attempt_count,),
+                )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
                 """
                 INSERT INTO payment_orders (
                     order_id, device_fingerprint_hash, product_code, amount_fen,
@@ -166,6 +187,126 @@ def test_foreign_keys_and_payment_constraints(tmp_path):
                           '2026-07-06T00:01:00Z')
             """
         )
+
+
+def test_v2_payment_order_is_preserved_when_migrated_to_v3(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    _create_v2_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO payment_orders (
+                order_id, device_fingerprint_hash, product_code, amount_fen,
+                currency, provider, status, open_slot, provider_order_id,
+                provider_trade_state, created_at, updated_at, expires_at
+            ) VALUES ('order-v2', 'device-v2', 'annual_v1', 990, 'CNY',
+                      'mock', 'WAITING_PAYMENT', 'open', 'provider-v2',
+                      'NOTPAY', '2026-07-13T00:00:00Z',
+                      '2026-07-13T00:00:01Z', '2026-07-13T00:15:00Z')
+            """
+        )
+
+    initialize_database(database_path)
+
+    with connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT order_id, device_fingerprint_hash, status, provider_order_id,
+                   provider_trade_state, provider_create_claimed_at,
+                   provider_create_attempt_count, provider_code_url,
+                   last_provider_query_at, next_provider_query_at,
+                   provider_query_attempt_count
+            FROM payment_orders
+            """
+        ).fetchone()
+        assert tuple(row) == (
+            "order-v2",
+            "device-v2",
+            "WAITING_PAYMENT",
+            "provider-v2",
+            "NOTPAY",
+            None,
+            0,
+            None,
+            None,
+            None,
+            0,
+        )
+        assert _schema_version(connection) == 3
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_partial_v3_payment_schema_is_rejected_without_changes(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    _create_v2_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("ALTER TABLE payment_orders ADD COLUMN provider_code_url TEXT")
+    before = _database_snapshot(database_path)
+
+    with pytest.raises(RuntimeError, match="payment_orders schema"):
+        initialize_database(database_path)
+
+    assert _database_snapshot(database_path) == before
+
+
+def test_schema_meta_v3_rejects_v2_payment_table_without_changes(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    _create_v2_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'"
+        )
+    before = _database_snapshot(database_path)
+
+    with pytest.raises(RuntimeError, match="schema version 3"):
+        initialize_database(database_path)
+
+    assert _database_snapshot(database_path) == before
+
+
+def test_schema_meta_v3_rejects_preclaim_payment_table_without_changes(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    _create_v2_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("ALTER TABLE payment_orders ADD COLUMN provider_code_url TEXT")
+        connection.execute("ALTER TABLE payment_orders ADD COLUMN last_provider_query_at TEXT")
+        connection.execute("ALTER TABLE payment_orders ADD COLUMN next_provider_query_at TEXT")
+        connection.execute(
+            "ALTER TABLE payment_orders ADD COLUMN provider_query_attempt_count "
+            "INTEGER NOT NULL DEFAULT 0 CHECK(provider_query_attempt_count >= 0)"
+        )
+        connection.execute(
+            "UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'"
+        )
+    before = _database_snapshot(database_path)
+
+    with pytest.raises(RuntimeError, match="schema version 3"):
+        initialize_database(database_path)
+
+    assert _database_snapshot(database_path) == before
+
+
+def test_v2_to_v3_migration_failure_rolls_back_every_column(tmp_path, monkeypatch):
+    database_path = tmp_path / "license.sqlite3"
+    _create_v2_database(database_path)
+    before = _database_snapshot(database_path)
+
+    def fail_after_first_column(connection):
+        connection.execute("ALTER TABLE payment_orders ADD COLUMN provider_code_url TEXT")
+        raise RuntimeError("v3 migration failure")
+
+    monkeypatch.setattr(
+        db,
+        "_migrate_payment_orders_v2_to_v3",
+        fail_after_first_column,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="v3 migration failure"):
+        initialize_database(database_path)
+
+    assert _database_snapshot(database_path) == before
 
 
 def test_connect_sets_busy_timeout(tmp_path):
@@ -338,6 +479,55 @@ def _create_legacy_database(database_path: Path, *, amount: str = "9.9") -> None
                       '2026-07-06T00:00:00Z', '2026-07-06T00:15:00Z',
                       '2026-07-06T00:02:00Z', '2026-07-06T00:02:00Z')
             """
+        )
+
+
+V2_PAYMENT_ORDER_SCHEMA = """
+CREATE TABLE payment_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL UNIQUE,
+    device_fingerprint_hash TEXT NOT NULL,
+    product_code TEXT NOT NULL,
+    amount_fen INTEGER NOT NULL CHECK(amount_fen > 0),
+    currency TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'CREATED', 'WAITING_PAYMENT', 'PAID', 'CLOSED', 'ABNORMAL'
+    )),
+    open_slot TEXT CHECK(open_slot IS NULL OR open_slot = 'open'),
+    provider_order_id TEXT,
+    provider_transaction_id TEXT UNIQUE,
+    provider_trade_state TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    paid_at TEXT,
+    closed_at TEXT,
+    security_error_code TEXT
+);
+CREATE UNIQUE INDEX idx_payment_orders_device_open_slot
+ON payment_orders(device_fingerprint_hash, open_slot);
+CREATE INDEX idx_payment_orders_status
+ON payment_orders(status, expires_at);
+"""
+
+
+def _create_v2_database(database_path: Path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            "\n".join(
+                (
+                    db.CORE_SCHEMA,
+                    V2_PAYMENT_ORDER_SCHEMA,
+                    db.PAYMENT_NOTIFICATION_SCHEMA,
+                    db.LICENSE_GRANT_SCHEMA,
+                    db.ADMIN_AUDIT_SCHEMA,
+                    db.SCHEMA_META_SQL,
+                )
+            )
+        )
+        connection.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2')"
         )
 
 

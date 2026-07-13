@@ -112,6 +112,20 @@ def test_default_app_refuses_invalid_production_config(monkeypatch):
     assert "DATABASE_URL or LICENSE_DB_PATH is required in production" in str(exc_info.value)
 
 
+def test_default_app_refuses_invalid_explicit_wechat_config_in_development(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LICENSE_SERVER_ENV", "development")
+    monkeypatch.setenv("DATABASE_URL", _sqlite_url(tmp_path / "license.sqlite3"))
+    monkeypatch.setenv("LICENSE_PRIVATE_KEY", _private_key_b64())
+    monkeypatch.setenv("PAYMENT_PROVIDER", "wechat_native")
+    monkeypatch.delenv("WECHAT_PAY_APP_ID", raising=False)
+
+    with pytest.raises(RuntimeError, match="WECHAT_PAY_APP_ID"):
+        _default_app()
+
+
 def test_load_config_accepts_development_mode(monkeypatch):
     monkeypatch.setenv("LICENSE_SERVER_ENV", "development")
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./license_server_dev.sqlite3")

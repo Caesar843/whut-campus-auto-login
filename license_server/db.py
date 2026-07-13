@@ -9,7 +9,7 @@ from pathlib import Path
 from license_server.payment import ANNUAL_V1, OrderStatus
 
 
-SUPPORTED_SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5000
 
 LEGACY_REMOVED_DEVICE_COLUMNS = (
@@ -214,7 +214,15 @@ CREATE TABLE IF NOT EXISTS payment_orders (
     expires_at TEXT NOT NULL,
     paid_at TEXT,
     closed_at TEXT,
-    security_error_code TEXT
+    security_error_code TEXT,
+    provider_create_claimed_at TEXT,
+    provider_create_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK(provider_create_attempt_count IN (0, 1)),
+    provider_code_url TEXT,
+    last_provider_query_at TEXT,
+    next_provider_query_at TEXT,
+    provider_query_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK(provider_query_attempt_count >= 0)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_orders_device_open_slot
@@ -223,6 +231,84 @@ ON payment_orders(device_fingerprint_hash, open_slot);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_status
 ON payment_orders(status, expires_at);
 """
+
+PAYMENT_ORDER_V2_TABLE_SQL = f"""
+CREATE TABLE payment_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL UNIQUE,
+    device_fingerprint_hash TEXT NOT NULL,
+    product_code TEXT NOT NULL,
+    amount_fen INTEGER NOT NULL CHECK(amount_fen > 0),
+    currency TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        '{OrderStatus.CREATED.value}',
+        '{OrderStatus.WAITING_PAYMENT.value}',
+        '{OrderStatus.PAID.value}',
+        '{OrderStatus.CLOSED.value}',
+        '{OrderStatus.ABNORMAL.value}'
+    )),
+    open_slot TEXT CHECK(open_slot IS NULL OR open_slot = 'open'),
+    provider_order_id TEXT,
+    provider_transaction_id TEXT UNIQUE,
+    provider_trade_state TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    paid_at TEXT,
+    closed_at TEXT,
+    security_error_code TEXT
+)
+"""
+
+PAYMENT_ORDER_V2_COLUMNS = (
+    ("id", "INTEGER", 0, None, 1, 0),
+    ("order_id", "TEXT", 1, None, 0, 0),
+    ("device_fingerprint_hash", "TEXT", 1, None, 0, 0),
+    ("product_code", "TEXT", 1, None, 0, 0),
+    ("amount_fen", "INTEGER", 1, None, 0, 0),
+    ("currency", "TEXT", 1, None, 0, 0),
+    ("provider", "TEXT", 1, None, 0, 0),
+    ("status", "TEXT", 1, None, 0, 0),
+    ("open_slot", "TEXT", 0, None, 0, 0),
+    ("provider_order_id", "TEXT", 0, None, 0, 0),
+    ("provider_transaction_id", "TEXT", 0, None, 0, 0),
+    ("provider_trade_state", "TEXT", 0, None, 0, 0),
+    ("created_at", "TEXT", 1, None, 0, 0),
+    ("updated_at", "TEXT", 1, None, 0, 0),
+    ("expires_at", "TEXT", 1, None, 0, 0),
+    ("paid_at", "TEXT", 0, None, 0, 0),
+    ("closed_at", "TEXT", 0, None, 0, 0),
+    ("security_error_code", "TEXT", 0, None, 0, 0),
+)
+
+PAYMENT_ORDER_V3_COLUMNS = PAYMENT_ORDER_V2_COLUMNS + (
+    ("provider_create_claimed_at", "TEXT", 0, None, 0, 0),
+    ("provider_create_attempt_count", "INTEGER", 1, "0", 0, 0),
+    ("provider_code_url", "TEXT", 0, None, 0, 0),
+    ("last_provider_query_at", "TEXT", 0, None, 0, 0),
+    ("next_provider_query_at", "TEXT", 0, None, 0, 0),
+    ("provider_query_attempt_count", "INTEGER", 1, "0", 0, 0),
+)
+
+PAYMENT_ORDER_INDEXES = {
+    (None, 1, "u", 0, (("order_id", 0, "BINARY"),)),
+    (None, 1, "u", 0, (("provider_transaction_id", 0, "BINARY"),)),
+    (
+        "idx_payment_orders_device_open_slot",
+        1,
+        "c",
+        0,
+        (("device_fingerprint_hash", 0, "BINARY"), ("open_slot", 0, "BINARY")),
+    ),
+    (
+        "idx_payment_orders_status",
+        0,
+        "c",
+        0,
+        (("status", 0, "BINARY"), ("expires_at", 0, "BINARY")),
+    ),
+}
 
 PAYMENT_NOTIFICATION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS payment_notifications (
@@ -349,6 +435,7 @@ def initialize_database(database_path: Path) -> None:
         _execute_script(connection, CORE_SCHEMA)
         _drop_legacy_sensitive_columns(connection)
         _ensure_payment_orders(connection)
+        _ensure_payment_orders_v3(connection, declared_version=schema_version)
         if unversioned_legacy:
             connection.execute("DROP TABLE payment_orders_legacy_v0")
         _execute_script(connection, PAYMENT_NOTIFICATION_SCHEMA)
@@ -401,6 +488,75 @@ def _ensure_payment_orders(connection: sqlite3.Connection) -> None:
         _execute_script(connection, PAYMENT_ORDER_SCHEMA)
         return
     _migrate_legacy_payment_orders(connection)
+
+
+def _ensure_payment_orders_v3(
+    connection: sqlite3.Connection,
+    *,
+    declared_version: int,
+) -> None:
+    signature = _payment_orders_signature(connection)
+    if declared_version == 3:
+        if signature != 3:
+            raise RuntimeError(
+                "payment_orders schema does not match declared schema version 3"
+            )
+        return
+    if declared_version == 2 and signature != 2:
+        raise RuntimeError(
+            "payment_orders schema does not match declared schema version 2"
+        )
+    if signature == 3:
+        return
+    if signature == 2:
+        _migrate_payment_orders_v2_to_v3(connection)
+        if _payment_orders_signature(connection) == 3:
+            return
+    raise RuntimeError("payment_orders schema is not a supported V2 or V3 schema")
+
+
+def _payment_orders_signature(connection: sqlite3.Connection) -> int | None:
+    columns = _table_signature(connection, "payment_orders")
+    if (
+        _index_signature(connection, "payment_orders") != PAYMENT_ORDER_INDEXES
+        or _foreign_key_signature(connection, "payment_orders")
+        or _table_options(connection, "payment_orders") != (0, 0)
+    ):
+        return None
+    if columns == PAYMENT_ORDER_V2_COLUMNS and _table_sql_matches(
+        connection, "payment_orders", PAYMENT_ORDER_V2_TABLE_SQL
+    ):
+        return 2
+    if columns == PAYMENT_ORDER_V3_COLUMNS and _table_sql_matches(
+        connection,
+        "payment_orders",
+        PAYMENT_ORDER_SCHEMA.split(";")[0].replace("IF NOT EXISTS ", ""),
+    ):
+        return 3
+    return None
+
+
+def _migrate_payment_orders_v2_to_v3(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "ALTER TABLE payment_orders ADD COLUMN provider_create_claimed_at TEXT"
+    )
+    connection.execute(
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN provider_create_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK(provider_create_attempt_count IN (0, 1))
+        """
+    )
+    connection.execute("ALTER TABLE payment_orders ADD COLUMN provider_code_url TEXT")
+    connection.execute("ALTER TABLE payment_orders ADD COLUMN last_provider_query_at TEXT")
+    connection.execute("ALTER TABLE payment_orders ADD COLUMN next_provider_query_at TEXT")
+    connection.execute(
+        """
+        ALTER TABLE payment_orders
+        ADD COLUMN provider_query_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK(provider_query_attempt_count >= 0)
+        """
+    )
 
 
 def _migrate_legacy_payment_orders(connection: sqlite3.Connection) -> None:
