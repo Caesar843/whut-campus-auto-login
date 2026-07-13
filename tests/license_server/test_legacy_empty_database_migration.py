@@ -53,7 +53,7 @@ PRAGMA user_version = 0;
 """
 
 
-def test_exact_empty_production_legacy_schema_upgrades_to_v2_idempotently(tmp_path):
+def test_exact_empty_production_legacy_schema_upgrades_to_v3_idempotently(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     _create_legacy_database(database_path)
 
@@ -65,7 +65,7 @@ def test_exact_empty_production_legacy_schema_upgrades_to_v2_idempotently(tmp_pa
         tables = _tables(connection)
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "2"
+        ).fetchone()[0] == "3"
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert _columns(connection, "payment_orders") == [
@@ -87,6 +87,12 @@ def test_exact_empty_production_legacy_schema_upgrades_to_v2_idempotently(tmp_pa
             "paid_at",
             "closed_at",
             "security_error_code",
+            "provider_create_claimed_at",
+            "provider_create_attempt_count",
+            "provider_code_url",
+            "last_provider_query_at",
+            "next_provider_query_at",
+            "provider_query_attempt_count",
         ]
 
     assert {
@@ -115,7 +121,7 @@ def test_legacy_autoincrement_accepts_keyword_case_and_whitespace(tmp_path):
     with connect(database_path) as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "2"
+        ).fetchone()[0] == "3"
 
 
 @pytest.mark.parametrize(

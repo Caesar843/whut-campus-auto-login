@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from license_server.db import connect
 from license_server.device_proof import bearer_token, verify_device_proof_token
 from license_server.payment import ANNUAL_V1, PaymentEvidence, PaymentEvidenceSource
-from license_server.payment_gateway import MOCK_APP_ID, MOCK_MCH_ID, MockPaymentGateway
+from license_server.payment_gateway import MOCK_APP_ID, MOCK_MCH_ID, PaymentGateway
 from license_server.payment_service import (
     PaymentServiceError,
     confirm_paid_order,
@@ -36,16 +36,20 @@ def create_payment_router(
     private_key_b64: str,
     payment_provider: str | None,
     payment_mock_admin_token: str | None,
+    gateway: PaymentGateway | None,
+    notify_url: str | None,
+    expected_appid: str | None,
+    expected_mchid: str | None,
     payment_order_ttl_minutes: int,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1/payment")
-    gateway = MockPaymentGateway()
 
     @router.post("/orders")
     def create_order(
         request: PaymentOrderCreateRequest,
         authorization: str = Header(default=""),
     ):
+        _require_payment_provider(payment_provider, gateway)
         proof = _proof(
             database_path,
             authorization=authorization,
@@ -59,6 +63,9 @@ def create_payment_router(
                 provider=payment_provider,
                 ttl_minutes=payment_order_ttl_minutes,
                 gateway=gateway,
+                notify_url=notify_url or "https://mock.invalid/notify",
+                expected_appid=expected_appid,
+                expected_mchid=expected_mchid,
             )
         except PaymentServiceError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
@@ -66,6 +73,7 @@ def create_payment_router(
 
     @router.get("/orders/{order_id}")
     def get_order(order_id: str, authorization: str = Header(default="")):
+        _require_payment_provider(payment_provider, gateway)
         proof = _proof(
             database_path,
             authorization=authorization,
@@ -126,6 +134,14 @@ def create_payment_router(
             }
 
     return router
+
+
+def _require_payment_provider(
+    payment_provider: str | None,
+    gateway: PaymentGateway | None,
+) -> None:
+    if payment_provider is None or gateway is None:
+        raise HTTPException(status_code=503, detail="payment_provider_not_configured")
 
 
 def _proof(database_path: Path, *, authorization: str, private_key_b64: str):

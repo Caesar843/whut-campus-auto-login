@@ -22,16 +22,15 @@ from license_server.payment_gateway import (
     MOCK_MCH_ID,
     CreateNativeOrderRequest,
     PaymentGateway,
+    QueryOrderOutcome,
+    QueryOrderResult,
     mock_code_url,
 )
 from license_server.signer import datetime_text
+from license_server.wechat_payment import WechatPaymentError
 
 
-OPEN_STATUSES = (
-    OrderStatus.CREATED.value,
-    OrderStatus.WAITING_PAYMENT.value,
-    OrderStatus.ABNORMAL.value,
-)
+PROVIDER_QUERY_RETRY_SECONDS = 10
 
 
 class PaymentServiceError(RuntimeError):
@@ -74,30 +73,219 @@ def create_or_restore_order(
     provider: str | None,
     ttl_minutes: int,
     gateway: PaymentGateway,
+    notify_url: str = "https://mock.invalid/notify",
+    expected_appid: str | None = None,
+    expected_mchid: str | None = None,
     now: datetime | None = None,
 ) -> PaymentOrderResult:
     product = _product(product_code)
     if provider is None:
         raise PaymentServiceError("payment_provider_not_configured", status_code=503)
-    if provider != "mock":
+    if provider not in {"mock", "wechat_native"}:
         raise PaymentServiceError("payment_provider_not_supported", status_code=503)
     now = _utc(now)
-    def action(connection):
-        _close_expired_open_orders(connection, now=now)
-        row = _open_order(connection, device_fingerprint_hash, now=now)
-        if row is None:
-            row = _insert_order_with_gateway(
-                connection,
-                device_fingerprint_hash=device_fingerprint_hash,
-                product_code=product.product_code,
-                provider=provider,
-                ttl_minutes=ttl_minutes,
+    row = _payment_transaction(
+        database_path,
+        lambda connection: _prepare_local_order(
+            connection,
+            device_fingerprint_hash=device_fingerprint_hash,
+            product_code=product.product_code,
+            provider=provider,
+            ttl_minutes=ttl_minutes,
+            now=now,
+        ),
+    )
+    if str(row["status"]) != OrderStatus.CREATED.value:
+        return _order_result(row)
+    order_id = str(row["order_id"])
+    expires_at = _parse_utc(str(row["expires_at"]))
+    if expires_at is None:
+        _record_retryable_gateway_error(
+            database_path,
+            order_id=order_id,
+            code="invalid_expires_at",
+            now=now,
+        )
+        raise PaymentServiceError("invalid_expires_at", status_code=409)
+    claimed = _payment_transaction(
+        database_path,
+        lambda connection: _claim_native_create(
+            connection,
+            order_id=order_id,
+            now=now,
+        ),
+    )
+    if not claimed:
+        return _restore_claimed_order(
+            database_path,
+            order_id=order_id,
+            gateway=gateway,
+            expected_appid=expected_appid,
+            expected_mchid=expected_mchid,
+            now=now,
+        )
+    try:
+        gateway_order = gateway.create_native_order(
+            CreateNativeOrderRequest(
+                out_trade_no=order_id,
+                description="WHUT Campus Auto Login annual license",
+                amount_fen=ANNUAL_V1.amount_fen,
+                currency=ANNUAL_V1.currency,
+                notify_url=notify_url,
+                expires_at=expires_at,
+                attach=product.product_code,
+            )
+        )
+    except WechatPaymentError as exc:
+        if exc.result_unknown:
+            return _recover_unknown_create_result(
+                database_path,
+                order_id=order_id,
                 gateway=gateway,
+                expected_appid=expected_appid,
+                expected_mchid=expected_mchid,
                 now=now,
             )
-        return _order_result(row)
+        code = exc.code.casefold()
+        _record_retryable_gateway_error(
+            database_path,
+            order_id=order_id,
+            code=code,
+            now=now,
+        )
+        raise PaymentServiceError(code, status_code=502) from exc
+    except Exception as exc:
+        _record_retryable_gateway_error(
+            database_path,
+            order_id=order_id,
+            code="payment_gateway_failed",
+            now=now,
+        )
+        raise PaymentServiceError("payment_gateway_failed", status_code=502) from exc
+    if gateway_order.provider_order_id != order_id:
+        _record_retryable_gateway_error(
+            database_path,
+            order_id=order_id,
+            code="payment_create_order_mismatch",
+            now=now,
+        )
+        raise PaymentServiceError("payment_create_order_mismatch", status_code=502)
+    return _persist_create_result(
+        database_path,
+        order_id=order_id,
+        gateway_order=gateway_order,
+        now=now,
+    )
 
-    return _payment_transaction(database_path, action)
+
+def _prepare_local_order(
+    connection,
+    *,
+    device_fingerprint_hash: str,
+    product_code: str,
+    provider: str,
+    ttl_minutes: int,
+    now: datetime,
+):
+    _close_expired_open_orders(connection, now=now)
+    row = _open_order(connection, device_fingerprint_hash, now=now)
+    if row is None:
+        row = _insert_local_order(
+            connection,
+            device_fingerprint_hash=device_fingerprint_hash,
+            product_code=product_code,
+            provider=provider,
+            ttl_minutes=ttl_minutes,
+            now=now,
+        )
+    return row
+
+
+def _claim_native_create(connection, *, order_id: str, now: datetime) -> bool:
+    now_text = datetime_text(now)
+    cursor = connection.execute(
+        """
+        UPDATE payment_orders
+        SET provider_create_claimed_at = ?,
+            provider_create_attempt_count = 1,
+            updated_at = ?
+        WHERE order_id = ?
+          AND status = 'CREATED'
+          AND provider_create_attempt_count = 0
+          AND provider_create_claimed_at IS NULL
+        """,
+        (now_text, now_text, order_id),
+    )
+    return cursor.rowcount == 1
+
+
+def _restore_claimed_order(
+    database_path: Path,
+    *,
+    order_id: str,
+    gateway: PaymentGateway,
+    expected_appid: str | None,
+    expected_mchid: str | None,
+    now: datetime,
+) -> PaymentOrderResult:
+    row, query_claimed = _payment_transaction(
+        database_path,
+        lambda connection: _claim_provider_query(
+            connection,
+            order_id=order_id,
+            now=now,
+        ),
+    )
+    if not query_claimed:
+        return _order_result(row)
+    try:
+        query = gateway.query_order(order_id)
+    except Exception:
+        query = QueryOrderResult(
+            outcome=QueryOrderOutcome.HTTP_UNKNOWN,
+            out_trade_no=order_id,
+        )
+    return _apply_provider_query_result(
+        database_path,
+        order_id=order_id,
+        query=query,
+        expected_appid=expected_appid,
+        expected_mchid=expected_mchid,
+        now=now,
+        query_attempt_recorded=True,
+    )
+
+
+def _claim_provider_query(connection, *, order_id: str, now: datetime):
+    row = _order_by_id(connection, order_id)
+    if row is None:
+        raise PaymentServiceError("payment_order_not_found", status_code=404)
+    if str(row["status"]) != OrderStatus.CREATED.value:
+        return row, False
+    now_text = datetime_text(now)
+    cursor = connection.execute(
+        """
+        UPDATE payment_orders
+        SET last_provider_query_at = ?,
+            next_provider_query_at = ?,
+            provider_query_attempt_count = provider_query_attempt_count + 1,
+            updated_at = ?
+        WHERE order_id = ?
+          AND status = 'CREATED'
+          AND provider_create_attempt_count = 1
+          AND provider_create_claimed_at IS NOT NULL
+          AND next_provider_query_at IS NOT NULL
+          AND next_provider_query_at <= ?
+        """,
+        (
+            now_text,
+            datetime_text(now + timedelta(seconds=PROVIDER_QUERY_RETRY_SECONDS)),
+            now_text,
+            order_id,
+            now_text,
+        ),
+    )
+    return _order_by_id(connection, order_id), cursor.rowcount == 1
 
 
 def get_order_for_device(
@@ -142,14 +330,13 @@ def confirm_paid_order(
     )
 
 
-def _insert_order_with_gateway(
+def _insert_local_order(
     connection,
     *,
     device_fingerprint_hash: str,
     product_code: str,
     provider: str,
     ttl_minutes: int,
-    gateway: PaymentGateway,
     now: datetime,
 ):
     order_id = f"pay_{uuid4().hex}"
@@ -183,41 +370,252 @@ def _insert_order_with_gateway(
             return existing
         raise
 
-    try:
-        gateway_order = gateway.create_native_order(
-            CreateNativeOrderRequest(
-                order_id=order_id,
-                description="WHUT Campus Auto Login annual license",
-                amount_fen=ANNUAL_V1.amount_fen,
-                currency=ANNUAL_V1.currency,
-                expires_at=expires_at,
-            )
-        )
-    except Exception as exc:
-        _mark_order_abnormal(connection, order_id, "payment_gateway_failed", now)
-        raise PaymentServiceError(
-            "payment_gateway_failed",
-            status_code=502,
-            commit=True,
-        ) from exc
+    return _order_by_id(connection, order_id)
 
+
+def _persist_create_result(
+    database_path: Path,
+    *,
+    order_id: str,
+    gateway_order,
+    now: datetime,
+) -> PaymentOrderResult:
+    def action(connection):
+        connection.execute(
+            """
+            UPDATE payment_orders
+            SET status = 'WAITING_PAYMENT',
+                provider_order_id = ?,
+                provider_trade_state = ?,
+                provider_code_url = ?,
+                updated_at = ?,
+                security_error_code = NULL,
+                next_provider_query_at = NULL
+            WHERE order_id = ? AND status = 'CREATED'
+              AND provider_create_attempt_count = 1
+              AND provider_create_claimed_at IS NOT NULL
+              AND provider_code_url IS NULL
+            """,
+            (
+                gateway_order.provider_order_id,
+                gateway_order.provider_trade_state,
+                gateway_order.code_url,
+                datetime_text(now),
+                order_id,
+            ),
+        )
+        row = _order_by_id(connection, order_id)
+        if row is None:
+            raise PaymentServiceError("payment_order_not_found", status_code=404)
+        return _order_result(row)
+
+    return _payment_transaction(database_path, action)
+
+
+def _recover_unknown_create_result(
+    database_path: Path,
+    *,
+    order_id: str,
+    gateway: PaymentGateway,
+    expected_appid: str | None,
+    expected_mchid: str | None,
+    now: datetime,
+) -> PaymentOrderResult:
+    try:
+        query = gateway.query_order(order_id)
+    except Exception:
+        query = QueryOrderResult(
+            outcome=QueryOrderOutcome.HTTP_UNKNOWN,
+            out_trade_no=order_id,
+        )
+    return _apply_provider_query_result(
+        database_path,
+        order_id=order_id,
+        query=query,
+        expected_appid=expected_appid,
+        expected_mchid=expected_mchid,
+        now=now,
+    )
+
+
+def _apply_provider_query_result(
+    database_path: Path,
+    *,
+    order_id: str,
+    query: QueryOrderResult,
+    expected_appid: str | None,
+    expected_mchid: str | None,
+    now: datetime,
+    query_attempt_recorded: bool = False,
+) -> PaymentOrderResult:
+    def action(connection):
+        order = _order_by_id(connection, order_id)
+        if order is None:
+            raise PaymentServiceError("payment_order_not_found", status_code=404)
+        if query_attempt_recorded:
+            connection.execute(
+                """
+                UPDATE payment_orders
+                SET provider_trade_state = COALESCE(?, provider_trade_state)
+                WHERE order_id = ?
+                """,
+                (query.trade_state, order_id),
+            )
+        else:
+            _record_provider_query(connection, order_id, query, now=now)
+        if str(order["status"]) in {OrderStatus.PAID.value, OrderStatus.CLOSED.value}:
+            return _order_result(_order_by_id(connection, order_id))
+        if query.outcome in {QueryOrderOutcome.PAID, QueryOrderOutcome.CLOSED}:
+            if _provider_query_conflicts(
+                order,
+                query,
+                expected_appid=expected_appid,
+                expected_mchid=expected_mchid,
+            ):
+                _mark_order_abnormal(connection, order_id, "payment_query_conflict", now)
+                raise PaymentServiceError(
+                    "payment_query_conflict",
+                    status_code=409,
+                    commit=True,
+                )
+        if query.outcome == QueryOrderOutcome.PAID:
+            connection.execute(
+                """
+                UPDATE payment_orders
+                SET status = 'WAITING_PAYMENT',
+                    provider_order_id = ?,
+                    provider_trade_state = ?,
+                    updated_at = ?,
+                    security_error_code = NULL,
+                    next_provider_query_at = NULL
+                WHERE order_id = ? AND status = 'CREATED'
+                """,
+                (query.out_trade_no, query.trade_state, datetime_text(now), order_id),
+            )
+            _confirm_paid_order(
+                connection,
+                PaymentEvidence(
+                    source=PaymentEvidenceSource.WECHAT_QUERY,
+                    out_trade_no=order_id,
+                    provider_transaction_id=str(query.transaction_id),
+                    trade_type=str(query.trade_type),
+                    trade_state=str(query.trade_state),
+                    amount_fen=int(query.amount_total),
+                    currency=str(query.currency),
+                    paid_at=query.success_time,
+                    appid=str(query.appid),
+                    mchid=str(query.mchid),
+                ),
+                notification_id=None,
+                issued_by="wechat_query",
+                now=now,
+            )
+            return _order_result(_order_by_id(connection, order_id))
+        if query.outcome == QueryOrderOutcome.CLOSED:
+            now_text = datetime_text(now)
+            connection.execute(
+                """
+                UPDATE payment_orders
+                SET status = 'CLOSED', open_slot = NULL, provider_trade_state = ?,
+                    closed_at = ?, updated_at = ?, security_error_code = NULL,
+                    next_provider_query_at = NULL
+                WHERE order_id = ? AND status IN ('CREATED', 'WAITING_PAYMENT')
+                """,
+                (query.trade_state, now_text, now_text, order_id),
+            )
+            return _order_result(_order_by_id(connection, order_id))
+        codes = {
+            QueryOrderOutcome.NOT_FOUND: "payment_order_not_found_upstream",
+            QueryOrderOutcome.SIGNATURE_INVALID: "payment_response_signature_invalid",
+            QueryOrderOutcome.UNPAID: "payment_create_result_unknown",
+            QueryOrderOutcome.UNCLEAR: "payment_result_unknown",
+            QueryOrderOutcome.HTTP_UNKNOWN: "payment_result_unknown",
+        }
+        code = codes.get(query.outcome, "payment_result_unknown")
+        connection.execute(
+            """
+            UPDATE payment_orders
+            SET security_error_code = ?, next_provider_query_at = ?, updated_at = ?
+            WHERE order_id = ? AND status IN ('CREATED', 'WAITING_PAYMENT')
+            """,
+            (
+                code,
+                datetime_text(now + timedelta(seconds=PROVIDER_QUERY_RETRY_SECONDS)),
+                datetime_text(now),
+                order_id,
+            ),
+        )
+        raise PaymentServiceError(code, status_code=502, commit=True)
+
+    return _payment_transaction(database_path, action)
+
+
+def _record_provider_query(
+    connection,
+    order_id: str,
+    query: QueryOrderResult,
+    *,
+    now: datetime,
+) -> None:
     connection.execute(
         """
         UPDATE payment_orders
-        SET status = 'WAITING_PAYMENT',
-            provider_order_id = ?,
-            provider_trade_state = ?,
-            updated_at = ?
+        SET last_provider_query_at = ?,
+            provider_query_attempt_count = provider_query_attempt_count + 1,
+            provider_trade_state = COALESCE(?, provider_trade_state)
         WHERE order_id = ?
         """,
-        (
-            gateway_order.provider_order_id,
-            gateway_order.provider_trade_state,
-            datetime_text(now),
-            order_id,
-        ),
+        (datetime_text(now), query.trade_state, order_id),
     )
-    return _order_by_id(connection, order_id)
+
+
+def _provider_query_conflicts(
+    order,
+    query: QueryOrderResult,
+    *,
+    expected_appid: str | None,
+    expected_mchid: str | None,
+) -> bool:
+    common = (
+        query.out_trade_no != str(order["order_id"])
+        or query.trade_type != "NATIVE"
+        or query.amount_total != int(order["amount_fen"])
+        or query.currency != str(order["currency"])
+        or not expected_appid
+        or query.appid != expected_appid
+        or not expected_mchid
+        or query.mchid != expected_mchid
+    )
+    if common:
+        return True
+    return query.outcome == QueryOrderOutcome.PAID and (
+        query.trade_state != "SUCCESS"
+        or not query.transaction_id
+        or query.success_time is None
+    )
+
+
+def _record_retryable_gateway_error(
+    database_path: Path,
+    *,
+    order_id: str,
+    code: str,
+    now: datetime,
+) -> None:
+    with write_transaction(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE payment_orders
+            SET security_error_code = ?, next_provider_query_at = ?, updated_at = ?
+            WHERE order_id = ? AND status = 'CREATED'
+            """,
+            (
+                code,
+                datetime_text(now + timedelta(seconds=PROVIDER_QUERY_RETRY_SECONDS)),
+                datetime_text(now),
+                order_id,
+            ),
+        )
 
 
 def _confirm_paid_order(
@@ -511,6 +909,7 @@ def _order_by_id(connection, order_id: str):
 
 def _order_result(row) -> PaymentOrderResult:
     provider = str(row["provider"])
+    stored_code_url = row["provider_code_url"]
     return PaymentOrderResult(
         order_id=str(row["order_id"]),
         product_code=str(row["product_code"]),
@@ -518,7 +917,11 @@ def _order_result(row) -> PaymentOrderResult:
         currency=str(row["currency"]),
         provider=provider,
         status=str(row["status"]),
-        code_url=mock_code_url(str(row["order_id"])) if provider == "mock" else None,
+        code_url=(
+            str(stored_code_url)
+            if stored_code_url
+            else mock_code_url(str(row["order_id"])) if provider == "mock" else None
+        ),
         created_at=str(row["created_at"]),
         expires_at=str(row["expires_at"]),
         paid_at=row["paid_at"],

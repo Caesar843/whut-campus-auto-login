@@ -1,6 +1,9 @@
 import sqlite3
+from pathlib import Path
 
 from license_server.db import connect
+from license_server.config import WechatPayConfig
+from license_server.payment_gateway import MockPaymentGateway
 from tests.license_server.test_license_server import _client, _register_payload
 
 
@@ -54,6 +57,56 @@ def test_create_order_requires_configured_provider(tmp_path):
 
     assert response.status_code == 503
     assert response.json()["detail"] == "payment_provider_not_configured"
+
+
+def test_query_order_requires_configured_provider(tmp_path):
+    client, _public_key = _client(tmp_path)
+
+    response = client.get("/api/v1/payment/orders/missing")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "payment_provider_not_configured"
+
+
+def test_wechat_provider_uses_injected_gateway_and_notify_url(tmp_path):
+    gateway = CapturingGateway()
+    config = WechatPayConfig(
+        app_id="wx-test-app",
+        mch_id="1900000109",
+        merchant_serial_no="merchant-serial",
+        merchant_private_key_path=Path("unused-merchant-key.pem"),
+        public_key_id="wechat-public-key-id",
+        public_key_path=Path("unused-wechat-key.pem"),
+        api_v3_key=b"a" * 32,
+        notify_url="https://pay.example.test/wechat/notify",
+    )
+    client, _public_key = _client(
+        tmp_path,
+        payment_provider="wechat_native",
+        wechat_pay_config=config,
+        payment_gateway=gateway,
+    )
+    token = client.post("/device/register", json=_register_payload()).json()[
+        "signed_license_token"
+    ]
+
+    response = client.post(
+        "/api/v1/payment/orders",
+        headers=_auth(token),
+        json={"product_code": "annual_v1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["provider"] == "wechat_native"
+    assert response.json()["code_url"].startswith("mock://whut-payment/")
+    assert gateway.request.notify_url == config.notify_url
+
+
+def test_wechat_provider_without_config_refuses_startup(tmp_path):
+    import pytest
+
+    with pytest.raises(RuntimeError, match="wechat_native configuration"):
+        _client(tmp_path, payment_provider="wechat_native")
 
 
 def test_same_device_reuses_open_order(tmp_path):
@@ -243,3 +296,12 @@ def _auth(token: str) -> dict[str, str]:
 def _tamper(token: str) -> str:
     replacement = "A" if token[0] != "A" else "B"
     return replacement + token[1:]
+
+
+class CapturingGateway(MockPaymentGateway):
+    def __init__(self):
+        self.request = None
+
+    def create_native_order(self, request):
+        self.request = request
+        return super().create_native_order(request)

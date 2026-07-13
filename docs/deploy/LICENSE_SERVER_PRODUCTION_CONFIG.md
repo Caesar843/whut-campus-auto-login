@@ -21,9 +21,15 @@
 - `LICENSE_DB_PATH`：兼容用数据库文件路径。生产必须是绝对路径。优先使用 `DATABASE_URL`。
 - `LICENSE_PRIVATE_KEY`：Base64 编码的 32 字节 Ed25519 私钥。
 - `LICENSE_PRIVATE_KEY_FILE`：保存上述私钥内容的文件路径。生产建议使用这个变量，路径必须是绝对路径。
+- `PAYMENT_PROVIDER`：未设置或 `disabled` 时支付端点返回 503；生产启用微信 Native 时必须显式设为 `wechat_native`，生产禁止 `mock`。
 - `PAYMENT_CURRENCY`：币种，当前默认 `CNY`。
-- `PAYMENT_CHANNELS`：既有订单骨架使用的支付渠道列表，当前只是订单骨架。
+- `PAYMENT_CHANNELS`：必须精确为 `wechat_pay`，V1 不提供支付宝渠道。
 - `PAYMENT_ORDER_TTL_MINUTES`：未支付订单有效分钟数。
+- `WECHAT_PAY_APP_ID`、`WECHAT_PAY_MCH_ID`、`WECHAT_PAY_MERCHANT_SERIAL_NO`：微信直连商户标识。
+- `WECHAT_PAY_MERCHANT_PRIVATE_KEY_PATH`：商户 RSA 私钥 PEM 的绝对路径。
+- `WECHAT_PAY_PUBLIC_KEY_ID`、`WECHAT_PAY_PUBLIC_KEY_PATH`：微信支付公钥 ID 与 RSA 公钥 PEM 路径。
+- `WECHAT_PAY_API_V3_KEY`：32 字节 APIv3 密钥。
+- `WECHAT_PAY_NOTIFY_URL`：不带 query/fragment 的公网 HTTPS 通知 URL；P5-A1 只校验和用于下单，尚不注册回调路由。
 - `ADMIN_ENABLED`：是否启用 `/internal/admin` 最小后台。生产默认必须为 `false`。
 - `ADMIN_OPERATOR_NAME`：后台追加售后备注时写入审计的操作人名称。启用后台写操作前必须配置为非空值。
 - `ADMIN_ACCESS_TOKEN_SHA256`：管理员 Bearer Token 的 SHA-256 十六进制摘要。只保存摘要，不保存原始 Token。
@@ -85,7 +91,7 @@ sqlite:////srv/APP_NAME/license.sqlite3
 - 三张表的列顺序、类型、`NOT NULL`、主键、外键、唯一约束和索引与已知生产旧 DDL 精确一致；
 - 三张业务表的行数均为 0。
 
-满足条件时，初始化会在既有 `BEGIN IMMEDIATE` 事务中建立当前 V1 baseline，再升级到 Schema V2。最终写入 `schema_meta=2`，`PRAGMA user_version` 继续保持 0。再次启动不会重复迁移。
+满足条件时，初始化会在既有 `BEGIN IMMEDIATE` 事务中建立当前 V1 baseline，再依次升级到 Schema V2 和 V3。最终写入 `schema_meta=3`，`PRAGMA user_version` 继续保持 0。再次启动不会重复迁移。
 
 以下情况会在任何 DDL 写入前拒绝启动，并要求人工迁移：
 

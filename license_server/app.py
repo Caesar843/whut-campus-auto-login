@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +12,7 @@ from license_server.config import (
     DEFAULT_PAYMENT_CHANNELS,
     DEFAULT_PAYMENT_ORDER_TTL_MINUTES,
     DEFAULT_ENVIRONMENT,
+    WechatPayConfig,
     is_production_environment,
     load_config,
     validate_mock_admin_token,
@@ -18,8 +20,10 @@ from license_server.config import (
     validate_private_key_b64,
 )
 from license_server.db import initialize_database
+from license_server.payment_gateway import MockPaymentGateway, PaymentGateway
 from license_server.payment_routes import create_payment_router
 from license_server.routes import create_router
+from license_server.wechat_payment import WeChatNativePaymentGateway
 
 
 HEALTHZ_RESPONSE = {"status": "ok"}
@@ -35,6 +39,8 @@ def create_app(
     payment_channels: Optional[tuple[str, ...]] = None,
     payment_provider: Optional[str] = None,
     payment_mock_admin_token: Optional[str] = None,
+    wechat_pay_config: Optional[WechatPayConfig] = None,
+    payment_gateway: Optional[PaymentGateway] = None,
     payment_order_ttl_minutes: Optional[int] = None,
     environment: Optional[str] = None,
     admin_enabled: Optional[bool] = None,
@@ -53,6 +59,7 @@ def create_app(
         payment_mock_admin_token = (
             payment_mock_admin_token or config.payment_mock_admin_token
         )
+        wechat_pay_config = wechat_pay_config or config.wechat_pay
         payment_order_ttl_minutes = (
             payment_order_ttl_minutes or config.payment_order_ttl_minutes
         )
@@ -69,6 +76,13 @@ def create_app(
         raise RuntimeError("PAYMENT_MOCK_ADMIN_TOKEN is required when PAYMENT_PROVIDER=mock.")
     if payment_provider == "mock":
         validate_mock_admin_token(str(payment_mock_admin_token))
+        payment_gateway = payment_gateway or MockPaymentGateway()
+    elif payment_provider == "wechat_native":
+        if wechat_pay_config is None:
+            raise RuntimeError("wechat_native configuration is required.")
+        payment_gateway = payment_gateway or WeChatNativePaymentGateway(
+            wechat_pay_config
+        )
     payment_amount = payment_amount or PRICE_AMOUNT
     payment_currency = payment_currency or PRICE_CURRENCY
     payment_channels = payment_channels or DEFAULT_PAYMENT_CHANNELS
@@ -98,6 +112,16 @@ def create_app(
             private_key_b64=str(private_key_b64),
             payment_provider=payment_provider,
             payment_mock_admin_token=payment_mock_admin_token,
+            gateway=payment_gateway,
+            notify_url=(
+                wechat_pay_config.notify_url if wechat_pay_config is not None else None
+            ),
+            expected_appid=(
+                wechat_pay_config.app_id if wechat_pay_config is not None else None
+            ),
+            expected_mchid=(
+                wechat_pay_config.mch_id if wechat_pay_config is not None else None
+            ),
             payment_order_ttl_minutes=int(payment_order_ttl_minutes),
         )
     )
@@ -125,9 +149,12 @@ def _default_app() -> FastAPI:
 
 def _must_fail_startup() -> bool:
     try:
-        return is_production_environment()
+        if is_production_environment():
+            return True
     except RuntimeError:
         return True
+    provider = os.environ.get("PAYMENT_PROVIDER", "").strip().lower()
+    return bool(provider and provider != "disabled")
 
 
 def _add_health_route(app: FastAPI) -> None:

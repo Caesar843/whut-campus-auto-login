@@ -2,23 +2,30 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import os
 import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    load_pem_private_key,
+    load_pem_public_key,
+)
 
 from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
 from license_server.payment import ANNUAL_V1
 
 DEFAULT_ENVIRONMENT = "development"
 VALID_ENVIRONMENTS = {"development", "test", "production"}
-DEFAULT_PAYMENT_CHANNELS = ("wechat_pay", "alipay")
+DEFAULT_PAYMENT_CHANNELS = ("wechat_pay",)
 DEFAULT_PAYMENT_ORDER_TTL_MINUTES = 15
-VALID_PAYMENT_PROVIDERS = {"mock", "wechat_native"}
+VALID_PAYMENT_PROVIDERS = {"disabled", "mock", "wechat_native"}
 MOCK_ADMIN_TOKEN_MIN_LENGTH = 16
 SHA256_HEX_LENGTH = 64
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -34,13 +41,26 @@ INSECURE_ADMIN_TOKEN_MARKERS = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
+class WechatPayConfig:
+    app_id: str
+    mch_id: str
+    merchant_serial_no: str
+    merchant_private_key_path: Path
+    public_key_id: str
+    public_key_path: Path
+    api_v3_key: bytes
+    notify_url: str
+
+
+@dataclass(frozen=True, repr=False)
 class LicenseServerConfig:
     environment: str
     database_path: Path
     private_key_b64: str
     payment_provider: str | None
     payment_mock_admin_token: str | None
+    wechat_pay: WechatPayConfig | None
     payment_price_fen: int
     payment_amount: str
     payment_currency: str
@@ -58,12 +78,14 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
     private_key_b64 = _private_key_from_env(values, environment)
     payment_price_fen = _payment_price_fen_from_env(values)
     payment_currency = _payment_currency_from_env(values)
+    payment_provider = _payment_provider_from_env(values, environment)
     return LicenseServerConfig(
         environment=environment,
         database_path=database_path,
         private_key_b64=private_key_b64,
-        payment_provider=_payment_provider_from_env(values, environment),
+        payment_provider=payment_provider,
         payment_mock_admin_token=_payment_mock_admin_token_from_env(values, environment),
+        wechat_pay=_wechat_pay_from_env(values) if payment_provider == "wechat_native" else None,
         payment_price_fen=payment_price_fen,
         payment_amount=_payment_amount_text(payment_price_fen),
         payment_currency=payment_currency,
@@ -157,8 +179,8 @@ def _is_absolute_path(path: Path) -> bool:
 def _payment_channels_from_env(values: Mapping[str, str]) -> tuple[str, ...]:
     raw_channels = values.get("PAYMENT_CHANNELS", ",".join(DEFAULT_PAYMENT_CHANNELS))
     channels = tuple(channel.strip() for channel in raw_channels.split(",") if channel.strip())
-    if not channels:
-        raise RuntimeError("PAYMENT_CHANNELS must include at least one channel.")
+    if channels != DEFAULT_PAYMENT_CHANNELS:
+        raise RuntimeError("PAYMENT_CHANNELS must be exactly: wechat_pay.")
     return channels
 
 
@@ -173,7 +195,79 @@ def _payment_provider_from_env(values: Mapping[str, str], environment: str) -> s
         raise RuntimeError(f"PAYMENT_PROVIDER must be one of: {allowed}.")
     if environment == "production" and provider == "mock":
         raise RuntimeError("PAYMENT_PROVIDER=mock is not allowed in production.")
-    return provider
+    return None if provider == "disabled" else provider
+
+
+def _wechat_pay_from_env(values: Mapping[str, str]) -> WechatPayConfig:
+    required = (
+        "WECHAT_PAY_APP_ID",
+        "WECHAT_PAY_MCH_ID",
+        "WECHAT_PAY_MERCHANT_SERIAL_NO",
+        "WECHAT_PAY_MERCHANT_PRIVATE_KEY_PATH",
+        "WECHAT_PAY_PUBLIC_KEY_ID",
+        "WECHAT_PAY_PUBLIC_KEY_PATH",
+        "WECHAT_PAY_API_V3_KEY",
+        "WECHAT_PAY_NOTIFY_URL",
+    )
+    missing = [name for name in required if not values.get(name, "").strip()]
+    if missing:
+        raise RuntimeError(f"{missing[0]} is required when PAYMENT_PROVIDER=wechat_native.")
+
+    merchant_path = Path(values["WECHAT_PAY_MERCHANT_PRIVATE_KEY_PATH"].strip())
+    public_path = Path(values["WECHAT_PAY_PUBLIC_KEY_PATH"].strip())
+    _require_rsa_key(merchant_path, "WECHAT_PAY_MERCHANT_PRIVATE_KEY_PATH", private=True)
+    _require_rsa_key(public_path, "WECHAT_PAY_PUBLIC_KEY_PATH", private=False)
+
+    api_v3_key = values["WECHAT_PAY_API_V3_KEY"].strip().encode("utf-8")
+    if len(api_v3_key) != 32:
+        raise RuntimeError("WECHAT_PAY_API_V3_KEY must be exactly 32 bytes.")
+    notify_url = values["WECHAT_PAY_NOTIFY_URL"].strip()
+    _validate_wechat_notify_url(notify_url)
+    return WechatPayConfig(
+        app_id=values["WECHAT_PAY_APP_ID"].strip(),
+        mch_id=values["WECHAT_PAY_MCH_ID"].strip(),
+        merchant_serial_no=values["WECHAT_PAY_MERCHANT_SERIAL_NO"].strip(),
+        merchant_private_key_path=merchant_path,
+        public_key_id=values["WECHAT_PAY_PUBLIC_KEY_ID"].strip(),
+        public_key_path=public_path,
+        api_v3_key=api_v3_key,
+        notify_url=notify_url,
+    )
+
+
+def _require_rsa_key(path: Path, name: str, *, private: bool) -> None:
+    try:
+        pem = path.read_bytes()
+        key = load_pem_private_key(pem, password=None) if private else load_pem_public_key(pem)
+    except (OSError, TypeError, ValueError, UnsupportedAlgorithm) as exc:
+        raise RuntimeError(f"{name} must reference a readable RSA key.") from exc
+    expected = rsa.RSAPrivateKey if private else rsa.RSAPublicKey
+    if not isinstance(key, expected):
+        raise RuntimeError(f"{name} must reference a readable RSA key.")
+
+
+def _validate_wechat_notify_url(value: str) -> None:
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise RuntimeError("WECHAT_PAY_NOTIFY_URL must be a safe public HTTPS URL.") from exc
+    host = parsed.hostname or ""
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+        or host.casefold().rstrip(".") == "localhost"
+        or is_loopback
+    ):
+        raise RuntimeError("WECHAT_PAY_NOTIFY_URL must be a public HTTPS URL without query or fragment.")
 
 
 def _payment_mock_admin_token_from_env(
