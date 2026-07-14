@@ -185,6 +185,7 @@ def test_notification_signature_timestamp_and_whitelist_extraction(rsa_private_k
     outer = {
         "id": "notice-1",
         "event_type": "TRANSACTION.SUCCESS",
+        "resource_type": "encrypt-resource",
         "create_time": "2026-07-13T12:00:00+08:00",
         "resource": {
             "algorithm": "AEAD_AES_256_GCM",
@@ -231,6 +232,148 @@ def test_notification_signature_timestamp_and_whitelist_extraction(rsa_private_k
         )
 
 
+def test_notification_rejects_stale_timestamp_before_rsa_verification(rsa_private_key):
+    now = datetime(2026, 7, 13, 4, 0, tzinfo=timezone.utc)
+    body = _notification_body()
+    headers = _signed_headers(
+        rsa_private_key,
+        body,
+        timestamp=int((now - timedelta(seconds=301)).timestamp()),
+    )
+    headers["Wechatpay-Signature"] = base64.b64encode(b"invalid").decode()
+
+    with pytest.raises(WechatPaymentError, match="PAYMENT_NOTIFY_TIMESTAMP_INVALID"):
+        parse_and_verify_notification(
+            headers,
+            body,
+            public_key_id=PUBLIC_KEY_ID,
+            public_key=rsa_private_key.public_key(),
+            api_v3_key=API_V3_KEY,
+            now=now,
+        )
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    (
+        "9" * 4300,
+        "9" * 4301,
+        "9" * 5000,
+        "１２３",
+        "+123",
+        "-1",
+        "1.0",
+        "1e3",
+        "1 2",
+        "99999999999999999999",
+    ),
+)
+def test_notification_rejects_invalid_timestamp_before_rsa_verification(
+    rsa_private_key,
+    monkeypatch,
+    timestamp,
+):
+    body = _notification_body()
+    headers = _signed_headers(rsa_private_key, body)
+    headers["Wechatpay-Timestamp"] = timestamp
+
+    def fail_verify(*_args, **_kwargs):
+        pytest.fail("RSA verification should not run for an invalid timestamp")
+
+    monkeypatch.setattr(
+        "license_server.wechat_payment.verify_response_signature",
+        fail_verify,
+    )
+
+    with pytest.raises(WechatPaymentError, match="PAYMENT_NOTIFY_TIMESTAMP_INVALID"):
+        parse_and_verify_notification(
+            headers,
+            body,
+            public_key_id=PUBLIC_KEY_ID,
+            public_key=rsa_private_key.public_key(),
+            api_v3_key=API_V3_KEY,
+        )
+
+
+@pytest.mark.parametrize(
+    "outer_overrides",
+    (
+        {"event_type": "TRANSACTION.CLOSED"},
+        {"resource_type": "plaintext-resource"},
+        {"resource_type": None},
+        {"resource": {"algorithm": "AEAD_AES_128_GCM"}},
+    ),
+)
+def test_notification_requires_success_encrypted_resource(
+    rsa_private_key,
+    outer_overrides,
+):
+    now = datetime(2026, 7, 13, 4, 0, tzinfo=timezone.utc)
+    body = _notification_body(outer_overrides=outer_overrides)
+
+    with pytest.raises(WechatPaymentError, match="PAYMENT_NOTIFY_PAYLOAD_INVALID"):
+        parse_and_verify_notification(
+            _signed_headers(rsa_private_key, body, timestamp=int(now.timestamp())),
+            body,
+            public_key_id=PUBLIC_KEY_ID,
+            public_key=rsa_private_key.public_key(),
+            api_v3_key=API_V3_KEY,
+            now=now,
+        )
+
+
+@pytest.mark.parametrize(
+    "transaction_overrides",
+    (
+        {"trade_type": "JSAPI"},
+        {"trade_state": "NOTPAY"},
+        {"transaction_id": ""},
+        {"out_trade_no": ""},
+        {"appid": ""},
+        {"mchid": ""},
+        {"amount": {"total": True, "currency": "CNY"}},
+        {"amount": {"total": "990", "currency": "CNY"}},
+        {"amount": {"total": 990.0, "currency": "CNY"}},
+        {"amount": {"total": 0, "currency": "CNY"}},
+        {"amount": {"total": -1, "currency": "CNY"}},
+        {"amount": {"total": 990, "currency": 1}},
+        {"amount": {"total": 990, "currency": ""}},
+        {"success_time": "not-a-time"},
+    ),
+)
+def test_notification_requires_strict_success_transaction_fields(
+    rsa_private_key,
+    transaction_overrides,
+):
+    now = datetime(2026, 7, 13, 4, 0, tzinfo=timezone.utc)
+    body = _notification_body(transaction_overrides=transaction_overrides)
+
+    with pytest.raises(WechatPaymentError, match="PAYMENT_NOTIFY_PAYLOAD_INVALID"):
+        parse_and_verify_notification(
+            _signed_headers(rsa_private_key, body, timestamp=int(now.timestamp())),
+            body,
+            public_key_id=PUBLIC_KEY_ID,
+            public_key=rsa_private_key.public_key(),
+            api_v3_key=API_V3_KEY,
+            now=now,
+        )
+
+
+def test_notification_requires_valid_provider_create_time(rsa_private_key):
+    now = datetime(2026, 7, 13, 4, 0, tzinfo=timezone.utc)
+    body = _notification_body(outer_overrides={"create_time": "not-a-time"})
+
+    with pytest.raises(WechatPaymentError, match="PAYMENT_NOTIFY_PAYLOAD_INVALID"):
+        parse_and_verify_notification(
+            _signed_headers(rsa_private_key, body, timestamp=int(now.timestamp())),
+            body,
+            public_key_id=PUBLIC_KEY_ID,
+            public_key=rsa_private_key.public_key(),
+            api_v3_key=API_V3_KEY,
+            now=now,
+        )
+
+
 def _signed_headers(private_key, body: bytes, *, timestamp: int = 1783905600):
     nonce = "response-nonce"
     message = f"{timestamp}\n{nonce}\n".encode() + body + b"\n"
@@ -255,3 +398,34 @@ def _resource_for_plaintext(plaintext: bytes) -> dict[str, str]:
         "associated_data": NOTIFICATION_AAD,
         "ciphertext": base64.b64encode(encrypted).decode(),
     }
+
+
+def _notification_body(*, outer_overrides=None, transaction_overrides=None) -> bytes:
+    transaction = {
+        "appid": "wx-test",
+        "mchid": "1900000109",
+        "out_trade_no": "pay_test",
+        "transaction_id": "4200000001",
+        "trade_type": "NATIVE",
+        "trade_state": "SUCCESS",
+        "success_time": "2026-07-13T12:00:00+08:00",
+        "amount": {"total": 990, "currency": "CNY"},
+    }
+    transaction.update(transaction_overrides or {})
+    outer = {
+        "id": "notice-1",
+        "event_type": "TRANSACTION.SUCCESS",
+        "resource_type": "encrypt-resource",
+        "create_time": "2026-07-13T12:00:00+08:00",
+        "resource": _resource_for_plaintext(
+            json.dumps(transaction, separators=(",", ":")).encode()
+        ),
+    }
+    for key, value in (outer_overrides or {}).items():
+        if key == "resource" and isinstance(value, dict):
+            outer["resource"].update(value)
+        elif value is None:
+            outer.pop(key, None)
+        else:
+            outer[key] = value
+    return json.dumps(outer, separators=(",", ":")).encode()

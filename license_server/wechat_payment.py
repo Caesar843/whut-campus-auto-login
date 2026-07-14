@@ -32,6 +32,8 @@ from license_server.payment_gateway import (
 
 
 DEFAULT_NOTIFICATION_TOLERANCE_SECONDS = 300
+_MAX_NOTIFICATION_TIMESTAMP_DIGITS = 20
+_SQLITE_INT64_MAX = (1 << 63) - 1
 WECHAT_API_BASE_URL = "https://api.mch.weixin.qq.com"
 WECHAT_HTTP_TIMEOUT = httpx.Timeout(
     10.0,
@@ -388,6 +390,10 @@ def parse_and_verify_notification(
     now: datetime | None = None,
     tolerance_seconds: int = DEFAULT_NOTIFICATION_TOLERANCE_SECONDS,
 ) -> VerifiedPaymentNotification:
+    timestamp = _parse_notification_timestamp(headers)
+    current = _utc(now)
+    if abs(int(current.timestamp()) - timestamp) > tolerance_seconds:
+        raise WechatPaymentError("PAYMENT_NOTIFY_TIMESTAMP_INVALID")
     try:
         verify_response_signature(
             headers,
@@ -397,19 +403,17 @@ def parse_and_verify_notification(
         )
     except WechatPaymentError as exc:
         raise WechatPaymentError("PAYMENT_NOTIFY_SIGNATURE_INVALID") from exc
-    normalized = {str(name).lower(): str(value) for name, value in headers.items()}
-    try:
-        timestamp = int(normalized["wechatpay-timestamp"])
-    except (KeyError, ValueError) as exc:
-        raise WechatPaymentError("PAYMENT_NOTIFY_TIMESTAMP_INVALID") from exc
-    current = _utc(now)
-    if abs(int(current.timestamp()) - timestamp) > tolerance_seconds:
-        raise WechatPaymentError("PAYMENT_NOTIFY_TIMESTAMP_INVALID")
     try:
         outer = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WechatPaymentError("PAYMENT_NOTIFY_PAYLOAD_INVALID") from exc
     if not isinstance(outer, dict) or not isinstance(outer.get("resource"), dict):
+        raise WechatPaymentError("PAYMENT_NOTIFY_PAYLOAD_INVALID")
+    if (
+        outer.get("event_type") != "TRANSACTION.SUCCESS"
+        or outer.get("resource_type") != "encrypt-resource"
+        or outer["resource"].get("algorithm") != "AEAD_AES_256_GCM"
+    ):
         raise WechatPaymentError("PAYMENT_NOTIFY_PAYLOAD_INVALID")
     transaction = decrypt_notification_resource(outer["resource"], api_v3_key)
     amount = transaction.get("amount")
@@ -417,18 +421,26 @@ def parse_and_verify_notification(
         raise WechatPaymentError("PAYMENT_NOTIFY_PAYLOAD_INVALID")
     try:
         amount_total = amount["total"]
-        if not isinstance(amount_total, int) or isinstance(amount_total, bool):
+        if (
+            type(amount_total) is not int
+            or amount_total <= 0
+            or amount_total > _SQLITE_INT64_MAX
+        ):
+            raise ValueError
+        trade_type = _required_text(transaction, "trade_type")
+        trade_state = _required_text(transaction, "trade_state")
+        if trade_type != "NATIVE" or trade_state != "SUCCESS":
             raise ValueError
         return VerifiedPaymentNotification(
             notification_id=_required_text(outer, "id"),
-            event_type=_required_text(outer, "event_type"),
+            event_type="TRANSACTION.SUCCESS",
             provider_created_time=_parse_datetime(_required_text(outer, "create_time")),
             appid=_required_text(transaction, "appid"),
             mchid=_required_text(transaction, "mchid"),
             out_trade_no=_required_text(transaction, "out_trade_no"),
             transaction_id=_required_text(transaction, "transaction_id"),
-            trade_type=_required_text(transaction, "trade_type"),
-            trade_state=_required_text(transaction, "trade_state"),
+            trade_type=trade_type,
+            trade_state=trade_state,
             amount_total=amount_total,
             currency=_required_text(amount, "currency"),
             success_time=_parse_datetime(_required_text(transaction, "success_time")),
@@ -439,9 +451,28 @@ def parse_and_verify_notification(
 
 def _required_text(values: Mapping[str, object], key: str) -> str:
     value = values.get(key)
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value.strip():
         raise ValueError
     return value
+
+
+def _parse_notification_timestamp(headers: Mapping[str, str]) -> int:
+    normalized = {str(name).lower(): value for name, value in headers.items()}
+    value = normalized.get("wechatpay-timestamp")
+    if not isinstance(value, str):
+        raise WechatPaymentError("PAYMENT_NOTIFY_TIMESTAMP_INVALID")
+    timestamp_text = value.strip(" \t")
+    if (
+        not timestamp_text
+        or len(timestamp_text) > _MAX_NOTIFICATION_TIMESTAMP_DIGITS
+        or not timestamp_text.isascii()
+        or any(character < "0" or character > "9" for character in timestamp_text)
+    ):
+        raise WechatPaymentError("PAYMENT_NOTIFY_TIMESTAMP_INVALID")
+    try:
+        return int(timestamp_text, 10)
+    except (ValueError, OverflowError) as exc:
+        raise WechatPaymentError("PAYMENT_NOTIFY_TIMESTAMP_INVALID") from exc
 
 
 def _parse_datetime(value: str) -> datetime:
