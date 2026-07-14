@@ -14,6 +14,10 @@ from license_server.payment_gateway import (
     QueryOrderOutcome,
     QueryOrderResult,
 )
+from license_server.payment_notification_repository import (
+    IncomingPaymentNotification,
+    insert_received_notification,
+)
 from license_server.payment_service import (
     PaymentServiceError,
     confirm_paid_order,
@@ -166,16 +170,28 @@ def test_transaction_rolls_back_when_license_creation_fails(tmp_path, monkeypatc
 
 def test_notification_status_updates_in_same_confirmation(tmp_path):
     order = _mock_order(tmp_path)
-    with connect(tmp_path / "license.sqlite3") as connection:
-        connection.execute(
-            """
-            INSERT INTO payment_notifications (
-                provider_notification_id, provider, process_status, received_at
-            ) VALUES ('notice-1', 'mock', 'RECEIVED', ?)
-            """,
-            (datetime_text(datetime.now(timezone.utc)),),
-        )
-        connection.commit()
+    now = datetime.now(timezone.utc)
+    insert_received_notification(
+        tmp_path / "license.sqlite3",
+        IncomingPaymentNotification(
+            provider_notification_id="notice-1",
+            provider="mock",
+            out_trade_no=order.order_id,
+            provider_transaction_id="mock-transaction",
+            event_type="TRANSACTION.SUCCESS",
+            signature_key_id="mock-key",
+            payload_digest_sha256="a" * 64,
+            reported_appid=MOCK_APP_ID,
+            reported_mchid=MOCK_MCH_ID,
+            reported_trade_type="NATIVE",
+            reported_trade_state="SUCCESS",
+            reported_amount_fen=990,
+            reported_currency="CNY",
+            reported_success_at=now,
+            provider_created_at=now,
+            received_at=now,
+        ),
+    )
 
     confirm_paid_order(
         tmp_path / "license.sqlite3",

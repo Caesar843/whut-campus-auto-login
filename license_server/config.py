@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import ipaddress
+import math
 import os
 import string
 from dataclasses import dataclass
@@ -25,6 +26,13 @@ DEFAULT_ENVIRONMENT = "development"
 VALID_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_PAYMENT_CHANNELS = ("wechat_pay",)
 DEFAULT_PAYMENT_ORDER_TTL_MINUTES = 15
+DEFAULT_PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS = 1.0
+MAX_PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS = 300.0
+DEFAULT_PAYMENT_NOTIFICATION_MAX_ATTEMPTS = 8
+MAX_PAYMENT_NOTIFICATION_MAX_ATTEMPTS = 100
+DEFAULT_PAYMENT_NOTIFICATION_LEASE_SECONDS = 60
+DEFAULT_PAYMENT_NOTIFICATION_RETRY_BASE_SECONDS = 5
+DEFAULT_PAYMENT_NOTIFICATION_RETRY_MAX_SECONDS = 300
 VALID_PAYMENT_PROVIDERS = {"disabled", "mock", "wechat_native"}
 MOCK_ADMIN_TOKEN_MIN_LENGTH = 16
 SHA256_HEX_LENGTH = 64
@@ -66,6 +74,12 @@ class LicenseServerConfig:
     payment_currency: str
     payment_channels: tuple[str, ...]
     payment_order_ttl_minutes: int
+    payment_notification_worker_enabled: bool
+    payment_notification_worker_poll_seconds: float
+    payment_notification_max_attempts: int
+    payment_notification_lease_seconds: int
+    payment_notification_retry_base_seconds: int
+    payment_notification_retry_max_seconds: int
     admin_enabled: bool
     admin_operator_name: str
     admin_access_token_sha256: str | None
@@ -74,11 +88,24 @@ class LicenseServerConfig:
 def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
     values = os.environ if env is None else env
     environment = _environment_from_env(values)
-    database_path = _database_path_from_env(values, environment)
+    worker_enabled = _boolean_from_env(
+        values,
+        "PAYMENT_NOTIFICATION_WORKER_ENABLED",
+    )
+    database_path = _database_path_from_env(
+        values,
+        environment,
+        worker_enabled=worker_enabled,
+    )
     private_key_b64 = _private_key_from_env(values, environment)
     payment_price_fen = _payment_price_fen_from_env(values)
     payment_currency = _payment_currency_from_env(values)
     payment_provider = _payment_provider_from_env(values, environment)
+    if worker_enabled and payment_provider != "wechat_native":
+        raise RuntimeError(
+            "PAYMENT_NOTIFICATION_WORKER_ENABLED requires "
+            "PAYMENT_PROVIDER=wechat_native."
+        )
     return LicenseServerConfig(
         environment=environment,
         database_path=database_path,
@@ -91,6 +118,22 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
         payment_currency=payment_currency,
         payment_channels=_payment_channels_from_env(values),
         payment_order_ttl_minutes=_payment_order_ttl_minutes_from_env(values),
+        payment_notification_worker_enabled=worker_enabled,
+        payment_notification_worker_poll_seconds=(
+            _payment_notification_worker_poll_seconds_from_env(values)
+        ),
+        payment_notification_max_attempts=(
+            _payment_notification_max_attempts_from_env(values)
+        ),
+        payment_notification_lease_seconds=(
+            DEFAULT_PAYMENT_NOTIFICATION_LEASE_SECONDS
+        ),
+        payment_notification_retry_base_seconds=(
+            DEFAULT_PAYMENT_NOTIFICATION_RETRY_BASE_SECONDS
+        ),
+        payment_notification_retry_max_seconds=(
+            DEFAULT_PAYMENT_NOTIFICATION_RETRY_MAX_SECONDS
+        ),
         admin_enabled=_admin_enabled_from_env(values),
         admin_operator_name=values.get("ADMIN_OPERATOR_NAME", "").strip(),
         admin_access_token_sha256=_admin_access_token_sha256_from_env(values),
@@ -124,7 +167,12 @@ def _environment_from_env(values: Mapping[str, str]) -> str:
     return environment
 
 
-def _database_path_from_env(values: Mapping[str, str], environment: str) -> Path:
+def _database_path_from_env(
+    values: Mapping[str, str],
+    environment: str,
+    *,
+    worker_enabled: bool,
+) -> Path:
     database_url = values.get("DATABASE_URL", "").strip()
     license_db_path = values.get("LICENSE_DB_PATH", "").strip()
     if environment == "production" and not database_url and not license_db_path:
@@ -133,6 +181,10 @@ def _database_path_from_env(values: Mapping[str, str], environment: str) -> Path
         database_path = _sqlite_database_path(database_url)
     else:
         database_path = Path(license_db_path or "license_server.sqlite3")
+    if worker_enabled and not _is_absolute_path(database_path):
+        raise RuntimeError(
+            "PAYMENT_NOTIFICATION_WORKER_DATABASE_PATH_NOT_ABSOLUTE"
+        )
     if environment == "production" and not _is_absolute_path(database_path):
         raise RuntimeError(
             "DATABASE_URL or LICENSE_DB_PATH must be an absolute path in production."
@@ -173,7 +225,7 @@ def _private_key_from_env(values: Mapping[str, str], environment: str) -> str:
 
 
 def _is_absolute_path(path: Path) -> bool:
-    return path.is_absolute() or str(path).startswith(("/", "\\"))
+    return path.is_absolute() and bool(path.name)
 
 
 def _payment_channels_from_env(values: Mapping[str, str]) -> tuple[str, ...]:
@@ -347,13 +399,69 @@ def _payment_order_ttl_minutes_from_env(values: Mapping[str, str]) -> int:
     return ttl_minutes
 
 
-def _admin_enabled_from_env(values: Mapping[str, str]) -> bool:
-    raw_value = values.get("ADMIN_ENABLED", "").strip().lower()
+def _boolean_from_env(values: Mapping[str, str], name: str) -> bool:
+    raw_value = values.get(name, "").strip().lower()
     if raw_value in TRUE_VALUES:
         return True
     if raw_value in FALSE_VALUES:
         return False
-    raise RuntimeError("ADMIN_ENABLED must be true or false.")
+    raise RuntimeError(f"{name} must be true or false.")
+
+
+def _payment_notification_worker_poll_seconds_from_env(
+    values: Mapping[str, str],
+) -> float:
+    raw_value = values.get(
+        "PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS",
+        str(DEFAULT_PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS),
+    ).strip()
+    try:
+        poll_seconds = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS must be a finite number."
+        ) from exc
+    if not math.isfinite(poll_seconds) or not (
+        0 < poll_seconds <= MAX_PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS
+    ):
+        raise RuntimeError(
+            "PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS must be greater than 0 "
+            f"and at most {MAX_PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS:g}."
+        )
+    return poll_seconds
+
+
+def _payment_notification_max_attempts_from_env(
+    values: Mapping[str, str],
+) -> int:
+    raw_value = values.get(
+        "PAYMENT_NOTIFICATION_MAX_ATTEMPTS",
+        str(DEFAULT_PAYMENT_NOTIFICATION_MAX_ATTEMPTS),
+    ).strip(" \t")
+    if not raw_value or not raw_value.isascii() or not raw_value.isdigit():
+        raise RuntimeError(
+            "PAYMENT_NOTIFICATION_MAX_ATTEMPTS must be an integer."
+        )
+    normalized = raw_value.lstrip("0") or "0"
+    maximum = str(MAX_PAYMENT_NOTIFICATION_MAX_ATTEMPTS)
+    if len(normalized) > len(maximum) or (
+        len(normalized) == len(maximum) and normalized > maximum
+    ):
+        raise RuntimeError(
+            "PAYMENT_NOTIFICATION_MAX_ATTEMPTS must be between 1 and "
+            f"{MAX_PAYMENT_NOTIFICATION_MAX_ATTEMPTS}."
+        )
+    max_attempts = int(normalized)
+    if not 1 <= max_attempts <= MAX_PAYMENT_NOTIFICATION_MAX_ATTEMPTS:
+        raise RuntimeError(
+            "PAYMENT_NOTIFICATION_MAX_ATTEMPTS must be between 1 and "
+            f"{MAX_PAYMENT_NOTIFICATION_MAX_ATTEMPTS}."
+        )
+    return max_attempts
+
+
+def _admin_enabled_from_env(values: Mapping[str, str]) -> bool:
+    return _boolean_from_env(values, "ADMIN_ENABLED")
 
 
 def _admin_access_token_sha256_from_env(values: Mapping[str, str]) -> str | None:

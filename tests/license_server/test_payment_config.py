@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,297 @@ def test_explicit_disabled_payment_provider_loads_without_wechat_config(tmp_path
 
     assert config.payment_provider is None
     assert config.wechat_pay is None
+
+
+def test_payment_notification_worker_defaults_are_disabled_and_bounded(tmp_path):
+    config = load_config(_production_env(tmp_path, PAYMENT_PROVIDER="disabled"))
+
+    assert config.payment_notification_worker_enabled is False
+    assert config.payment_notification_worker_poll_seconds == 1.0
+    assert config.payment_notification_max_attempts == 8
+    assert config.payment_notification_lease_seconds == 60
+    assert config.payment_notification_retry_base_seconds == 5
+    assert config.payment_notification_retry_max_seconds == 300
+
+
+@pytest.mark.parametrize("value", ("1", "true", "yes", "on", "TRUE"))
+def test_payment_notification_worker_accepts_enabled_values(tmp_path, value):
+    env = _wechat_env(tmp_path)
+    env["PAYMENT_NOTIFICATION_WORKER_ENABLED"] = value
+
+    assert load_config(env).payment_notification_worker_enabled is True
+
+
+@pytest.mark.parametrize("value", ("0", "false", "no", "off", "", "FALSE"))
+def test_payment_notification_worker_accepts_disabled_values(tmp_path, value):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_NOTIFICATION_WORKER_ENABLED=value,
+    )
+
+    assert load_config(env).payment_notification_worker_enabled is False
+
+
+@pytest.mark.parametrize("value", ("enabled", "2", "none"))
+def test_payment_notification_worker_rejects_invalid_boolean(tmp_path, value):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_NOTIFICATION_WORKER_ENABLED=value,
+    )
+
+    with pytest.raises(RuntimeError, match="PAYMENT_NOTIFICATION_WORKER_ENABLED"):
+        load_config(env)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (("0.25", 0.25), ("1", 1.0), ("300", 300.0)),
+)
+def test_payment_notification_worker_accepts_bounded_poll_seconds(
+    tmp_path, value, expected
+):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS=value,
+    )
+
+    assert load_config(env).payment_notification_worker_poll_seconds == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("", "0", "-1", "nan", "inf", "-inf", "301", "true", "1e309"),
+)
+def test_payment_notification_worker_rejects_invalid_poll_seconds(tmp_path, value):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS=value,
+    )
+
+    with pytest.raises(RuntimeError, match="PAYMENT_NOTIFICATION_WORKER_POLL_SECONDS"):
+        load_config(env)
+
+
+@pytest.mark.parametrize("value", ("1", "8", "008", "100"))
+def test_payment_notification_worker_accepts_bounded_max_attempts(tmp_path, value):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_NOTIFICATION_MAX_ATTEMPTS=value,
+    )
+
+    assert load_config(env).payment_notification_max_attempts == int(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "",
+        "0",
+        "-1",
+        "+8",
+        "101",
+        "1.5",
+        "8 8",
+        "8e0",
+        "true",
+        "1e2",
+        "８",
+        "١٢",
+        "9" * 5000,
+    ),
+)
+def test_payment_notification_worker_rejects_invalid_max_attempts(tmp_path, value):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_NOTIFICATION_MAX_ATTEMPTS=value,
+    )
+
+    with pytest.raises(RuntimeError, match="PAYMENT_NOTIFICATION_MAX_ATTEMPTS"):
+        load_config(env)
+
+
+def test_payment_notification_worker_max_attempts_error_does_not_leak_long_value(
+    tmp_path,
+):
+    value = "9" * 5000
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_NOTIFICATION_MAX_ATTEMPTS=value,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_config(env)
+
+    assert value not in str(exc_info.value)
+
+
+def test_enabled_payment_notification_worker_rejects_non_wechat_provider(tmp_path):
+    env = _production_env(
+        tmp_path,
+        LICENSE_SERVER_ENV="development",
+        PAYMENT_PROVIDER="mock",
+        PAYMENT_MOCK_ADMIN_TOKEN="localR4ndomValue123456",
+        PAYMENT_NOTIFICATION_WORKER_ENABLED="true",
+    )
+
+    with pytest.raises(RuntimeError, match="PAYMENT_PROVIDER=wechat_native"):
+        load_config(env)
+
+
+@pytest.mark.parametrize("environment", ("development", "test", "production"))
+@pytest.mark.parametrize("source", ("DATABASE_URL", "LICENSE_DB_PATH"))
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "relative-worker.sqlite3",
+        "./data/license.sqlite3",
+        r"\var\lib\worker.sqlite3",
+        r"C:worker.sqlite3",
+        r"C:relative\worker.sqlite3",
+    ),
+)
+def test_enabled_payment_notification_worker_requires_absolute_database_path(
+    monkeypatch, tmp_path, environment, source, relative_path
+):
+    env = _wechat_env(tmp_path)
+    env["LICENSE_SERVER_ENV"] = environment
+    env["PAYMENT_NOTIFICATION_WORKER_ENABLED"] = "true"
+    if source == "DATABASE_URL":
+        env["DATABASE_URL"] = f"sqlite:///{relative_path}"
+    else:
+        env["DATABASE_URL"] = ""
+        env["LICENSE_DB_PATH"] = relative_path
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="PAYMENT_NOTIFICATION_WORKER_DATABASE_PATH_NOT_ABSOLUTE",
+    ) as exc_info:
+        load_config(env)
+
+    assert relative_path not in str(exc_info.value)
+    assert not (tmp_path / relative_path).exists()
+
+
+@pytest.mark.parametrize("environment", ("development", "test", "production"))
+def test_enabled_payment_notification_worker_accepts_absolute_database_path(
+    tmp_path, environment
+):
+    env = _wechat_env(tmp_path)
+    env["LICENSE_SERVER_ENV"] = environment
+    env["PAYMENT_NOTIFICATION_WORKER_ENABLED"] = "true"
+
+    config = load_config(env)
+
+    assert config.database_path.is_absolute()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX path semantics are required")
+@pytest.mark.parametrize("source", ("DATABASE_URL", "LICENSE_DB_PATH"))
+@pytest.mark.parametrize(
+    "database_path",
+    (r"C:\data\worker.sqlite3", r"\\server\share\worker.sqlite3"),
+)
+def test_posix_worker_rejects_windows_absolute_paths(
+    tmp_path, source, database_path
+):
+    env = _wechat_env(tmp_path)
+    env["PAYMENT_NOTIFICATION_WORKER_ENABLED"] = "true"
+    if source == "DATABASE_URL":
+        env["DATABASE_URL"] = f"sqlite:///{database_path}"
+    else:
+        env["DATABASE_URL"] = ""
+        env["LICENSE_DB_PATH"] = database_path
+
+    with pytest.raises(
+        RuntimeError,
+        match="PAYMENT_NOTIFICATION_WORKER_DATABASE_PATH_NOT_ABSOLUTE",
+    ):
+        load_config(env)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX path semantics are required")
+@pytest.mark.parametrize("source", ("DATABASE_URL", "LICENSE_DB_PATH"))
+def test_posix_worker_accepts_posix_absolute_path(tmp_path, source):
+    database_path = "/tmp/worker-test.sqlite3"
+    env = _wechat_env(tmp_path)
+    env["PAYMENT_NOTIFICATION_WORKER_ENABLED"] = "true"
+    if source == "DATABASE_URL":
+        env["DATABASE_URL"] = f"sqlite:///{database_path}"
+    else:
+        env["DATABASE_URL"] = ""
+        env["LICENSE_DB_PATH"] = database_path
+
+    assert load_config(env).database_path == Path(database_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path semantics are required")
+@pytest.mark.parametrize("source", ("DATABASE_URL", "LICENSE_DB_PATH"))
+@pytest.mark.parametrize(
+    "database_path",
+    (r"C:\data\worker.sqlite3", r"\\server\share\worker.sqlite3"),
+)
+def test_windows_worker_accepts_drive_and_unc_absolute_paths(
+    tmp_path, source, database_path
+):
+    env = _wechat_env(tmp_path)
+    env["PAYMENT_NOTIFICATION_WORKER_ENABLED"] = "true"
+    if source == "DATABASE_URL":
+        env["DATABASE_URL"] = f"sqlite:///{database_path}"
+    else:
+        env["DATABASE_URL"] = ""
+        env["LICENSE_DB_PATH"] = database_path
+
+    assert load_config(env).database_path == Path(database_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path semantics are required")
+@pytest.mark.parametrize("source", ("DATABASE_URL", "LICENSE_DB_PATH"))
+@pytest.mark.parametrize("database_path", (r"\\server", "\\\\server\\"))
+def test_windows_worker_rejects_incomplete_unc_paths(
+    tmp_path, source, database_path
+):
+    env = _wechat_env(tmp_path)
+    env["PAYMENT_NOTIFICATION_WORKER_ENABLED"] = "true"
+    if source == "DATABASE_URL":
+        env["DATABASE_URL"] = f"sqlite:///{database_path}"
+    else:
+        env["DATABASE_URL"] = ""
+        env["LICENSE_DB_PATH"] = database_path
+
+    with pytest.raises(
+        RuntimeError,
+        match="PAYMENT_NOTIFICATION_WORKER_DATABASE_PATH_NOT_ABSOLUTE",
+    ):
+        load_config(env)
+
+
+@pytest.mark.parametrize("source", ("DATABASE_URL", "LICENSE_DB_PATH"))
+def test_disabled_payment_notification_worker_keeps_relative_database_compatibility(
+    tmp_path, source
+):
+    env = _production_env(
+        tmp_path,
+        LICENSE_SERVER_ENV="test",
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_NOTIFICATION_WORKER_ENABLED="false",
+    )
+    if source == "DATABASE_URL":
+        env["DATABASE_URL"] = "sqlite:///relative-web.sqlite3"
+    else:
+        env["DATABASE_URL"] = ""
+        env["LICENSE_DB_PATH"] = "relative-web.sqlite3"
+
+    config = load_config(env)
+
+    assert config.database_path == Path("relative-web.sqlite3")
 
 
 @pytest.mark.parametrize("channels", ("wechat_pay,alipay", "alipay", ""))

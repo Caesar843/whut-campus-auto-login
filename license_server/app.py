@@ -21,6 +21,9 @@ from license_server.config import (
 )
 from license_server.db import initialize_database
 from license_server.payment_gateway import MockPaymentGateway, PaymentGateway
+from license_server.payment_notification_routes import (
+    create_payment_notification_router,
+)
 from license_server.payment_routes import create_payment_router
 from license_server.routes import create_router
 from license_server.wechat_payment import WeChatNativePaymentGateway
@@ -125,6 +128,20 @@ def create_app(
             payment_order_ttl_minutes=int(payment_order_ttl_minutes),
         )
     )
+    if (
+        payment_provider == "wechat_native"
+        and wechat_pay_config is not None
+        and isinstance(payment_gateway, WeChatNativePaymentGateway)
+    ):
+        app.include_router(
+            create_payment_notification_router(
+                database_path=Path(database_path),
+                gateway=payment_gateway,
+                expected_appid=wechat_pay_config.app_id,
+                expected_mchid=wechat_pay_config.mch_id,
+                signature_key_id=wechat_pay_config.public_key_id,
+            )
+        )
     if admin_enabled:
         app.include_router(
             create_admin_router(
