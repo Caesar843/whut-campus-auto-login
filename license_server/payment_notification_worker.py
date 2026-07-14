@@ -6,6 +6,12 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
+from license_server.config import (
+    DEFAULT_PAYMENT_NOTIFICATION_LEASE_SECONDS,
+    DEFAULT_PAYMENT_NOTIFICATION_MAX_ATTEMPTS,
+    DEFAULT_PAYMENT_NOTIFICATION_RETRY_BASE_SECONDS,
+    DEFAULT_PAYMENT_NOTIFICATION_RETRY_MAX_SECONDS,
+)
 from license_server.db import write_transaction
 from license_server.payment import OrderStatus, PaymentEvidence, PaymentEvidenceSource
 from license_server.payment_notification_repository import (
@@ -60,10 +66,10 @@ class PaymentNotificationWorker:
     worker_id: str
     expected_appid: str
     expected_mchid: str
-    lease_seconds: int = 60
-    max_attempts: int = 8
-    retry_base_seconds: int = 5
-    retry_max_seconds: int = 300
+    lease_seconds: int = DEFAULT_PAYMENT_NOTIFICATION_LEASE_SECONDS
+    max_attempts: int = DEFAULT_PAYMENT_NOTIFICATION_MAX_ATTEMPTS
+    retry_base_seconds: int = DEFAULT_PAYMENT_NOTIFICATION_RETRY_BASE_SECONDS
+    retry_max_seconds: int = DEFAULT_PAYMENT_NOTIFICATION_RETRY_MAX_SECONDS
     finalize_limit: int = 100
 
     def __post_init__(self) -> None:
