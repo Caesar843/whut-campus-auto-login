@@ -13,7 +13,7 @@ from license_server.db import (
 )
 
 
-def test_empty_database_initializes_to_schema_version_3(tmp_path):
+def test_empty_database_initializes_to_latest_schema_version(tmp_path):
     database_path = tmp_path / "license.sqlite3"
 
     initialize_database(database_path)
@@ -189,7 +189,7 @@ def test_foreign_keys_and_payment_constraints(tmp_path):
         )
 
 
-def test_v2_payment_order_is_preserved_when_migrated_to_v3(tmp_path):
+def test_v2_payment_order_is_preserved_when_migrated_to_latest_schema(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     _create_v2_database(database_path)
     with sqlite3.connect(database_path) as connection:
@@ -232,7 +232,7 @@ def test_v2_payment_order_is_preserved_when_migrated_to_v3(tmp_path):
             None,
             0,
         )
-        assert _schema_version(connection) == 3
+        assert _schema_version(connection) == SUPPORTED_SCHEMA_VERSION
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -519,7 +519,7 @@ def _create_v2_database(database_path: Path) -> None:
                 (
                     db.CORE_SCHEMA,
                     V2_PAYMENT_ORDER_SCHEMA,
-                    db.PAYMENT_NOTIFICATION_SCHEMA,
+                    db.PAYMENT_NOTIFICATION_V3_SCHEMA,
                     db.LICENSE_GRANT_SCHEMA,
                     db.ADMIN_AUDIT_SCHEMA,
                     db.SCHEMA_META_SQL,

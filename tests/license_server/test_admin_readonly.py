@@ -464,7 +464,7 @@ def _seed_admin_rows(database_path):
                  'TRANSACTION.SUCCESS', 'serial-b', 0, 'digest-b', 'NATIVE',
                  'SUCCESS', 1, 'CNY', 1, 'ABNORMAL', 'amount_mismatch',
                  'amount_mismatch', '2026-07-06T00:07:00Z',
-                 '2026-07-06T00:07:01Z', NULL, 2)
+                 '2026-07-06T00:07:01Z', '2026-07-06T00:07:02Z', 2)
             """
         )
         connection.execute(

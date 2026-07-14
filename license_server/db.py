@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import sqlite3
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
@@ -9,7 +8,7 @@ from pathlib import Path
 from license_server.payment import ANNUAL_V1, OrderStatus
 
 
-SUPPORTED_SCHEMA_VERSION = 3
+SUPPORTED_SCHEMA_VERSION = 4
 BUSY_TIMEOUT_MS = 5000
 
 LEGACY_REMOVED_DEVICE_COLUMNS = (
@@ -310,7 +309,7 @@ PAYMENT_ORDER_INDEXES = {
     ),
 }
 
-PAYMENT_NOTIFICATION_SCHEMA = """
+PAYMENT_NOTIFICATION_V3_SCHEMA = """
 CREATE TABLE IF NOT EXISTS payment_notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider_notification_id TEXT NOT NULL UNIQUE,
@@ -346,6 +345,186 @@ ON payment_notifications(order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_notifications_process
 ON payment_notifications(process_status, next_attempt_at);
 """
+
+PAYMENT_NOTIFICATION_V3_COLUMNS = (
+    ("id", "INTEGER", 0, None, 1, 0),
+    ("provider_notification_id", "TEXT", 1, None, 0, 0),
+    ("order_id", "TEXT", 0, None, 0, 0),
+    ("out_trade_no", "TEXT", 0, None, 0, 0),
+    ("provider", "TEXT", 1, None, 0, 0),
+    ("provider_transaction_id", "TEXT", 0, None, 0, 0),
+    ("event_type", "TEXT", 0, None, 0, 0),
+    ("signature_key_id", "TEXT", 0, None, 0, 0),
+    ("signature_valid", "INTEGER", 1, "0", 0, 0),
+    ("payload_digest_sha256", "TEXT", 0, None, 0, 0),
+    ("reported_trade_type", "TEXT", 0, None, 0, 0),
+    ("reported_trade_state", "TEXT", 0, None, 0, 0),
+    ("reported_amount_fen", "INTEGER", 0, None, 0, 0),
+    ("reported_currency", "TEXT", 0, None, 0, 0),
+    ("merchant_identity_valid", "INTEGER", 1, "0", 0, 0),
+    ("process_status", "TEXT", 1, None, 0, 0),
+    ("security_error_code", "TEXT", 0, None, 0, 0),
+    ("failure_code", "TEXT", 0, None, 0, 0),
+    ("provider_created_at", "TEXT", 0, None, 0, 0),
+    ("received_at", "TEXT", 1, None, 0, 0),
+    ("processing_started_at", "TEXT", 0, None, 0, 0),
+    ("lease_expires_at", "TEXT", 0, None, 0, 0),
+    ("worker_id", "TEXT", 0, None, 0, 0),
+    ("processed_at", "TEXT", 0, None, 0, 0),
+    ("attempt_count", "INTEGER", 1, "0", 0, 0),
+    ("next_attempt_at", "TEXT", 0, None, 0, 0),
+)
+
+PAYMENT_NOTIFICATION_V3_INDEXES = {
+    (None, 1, "u", 0, (("provider_notification_id", 0, "BINARY"),)),
+    (
+        "idx_payment_notifications_order",
+        0,
+        "c",
+        0,
+        (("order_id", 0, "BINARY"),),
+    ),
+    (
+        "idx_payment_notifications_process",
+        0,
+        "c",
+        0,
+        (("process_status", 0, "BINARY"), ("next_attempt_at", 0, "BINARY")),
+    ),
+}
+
+PAYMENT_NOTIFICATION_V4_TABLE_SQL = """
+CREATE TABLE payment_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_notification_id TEXT NOT NULL UNIQUE,
+    order_id TEXT,
+    out_trade_no TEXT,
+    provider TEXT NOT NULL,
+    provider_transaction_id TEXT,
+    event_type TEXT,
+    signature_key_id TEXT,
+    signature_valid INTEGER NOT NULL DEFAULT 0 CHECK(signature_valid IN (0, 1)),
+    payload_digest_sha256 TEXT,
+    reported_trade_type TEXT,
+    reported_trade_state TEXT,
+    reported_amount_fen INTEGER,
+    reported_currency TEXT,
+    merchant_identity_valid INTEGER NOT NULL DEFAULT 0
+        CHECK(merchant_identity_valid IN (0, 1)),
+    process_status TEXT NOT NULL CHECK(process_status IN (
+        'RECEIVED', 'PROCESSING', 'PROCESSED', 'RETRY',
+        'DUPLICATE', 'ABNORMAL', 'ORPHAN'
+    )),
+    security_error_code TEXT,
+    failure_code TEXT,
+    provider_created_at TEXT,
+    received_at TEXT NOT NULL,
+    processing_started_at TEXT,
+    lease_expires_at TEXT,
+    worker_id TEXT,
+    processed_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    next_attempt_at TEXT,
+    reported_appid TEXT,
+    reported_mchid TEXT,
+    reported_success_at TEXT,
+    claim_token TEXT,
+    FOREIGN KEY (order_id) REFERENCES payment_orders(order_id),
+    CHECK(
+        (process_status = 'PROCESSING'
+         AND worker_id IS NOT NULL
+         AND claim_token IS NOT NULL
+         AND processing_started_at IS NOT NULL
+         AND lease_expires_at IS NOT NULL
+         AND processed_at IS NULL)
+        OR
+        (process_status <> 'PROCESSING'
+         AND worker_id IS NULL
+         AND claim_token IS NULL
+         AND processing_started_at IS NULL
+         AND lease_expires_at IS NULL)
+    ),
+    CHECK(
+        process_status <> 'RETRY'
+        OR (next_attempt_at IS NOT NULL
+            AND failure_code IS NOT NULL
+            AND processed_at IS NULL)
+    ),
+    CHECK(process_status = 'RETRY' OR next_attempt_at IS NULL),
+    CHECK(
+        process_status NOT IN ('PROCESSED', 'DUPLICATE', 'ABNORMAL', 'ORPHAN')
+        OR processed_at IS NOT NULL
+    ),
+    CHECK(
+        process_status IN ('PROCESSED', 'DUPLICATE', 'ABNORMAL', 'ORPHAN')
+        OR processed_at IS NULL
+    ),
+    CHECK(process_status <> 'PROCESSED' OR failure_code IS NULL),
+    CHECK(process_status NOT IN ('ABNORMAL', 'ORPHAN') OR failure_code IS NOT NULL),
+    CHECK(
+        process_status NOT IN ('RECEIVED', 'PROCESSING', 'RETRY')
+        OR (
+            out_trade_no IS NOT NULL
+            AND provider_transaction_id IS NOT NULL
+            AND event_type IS NOT NULL
+            AND signature_key_id IS NOT NULL
+            AND signature_valid = 1
+            AND payload_digest_sha256 IS NOT NULL
+            AND reported_trade_type IS NOT NULL
+            AND reported_trade_state IS NOT NULL
+            AND reported_amount_fen IS NOT NULL
+            AND reported_currency IS NOT NULL
+            AND merchant_identity_valid = 1
+            AND provider_created_at IS NOT NULL
+            AND reported_appid IS NOT NULL
+            AND reported_mchid IS NOT NULL
+            AND reported_success_at IS NOT NULL
+        )
+    )
+)
+"""
+
+PAYMENT_NOTIFICATION_SCHEMA = PAYMENT_NOTIFICATION_V4_TABLE_SQL.replace(
+    "CREATE TABLE payment_notifications",
+    "CREATE TABLE IF NOT EXISTS payment_notifications",
+) + """;
+
+CREATE INDEX IF NOT EXISTS idx_payment_notifications_order
+ON payment_notifications(order_id);
+
+CREATE INDEX IF NOT EXISTS idx_payment_notifications_process
+ON payment_notifications(process_status, next_attempt_at, lease_expires_at, id);
+"""
+
+PAYMENT_NOTIFICATION_V4_COLUMNS = PAYMENT_NOTIFICATION_V3_COLUMNS + (
+    ("reported_appid", "TEXT", 0, None, 0, 0),
+    ("reported_mchid", "TEXT", 0, None, 0, 0),
+    ("reported_success_at", "TEXT", 0, None, 0, 0),
+    ("claim_token", "TEXT", 0, None, 0, 0),
+)
+
+PAYMENT_NOTIFICATION_V4_INDEXES = {
+    (None, 1, "u", 0, (("provider_notification_id", 0, "BINARY"),)),
+    (
+        "idx_payment_notifications_order",
+        0,
+        "c",
+        0,
+        (("order_id", 0, "BINARY"),),
+    ),
+    (
+        "idx_payment_notifications_process",
+        0,
+        "c",
+        0,
+        (
+            ("process_status", 0, "BINARY"),
+            ("next_attempt_at", 0, "BINARY"),
+            ("lease_expires_at", 0, "BINARY"),
+            ("id", 0, "BINARY"),
+        ),
+    ),
+}
 
 LICENSE_GRANT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS license_grants (
@@ -432,17 +611,33 @@ def initialize_database(database_path: Path) -> None:
             if _has_user_schema_objects(connection):
                 _require_exact_empty_legacy_database(connection)
                 unversioned_legacy = True
+        if schema_version == 3:
+            _require_exact_versioned_schema(connection, 3)
+            _assert_no_foreign_key_violations(connection)
+            _require_safe_v3_payment_notifications(connection)
+        elif schema_version == 4:
+            _require_exact_versioned_schema(connection, 4)
+            _assert_no_foreign_key_violations(connection)
+            return
+        elif schema_version > 0:
+            _assert_no_foreign_key_violations(connection)
         _execute_script(connection, CORE_SCHEMA)
         _drop_legacy_sensitive_columns(connection)
         _ensure_payment_orders(connection)
         _ensure_payment_orders_v3(connection, declared_version=schema_version)
         if unversioned_legacy:
             connection.execute("DROP TABLE payment_orders_legacy_v0")
-        _execute_script(connection, PAYMENT_NOTIFICATION_SCHEMA)
+        _ensure_payment_notifications_v4(
+            connection,
+            declared_version=schema_version,
+        )
         _execute_script(connection, LICENSE_GRANT_SCHEMA)
         if unversioned_legacy:
             _set_schema_version(connection, 1)
         _execute_script(connection, ADMIN_AUDIT_SCHEMA)
+        _assert_no_foreign_key_violations(connection)
+        if _payment_notifications_signature(connection) != 4:
+            raise RuntimeError("payment_notifications V3 to V4 migration failed")
         _set_schema_version(connection, SUPPORTED_SCHEMA_VERSION)
 
 
@@ -513,6 +708,197 @@ def _ensure_payment_orders_v3(
         if _payment_orders_signature(connection) == 3:
             return
     raise RuntimeError("payment_orders schema is not a supported V2 or V3 schema")
+
+
+def _ensure_payment_notifications_v4(
+    connection: sqlite3.Connection,
+    *,
+    declared_version: int,
+) -> None:
+    if not _table_exists(connection, "payment_notifications"):
+        _execute_script(connection, PAYMENT_NOTIFICATION_SCHEMA)
+        return
+
+    signature = _payment_notifications_signature(connection)
+    if declared_version == 4:
+        if signature != 4:
+            raise RuntimeError(
+                "payment_notifications schema does not match declared schema version 4"
+            )
+        return
+    if signature == 4:
+        raise RuntimeError(
+            "payment_notifications schema does not match declared schema version"
+        )
+    if signature != 3:
+        raise RuntimeError("payment_notifications schema is not a supported V3 schema")
+
+    _require_safe_v3_payment_notifications(connection)
+    _migrate_payment_notifications_v3_to_v4(connection)
+
+
+def _payment_notifications_signature(connection: sqlite3.Connection) -> int | None:
+    columns = _table_signature(connection, "payment_notifications")
+    indexes = _index_signature(connection, "payment_notifications")
+    foreign_keys = _foreign_key_signature(connection, "payment_notifications")
+    if _table_options(connection, "payment_notifications") != (0, 0):
+        return None
+    if (
+        columns == PAYMENT_NOTIFICATION_V3_COLUMNS
+        and indexes == PAYMENT_NOTIFICATION_V3_INDEXES
+        and not foreign_keys
+        and _table_sql_matches(
+            connection,
+            "payment_notifications",
+            PAYMENT_NOTIFICATION_V3_SCHEMA.split(";")[0].replace(
+                "IF NOT EXISTS ", ""
+            ),
+        )
+    ):
+        return 3
+    if (
+        columns == PAYMENT_NOTIFICATION_V4_COLUMNS
+        and indexes == PAYMENT_NOTIFICATION_V4_INDEXES
+        and foreign_keys
+        == {("payment_orders", "order_id", "order_id", "NO ACTION", "NO ACTION", "NONE")}
+        and _table_sql_matches(
+            connection,
+            "payment_notifications",
+            PAYMENT_NOTIFICATION_V4_TABLE_SQL,
+        )
+    ):
+        return 4
+    return None
+
+
+def _require_safe_v3_payment_notifications(connection: sqlite3.Connection) -> None:
+    unsafe = connection.execute(
+        """
+        SELECT 1
+        FROM payment_notifications
+        WHERE process_status NOT IN ('PROCESSED', 'DUPLICATE', 'ABNORMAL', 'ORPHAN')
+           OR processed_at IS NULL
+           OR worker_id IS NOT NULL
+           OR processing_started_at IS NOT NULL
+           OR lease_expires_at IS NOT NULL
+           OR next_attempt_at IS NOT NULL
+           OR signature_valid NOT IN (0, 1)
+           OR merchant_identity_valid NOT IN (0, 1)
+           OR attempt_count < 0
+           OR (process_status = 'PROCESSED' AND failure_code IS NOT NULL)
+           OR (process_status IN ('ABNORMAL', 'ORPHAN') AND failure_code IS NULL)
+        LIMIT 1
+        """
+    ).fetchone()
+    orphan = connection.execute(
+        """
+        SELECT 1
+        FROM payment_notifications AS notification
+        LEFT JOIN payment_orders AS payment_order
+          ON payment_order.order_id = notification.order_id
+        WHERE notification.order_id IS NOT NULL
+          AND payment_order.order_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if unsafe is not None or orphan is not None:
+        raise RuntimeError(
+            "unsafe V3 payment notification data; manual migration required"
+        )
+
+
+def _assert_no_foreign_key_violations(connection: sqlite3.Connection) -> None:
+    try:
+        violation = connection.execute("PRAGMA foreign_key_check").fetchone()
+    except sqlite3.DatabaseError:
+        raise RuntimeError("DATABASE_FOREIGN_KEY_VIOLATION") from None
+    if violation is not None:
+        raise RuntimeError("DATABASE_FOREIGN_KEY_VIOLATION")
+
+
+def _migrate_payment_notifications_v3_to_v4(
+    connection: sqlite3.Connection,
+) -> None:
+    sequence_row = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'payment_notifications'"
+    ).fetchone()
+    sequence = int(sequence_row["seq"]) if sequence_row is not None else 0
+    _create_payment_notifications_v4_table(connection)
+    _copy_payment_notifications_v3_rows(connection)
+    _drop_payment_notifications_v3_table(connection)
+    _restore_payment_notifications_sequence(connection, sequence)
+    _create_payment_notifications_v4_indexes(connection)
+
+
+def _create_payment_notifications_v4_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "ALTER TABLE payment_notifications RENAME TO payment_notifications_v3"
+    )
+    connection.execute(PAYMENT_NOTIFICATION_V4_TABLE_SQL)
+
+
+def _copy_payment_notifications_v3_rows(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        INSERT INTO payment_notifications (
+            id, provider_notification_id, order_id, out_trade_no, provider,
+            provider_transaction_id, event_type, signature_key_id,
+            signature_valid, payload_digest_sha256, reported_trade_type,
+            reported_trade_state, reported_amount_fen, reported_currency,
+            merchant_identity_valid, process_status, security_error_code,
+            failure_code, provider_created_at, received_at,
+            processing_started_at, lease_expires_at, worker_id, processed_at,
+            attempt_count, next_attempt_at, reported_appid, reported_mchid,
+            reported_success_at, claim_token
+        )
+        SELECT
+            id, provider_notification_id, order_id, out_trade_no, provider,
+            provider_transaction_id, event_type, signature_key_id,
+            signature_valid, payload_digest_sha256, reported_trade_type,
+            reported_trade_state, reported_amount_fen, reported_currency,
+            merchant_identity_valid, process_status, security_error_code,
+            failure_code, provider_created_at, received_at,
+            processing_started_at, lease_expires_at, worker_id, processed_at,
+            attempt_count, next_attempt_at, NULL, NULL, NULL, NULL
+        FROM payment_notifications_v3
+        ORDER BY id
+        """
+    )
+
+
+def _drop_payment_notifications_v3_table(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TABLE payment_notifications_v3")
+
+
+def _restore_payment_notifications_sequence(
+    connection: sqlite3.Connection,
+    sequence: int,
+) -> None:
+    cursor = connection.execute(
+        """
+        UPDATE sqlite_sequence
+        SET seq = CASE WHEN seq < ? THEN ? ELSE seq END
+        WHERE name = 'payment_notifications'
+        """,
+        (sequence, sequence),
+    )
+    if cursor.rowcount == 0:
+        connection.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES ('payment_notifications', ?)",
+            (sequence,),
+        )
+
+
+def _create_payment_notifications_v4_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE INDEX idx_payment_notifications_order "
+        "ON payment_notifications(order_id)"
+    )
+    connection.execute(
+        "CREATE INDEX idx_payment_notifications_process "
+        "ON payment_notifications("
+        "process_status, next_attempt_at, lease_expires_at, id)"
+    )
 
 
 def _payment_orders_signature(connection: sqlite3.Connection) -> int | None:
@@ -684,6 +1070,80 @@ def _schema_version(connection: sqlite3.Connection) -> int:
     return schema_version
 
 
+def _require_exact_versioned_schema(
+    connection: sqlite3.Connection,
+    version: int,
+) -> None:
+    expected = sqlite3.connect(":memory:")
+    expected.row_factory = sqlite3.Row
+    expected.execute("PRAGMA foreign_keys = ON")
+    try:
+        notification_schema = (
+            PAYMENT_NOTIFICATION_V3_SCHEMA
+            if version == 3
+            else PAYMENT_NOTIFICATION_SCHEMA
+        )
+        for script in (
+            CORE_SCHEMA,
+            PAYMENT_ORDER_SCHEMA,
+            notification_schema,
+            LICENSE_GRANT_SCHEMA,
+            ADMIN_AUDIT_SCHEMA,
+            SCHEMA_META_SQL,
+        ):
+            _execute_script(expected, script)
+        if _schema_structure_signature(connection) != _schema_structure_signature(
+            expected
+        ):
+            raise RuntimeError(
+                f"database schema does not match declared schema version {version}"
+            )
+    finally:
+        expected.close()
+
+
+def _schema_structure_signature(connection: sqlite3.Connection) -> tuple[object, ...]:
+    objects = tuple(
+        (
+            str(row["type"]),
+            str(row["name"]),
+            str(row["tbl_name"]),
+            _normalize_sql(str(row["sql"])),
+        )
+        for row in connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index', 'view', 'trigger')
+            ORDER BY type, name
+            """
+        )
+    )
+    tables = sorted(
+        str(row["name"])
+        for row in connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            """
+        )
+    )
+    return (
+        objects,
+        tuple(
+            (
+                table,
+                _table_signature(connection, table),
+                frozenset(_foreign_key_signature(connection, table)),
+                frozenset(_index_signature(connection, table)),
+                _table_options(connection, table),
+            )
+            for table in tables
+        ),
+    )
+
+
 def _set_schema_version(connection: sqlite3.Connection, version: int) -> None:
     connection.execute(
         """
@@ -775,7 +1235,53 @@ def _table_sql_matches(
 
 
 def _normalize_sql(sql: str) -> str:
-    return re.sub(r"\s+", "", sql).casefold()
+    tokens = []
+    index = 0
+    closing_quotes = {"'": "'", '"': '"', "`": "`", "[": "]"}
+    while index < len(sql):
+        character = sql[index]
+        if character.isspace():
+            index += 1
+            continue
+        if sql.startswith("--", index):
+            end = sql.find("\n", index)
+            end = len(sql) if end < 0 else end
+            tokens.append(sql[index:end])
+            index = end
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            end = len(sql) if end < 0 else end + 2
+            tokens.append(sql[index:end])
+            index = end
+            continue
+        if character in closing_quotes:
+            closing = closing_quotes[character]
+            start = index
+            index += 1
+            while index < len(sql):
+                if sql[index] != closing:
+                    index += 1
+                    continue
+                if index + 1 < len(sql) and sql[index + 1] == closing:
+                    index += 2
+                    continue
+                index += 1
+                break
+            tokens.append(sql[start:index])
+            continue
+        if character.isalnum() or character in {"_", "$"}:
+            start = index
+            index += 1
+            while index < len(sql) and (
+                sql[index].isalnum() or sql[index] in {"_", "$"}
+            ):
+                index += 1
+            tokens.append(sql[start:index].casefold())
+            continue
+        tokens.append(character)
+        index += 1
+    return "\x1f".join(tokens)
 
 
 def _foreign_key_signature(
