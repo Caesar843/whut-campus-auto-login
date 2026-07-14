@@ -16,6 +16,7 @@ from license_server.signer import datetime_text
 MAX_ATTEMPTS_FAILURE_CODE = "PAYMENT_NOTIFICATION_MAX_ATTEMPTS_EXCEEDED"
 DUPLICATE_FAILURE_CODE = "PAYMENT_NOTIFICATION_DUPLICATE"
 ORPHAN_FAILURE_CODE = "PAYMENT_NOTIFICATION_ORDER_NOT_FOUND"
+EVIDENCE_MISMATCH_FAILURE_CODE = "PAYMENT_NOTIFICATION_EVIDENCE_MISMATCH"
 
 _ACTIVE_STATUSES = ("RECEIVED", "RETRY", "PROCESSING")
 _FAILURE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
@@ -497,6 +498,75 @@ def retry_delay_seconds(
     return min(retry_max_seconds, retry_base_seconds << shift)
 
 
+def load_claimed_notification_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    notification_id: int,
+    claim_token: str,
+    worker_id: str,
+    now: datetime,
+) -> sqlite3.Row | None:
+    claim_token = _required_text(claim_token)
+    worker_id = _required_text(worker_id)
+    now_text = _datetime_text(now)
+    return connection.execute(
+        """
+        SELECT * FROM payment_notifications
+        WHERE id = ?
+          AND process_status = 'PROCESSING'
+          AND claim_token = ?
+          AND worker_id = ?
+          AND processing_started_at IS NOT NULL
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > ?
+        """,
+        (notification_id, claim_token, worker_id, now_text),
+    ).fetchone()
+
+
+def mark_terminal_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    notification_id: int,
+    claim_token: str,
+    status: str,
+    failure_code: str | None,
+    processed_at: datetime,
+) -> NotificationUpdateResult:
+    claim_token = _required_text(claim_token)
+    if status not in {"PROCESSED", "DUPLICATE", "ABNORMAL", "ORPHAN"}:
+        raise PaymentNotificationRepositoryError(
+            "PAYMENT_NOTIFICATION_TERMINAL_STATUS_INVALID"
+        )
+    if status == "PROCESSED":
+        if failure_code is not None:
+            raise PaymentNotificationRepositoryError(
+                "PAYMENT_NOTIFICATION_TERMINAL_STATUS_INVALID"
+            )
+    else:
+        failure_code = _required_failure_code(str(failure_code or ""))
+    cursor = connection.execute(
+        """
+        UPDATE payment_notifications
+        SET process_status = ?, failure_code = ?, processed_at = ?,
+            worker_id = NULL, claim_token = NULL,
+            processing_started_at = NULL, lease_expires_at = NULL,
+            next_attempt_at = NULL
+        WHERE id = ? AND process_status = 'PROCESSING' AND claim_token = ?
+        """,
+        (
+            status,
+            failure_code,
+            _datetime_text(processed_at),
+            notification_id,
+            claim_token,
+        ),
+    )
+    if cursor.rowcount != 1:
+        return NotificationUpdateResult(UpdateOutcome.LOST_CLAIM, None)
+    return NotificationUpdateResult(UpdateOutcome.UPDATED, status)
+
+
 def _mark_terminal(
     database_path: Path,
     notification_id: int,
@@ -510,26 +580,14 @@ def _mark_terminal(
     processed_text = _datetime_text(processed_at)
 
     def update(connection: sqlite3.Connection) -> NotificationUpdateResult:
-        cursor = connection.execute(
-            """
-            UPDATE payment_notifications
-            SET process_status = ?, failure_code = ?, processed_at = ?,
-                worker_id = NULL, claim_token = NULL,
-                processing_started_at = NULL, lease_expires_at = NULL,
-                next_attempt_at = NULL
-            WHERE id = ? AND process_status = 'PROCESSING' AND claim_token = ?
-            """,
-            (
-                status,
-                failure_code,
-                processed_text,
-                notification_id,
-                claim_token,
-            ),
+        return mark_terminal_in_transaction(
+            connection,
+            notification_id=notification_id,
+            claim_token=claim_token,
+            status=status,
+            failure_code=failure_code,
+            processed_at=_parse_datetime(processed_text),
         )
-        if cursor.rowcount != 1:
-            return NotificationUpdateResult(UpdateOutcome.LOST_CLAIM, None)
-        return NotificationUpdateResult(UpdateOutcome.UPDATED, status)
 
     return _run_write(database_path, update)
 

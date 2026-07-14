@@ -320,7 +320,7 @@ def confirm_paid_order(
 ) -> PaymentConfirmationResult:
     return _payment_transaction(
         database_path,
-        lambda connection: _confirm_paid_order(
+        lambda connection: _confirm_paid_order_in_transaction(
             connection,
             evidence,
             notification_id=notification_id,
@@ -492,7 +492,7 @@ def _apply_provider_query_result(
                 """,
                 (query.out_trade_no, query.trade_state, datetime_text(now), order_id),
             )
-            _confirm_paid_order(
+            _confirm_paid_order_in_transaction(
                 connection,
                 PaymentEvidence(
                     source=PaymentEvidenceSource.WECHAT_QUERY,
@@ -618,7 +618,7 @@ def _record_retryable_gateway_error(
         )
 
 
-def _confirm_paid_order(
+def _confirm_paid_order_in_transaction(
     connection,
     evidence: PaymentEvidence,
     *,
@@ -748,6 +748,99 @@ def _confirm_paid_order(
     )
 
 
+def _order_product_error(order) -> str | None:
+    try:
+        product = get_product(str(order["product_code"]))
+        amount_fen = int(order["amount_fen"])
+    except (PaymentDomainError, TypeError, ValueError):
+        return "product_mismatch"
+    if amount_fen != product.amount_fen:
+        return "product_amount_mismatch"
+    if str(order["currency"]) != product.currency:
+        return "product_currency_mismatch"
+    if product.duration_days != PAID_LICENSE_DAYS:
+        return "product_duration_mismatch"
+    return None
+
+
+def _committed_payment_chain_is_valid_in_transaction(
+    connection,
+    order,
+    *,
+    expected_issued_by: str | None = None,
+) -> bool:
+    if (
+        str(order["status"]) != OrderStatus.PAID.value
+        or order["open_slot"] is not None
+        or _order_product_error(order) is not None
+    ):
+        return False
+    grant = connection.execute(
+        "SELECT * FROM license_grants WHERE source_order_id = ?",
+        (str(order["order_id"]),),
+    ).fetchone()
+    if grant is None:
+        return False
+    license_row = connection.execute(
+        "SELECT licenses.*, "
+        "devices.device_fingerprint_hash AS license_device_fingerprint_hash "
+        "FROM licenses JOIN devices ON devices.id = licenses.device_id "
+        "WHERE licenses.id = ?",
+        (int(grant["license_id"]),),
+    ).fetchone()
+    if license_row is None:
+        return False
+    try:
+        grant_days = int(grant["grant_days"])
+        granted_at = _parse_utc(str(grant["granted_at"] or ""))
+        new_expires_at = _parse_utc(str(grant["new_expire_at"] or ""))
+        previous_expires_at = (
+            _parse_utc(str(grant["previous_expire_at"]))
+            if grant["previous_expire_at"] is not None
+            else None
+        )
+        license_starts_at = _parse_utc(str(license_row["starts_at"] or ""))
+        license_expires_at = _parse_utc(str(license_row["expires_at"] or ""))
+    except (TypeError, ValueError):
+        return False
+    if (
+        grant_days != PAID_LICENSE_DAYS
+        or granted_at is None
+        or new_expires_at is None
+        or license_starts_at is None
+        or license_expires_at is None
+        or (
+            grant["previous_expire_at"] is not None
+            and previous_expires_at is None
+        )
+    ):
+        return False
+    base = (
+        max(granted_at, previous_expires_at)
+        if previous_expires_at is not None
+        else granted_at
+    )
+    return bool(
+        new_expires_at == base + timedelta(days=PAID_LICENSE_DAYS)
+        and license_starts_at == granted_at
+        and license_expires_at == new_expires_at
+        and str(grant["source_order_id"]) == str(order["order_id"])
+        and str(grant["device_fingerprint_hash"])
+        == str(order["device_fingerprint_hash"])
+        and str(grant["product_code"]) == str(order["product_code"])
+        and (
+            expected_issued_by is None
+            or str(grant["issued_by"]) == expected_issued_by
+        )
+        and str(license_row["license_device_fingerprint_hash"])
+        == str(grant["device_fingerprint_hash"])
+        and str(license_row["license_type"]) == "paid"
+        and str(license_row["status"]) == "active"
+        and str(license_row["source"]) == "payment"
+        and str(license_row["order_id"] or "") == str(grant["source_order_id"])
+    )
+
+
 def _validate_evidence(connection, order, evidence: PaymentEvidence, *, now: datetime) -> None:
     code = _evidence_error(connection, order, evidence, now=now)
     if code is None:
@@ -771,20 +864,18 @@ def _evidence_error(connection, order, evidence: PaymentEvidence, *, now: dateti
             return "invalid_expires_at"
         if expires_at <= now:
             return "payment_order_expired"
-    if status == OrderStatus.CREATED.value:
+    if (
+        status == OrderStatus.CREATED.value
+        and evidence.source != PaymentEvidenceSource.WECHAT_CALLBACK
+    ):
         return "order_not_waiting_payment"
     if status == OrderStatus.PAID.value:
         existing_txn = str(order["provider_transaction_id"] or "")
         if existing_txn and existing_txn != evidence.provider_transaction_id:
             return "provider_transaction_conflict"
-    try:
-        product = get_product(str(order["product_code"]))
-    except PaymentDomainError:
-        return "product_mismatch"
-    if int(order["amount_fen"]) != product.amount_fen:
-        return "product_amount_mismatch"
-    if str(order["currency"]) != product.currency:
-        return "product_currency_mismatch"
+    product_error = _order_product_error(order)
+    if product_error is not None:
+        return product_error
     if _provider_for(evidence.source) != str(order["provider"]):
         return "provider_mismatch"
     if evidence.amount_fen != int(order["amount_fen"]):
