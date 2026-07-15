@@ -65,7 +65,7 @@ def test_exact_empty_production_legacy_schema_upgrades_idempotently(tmp_path):
         tables = _tables(connection)
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "4"
+        ).fetchone()[0] == "5"
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert _columns(connection, "payment_orders") == [
@@ -100,6 +100,7 @@ def test_exact_empty_production_legacy_schema_upgrades_idempotently(tmp_path):
         "licenses",
         "payment_orders",
         "payment_notifications",
+        "payment_reconciliations",
         "license_grants",
         "admin_audit_logs",
         "schema_meta",
@@ -121,7 +122,7 @@ def test_legacy_autoincrement_accepts_keyword_case_and_whitespace(tmp_path):
     with connect(database_path) as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "4"
+        ).fetchone()[0] == "5"
 
 
 @pytest.mark.parametrize(

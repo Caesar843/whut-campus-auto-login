@@ -478,7 +478,7 @@ def test_initialize_database_removes_legacy_sensitive_columns(tmp_path):
     assert device == ("device-a",)
 
 
-def test_initialize_database_removes_legacy_license_revoked_reason(tmp_path):
+def test_invalid_v1_orphan_license_fails_closed_without_changes(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     with sqlite3.connect(database_path) as connection:
         connection.execute(
@@ -522,19 +522,27 @@ def test_initialize_database_removes_legacy_license_revoked_reason(tmp_path):
                 "legacy reason",
             ),
         )
+    with sqlite3.connect(database_path) as connection:
+        before_schema = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        before_licenses = connection.execute("SELECT * FROM licenses").fetchall()
 
-    initialize_database(database_path)
+    with pytest.raises(RuntimeError) as exc_info:
+        initialize_database(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(licenses)").fetchall()
-        }
-        license_row = connection.execute(
-            "SELECT license_type, status FROM licenses"
-        ).fetchone()
-    assert "revoked_reason" not in columns
-    assert license_row == ("trial", "active")
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "1"
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'devices'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall() == before_schema
+        assert connection.execute("SELECT * FROM licenses").fetchall() == before_licenses
+    assert str(exc_info.value) == "database schema does not match declared schema version 5"
 
 
 def test_register_device_ignores_device_description_fields(tmp_path):

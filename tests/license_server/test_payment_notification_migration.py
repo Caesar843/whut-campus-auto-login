@@ -44,13 +44,13 @@ ON payment_notifications(process_status, next_attempt_at);
 """
 
 
-def test_new_database_creates_schema_v4_with_notification_constraints(tmp_path):
+def test_new_database_creates_latest_schema_with_notification_constraints(tmp_path):
     database_path = tmp_path / "license.sqlite3"
 
     initialize_database(database_path)
 
     with connect(database_path) as connection:
-        assert _schema_version(connection) == 4
+        assert _schema_version(connection) == 5
         assert [row[1] for row in connection.execute(
             "PRAGMA table_xinfo(payment_notifications)"
         )] == [
@@ -357,7 +357,7 @@ def test_v3_core_foreign_key_violation_blocks_without_changes_and_can_recover(
     initialize_database(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        assert _schema_version(connection) == 4
+        assert _schema_version(connection) == 5
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 

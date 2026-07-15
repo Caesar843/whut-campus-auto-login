@@ -37,7 +37,7 @@ def test_empty_database_initializes_admin_audit_latest_schema_and_indexes(tmp_pa
             for row in connection.execute("PRAGMA index_list(admin_audit_logs)").fetchall()
         }
 
-    assert version == "4"
+    assert version == "5"
     assert columns == {
         "id",
         "actor",
@@ -81,19 +81,43 @@ def test_admin_audit_result_check_constraint_rejects_invalid_value(tmp_path):
 def test_v1_database_upgrades_to_latest_without_losing_existing_rows(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     _create_v1_database_with_rows(database_path)
+    with sqlite3.connect(database_path) as connection:
+        objects = {
+            (row[0], row[1])
+            for row in connection.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%'"
+            )
+        }
+    assert objects == {
+        ("table", "devices"),
+        ("table", "licenses"),
+        ("table", "payment_orders"),
+        ("table", "payment_notifications"),
+        ("table", "license_grants"),
+        ("table", "schema_meta"),
+        ("index", "idx_payment_orders_device_open_slot"),
+        ("index", "idx_payment_orders_status"),
+        ("index", "idx_payment_notifications_order"),
+        ("index", "idx_payment_notifications_process"),
+        ("index", "idx_license_grants_device"),
+    }
 
     initialize_database(database_path)
 
     with connect(database_path) as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "4"
+        ).fetchone()[0] == "5"
         assert connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM licenses").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM payment_orders").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM payment_notifications").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM admin_audit_logs").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM payment_reconciliations"
+        ).fetchone()[0] == 0
 
 
 def test_admin_audit_schema_setup_rolls_back_with_the_rest_of_initialization(tmp_path, monkeypatch):
@@ -457,13 +481,24 @@ def _entry(**overrides):
 
 
 def _create_v1_database_with_rows(database_path):
-    initialize_database(database_path)
-    with connect(database_path) as connection:
-        connection.execute("DROP TABLE IF EXISTS admin_audit_logs")
-        connection.execute("DROP TABLE payment_notifications")
-        connection.executescript(db.PAYMENT_NOTIFICATION_V3_SCHEMA)
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            "\n".join(
+                (
+                    db.CORE_SCHEMA,
+                    db.PAYMENT_ORDER_V2_TABLE_SQL + ";",
+                    "CREATE UNIQUE INDEX idx_payment_orders_device_open_slot "
+                    "ON payment_orders(device_fingerprint_hash, open_slot);",
+                    "CREATE INDEX idx_payment_orders_status "
+                    "ON payment_orders(status, expires_at);",
+                    db.PAYMENT_NOTIFICATION_V3_SCHEMA,
+                    db.LICENSE_GRANT_SCHEMA,
+                    db.SCHEMA_META_SQL,
+                )
+            )
+        )
         connection.execute(
-            "UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'"
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')"
         )
         connection.execute(
             """

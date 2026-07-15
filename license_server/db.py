@@ -8,7 +8,7 @@ from pathlib import Path
 from license_server.payment import ANNUAL_V1, OrderStatus
 
 
-SUPPORTED_SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSION = 5
 BUSY_TIMEOUT_MS = 5000
 
 LEGACY_REMOVED_DEVICE_COLUMNS = (
@@ -526,6 +526,132 @@ PAYMENT_NOTIFICATION_V4_INDEXES = {
     ),
 }
 
+PAYMENT_RECONCILIATION_V5_TABLE_SQL = """
+CREATE TABLE payment_reconciliations (
+    order_id TEXT PRIMARY KEY NOT NULL,
+    reconcile_status TEXT NOT NULL
+        CHECK(reconcile_status IN ('READY', 'CLAIMED', 'TERMINAL')),
+    last_query_at TEXT,
+    next_attempt_at TEXT,
+    query_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK(query_attempt_count >= 0),
+    last_close_at TEXT,
+    close_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK(close_attempt_count >= 0),
+    trusted_trade_state TEXT CHECK(
+        trusted_trade_state IS NULL OR trusted_trade_state IN (
+            'SUCCESS', 'NOTPAY', 'CLOSED', 'REFUND', 'REVOKED',
+            'USERPAYING', 'PAYERROR', 'UNKNOWN'
+        )
+    ),
+    last_error_code TEXT,
+    terminal_reason TEXT,
+    terminal_at TEXT,
+    claim_token TEXT,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    lease_expires_at TEXT,
+    updated_at TEXT NOT NULL,
+    state_version INTEGER NOT NULL DEFAULT 0 CHECK(state_version >= 0),
+    CHECK(
+        (
+            reconcile_status = 'READY'
+            AND next_attempt_at IS NOT NULL
+            AND claim_token IS NULL
+            AND claimed_by IS NULL
+            AND claimed_at IS NULL
+            AND lease_expires_at IS NULL
+            AND terminal_reason IS NULL
+            AND terminal_at IS NULL
+        ) OR (
+            reconcile_status = 'CLAIMED'
+            AND next_attempt_at IS NULL
+            AND claim_token IS NOT NULL
+            AND claimed_by IS NOT NULL
+            AND claimed_at IS NOT NULL
+            AND lease_expires_at IS NOT NULL
+            AND terminal_reason IS NULL
+            AND terminal_at IS NULL
+            AND lease_expires_at > claimed_at
+        ) OR (
+            reconcile_status = 'TERMINAL'
+            AND next_attempt_at IS NULL
+            AND claim_token IS NULL
+            AND claimed_by IS NULL
+            AND claimed_at IS NULL
+            AND lease_expires_at IS NULL
+            AND terminal_reason IS NOT NULL
+            AND terminal_at IS NOT NULL
+        )
+    ),
+    FOREIGN KEY (order_id) REFERENCES payment_orders(order_id)
+)
+"""
+
+PAYMENT_RECONCILIATION_V5_CLAIM_INDEX_SQL = """
+CREATE UNIQUE INDEX idx_payment_reconciliations_claim_token
+ON payment_reconciliations(claim_token)
+WHERE claim_token IS NOT NULL
+"""
+
+PAYMENT_RECONCILIATION_V5_CANDIDATE_INDEX_SQL = """
+CREATE INDEX idx_payment_reconciliations_candidate
+ON payment_reconciliations(
+    reconcile_status, next_attempt_at, lease_expires_at, order_id
+)
+"""
+
+PAYMENT_RECONCILIATION_SCHEMA = ";".join(
+    (
+        PAYMENT_RECONCILIATION_V5_TABLE_SQL,
+        PAYMENT_RECONCILIATION_V5_CLAIM_INDEX_SQL,
+        PAYMENT_RECONCILIATION_V5_CANDIDATE_INDEX_SQL,
+    )
+)
+
+PAYMENT_RECONCILIATION_V5_COLUMNS = (
+    ("order_id", "TEXT", 1, None, 1, 0),
+    ("reconcile_status", "TEXT", 1, None, 0, 0),
+    ("last_query_at", "TEXT", 0, None, 0, 0),
+    ("next_attempt_at", "TEXT", 0, None, 0, 0),
+    ("query_attempt_count", "INTEGER", 1, "0", 0, 0),
+    ("last_close_at", "TEXT", 0, None, 0, 0),
+    ("close_attempt_count", "INTEGER", 1, "0", 0, 0),
+    ("trusted_trade_state", "TEXT", 0, None, 0, 0),
+    ("last_error_code", "TEXT", 0, None, 0, 0),
+    ("terminal_reason", "TEXT", 0, None, 0, 0),
+    ("terminal_at", "TEXT", 0, None, 0, 0),
+    ("claim_token", "TEXT", 0, None, 0, 0),
+    ("claimed_by", "TEXT", 0, None, 0, 0),
+    ("claimed_at", "TEXT", 0, None, 0, 0),
+    ("lease_expires_at", "TEXT", 0, None, 0, 0),
+    ("updated_at", "TEXT", 1, None, 0, 0),
+    ("state_version", "INTEGER", 1, "0", 0, 0),
+)
+
+PAYMENT_RECONCILIATION_V5_INDEXES = {
+    (None, 1, "pk", 0, (("order_id", 0, "BINARY"),)),
+    (
+        "idx_payment_reconciliations_claim_token",
+        1,
+        "c",
+        1,
+        (("claim_token", 0, "BINARY"),),
+    ),
+    (
+        "idx_payment_reconciliations_candidate",
+        0,
+        "c",
+        0,
+        (
+            ("reconcile_status", 0, "BINARY"),
+            ("next_attempt_at", 0, "BINARY"),
+            ("lease_expires_at", 0, "BINARY"),
+            ("order_id", 0, "BINARY"),
+        ),
+    ),
+}
+
 LICENSE_GRANT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS license_grants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -618,6 +744,11 @@ def initialize_database(database_path: Path) -> None:
         elif schema_version == 4:
             _require_exact_versioned_schema(connection, 4)
             _assert_no_foreign_key_violations(connection)
+            _migrate_schema_v4_to_v5(connection)
+            return
+        elif schema_version == 5:
+            _require_exact_versioned_schema(connection, 5)
+            _assert_no_foreign_key_violations(connection)
             return
         elif schema_version > 0:
             _assert_no_foreign_key_violations(connection)
@@ -638,7 +769,65 @@ def initialize_database(database_path: Path) -> None:
         _assert_no_foreign_key_violations(connection)
         if _payment_notifications_signature(connection) != 4:
             raise RuntimeError("payment_notifications V3 to V4 migration failed")
+        if schema_version in (2, 3) or unversioned_legacy:
+            _set_schema_version(connection, 4)
+            _require_exact_versioned_schema(connection, 4)
+        _create_payment_reconciliations_v5_table(connection)
+        _create_payment_reconciliations_v5_indexes(connection)
         _set_schema_version(connection, SUPPORTED_SCHEMA_VERSION)
+        _require_exact_versioned_schema(connection, 5)
+        _assert_no_foreign_key_violations(connection)
+
+
+def _migrate_schema_v4_to_v5(connection: sqlite3.Connection) -> None:
+    _create_payment_reconciliations_v5_table(connection)
+    _create_payment_reconciliations_v5_indexes(connection)
+    _set_schema_version(connection, 5)
+    _require_exact_versioned_schema(connection, 5)
+    _assert_no_foreign_key_violations(connection)
+
+
+def _create_payment_reconciliations_v5_table(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(PAYMENT_RECONCILIATION_V5_TABLE_SQL)
+
+
+def _create_payment_reconciliations_v5_indexes(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(PAYMENT_RECONCILIATION_V5_CLAIM_INDEX_SQL)
+    connection.execute(PAYMENT_RECONCILIATION_V5_CANDIDATE_INDEX_SQL)
+
+
+def _payment_reconciliations_signature(
+    connection: sqlite3.Connection,
+) -> int | None:
+    if (
+        _table_signature(connection, "payment_reconciliations")
+        != PAYMENT_RECONCILIATION_V5_COLUMNS
+        or _index_signature(connection, "payment_reconciliations")
+        != PAYMENT_RECONCILIATION_V5_INDEXES
+        or _foreign_key_signature(connection, "payment_reconciliations")
+        != {
+            (
+                "payment_orders",
+                "order_id",
+                "order_id",
+                "NO ACTION",
+                "NO ACTION",
+                "NONE",
+            )
+        }
+        or _table_options(connection, "payment_reconciliations") != (0, 0)
+        or not _table_sql_matches(
+            connection,
+            "payment_reconciliations",
+            PAYMENT_RECONCILIATION_V5_TABLE_SQL,
+        )
+    ):
+        return None
+    return 5
 
 
 def _require_exact_empty_legacy_database(connection: sqlite3.Connection) -> None:
@@ -1083,14 +1272,17 @@ def _require_exact_versioned_schema(
             if version == 3
             else PAYMENT_NOTIFICATION_SCHEMA
         )
-        for script in (
+        scripts = [
             CORE_SCHEMA,
             PAYMENT_ORDER_SCHEMA,
             notification_schema,
             LICENSE_GRANT_SCHEMA,
             ADMIN_AUDIT_SCHEMA,
             SCHEMA_META_SQL,
-        ):
+        ]
+        if version == 5:
+            scripts.append(PAYMENT_RECONCILIATION_SCHEMA)
+        for script in scripts:
             _execute_script(expected, script)
         if _schema_structure_signature(connection) != _schema_structure_signature(
             expected
