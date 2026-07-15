@@ -45,4 +45,10 @@ def test_mock_gateway_implements_typed_create_query_and_close():
     assert created.code_url == "mock://whut-payment/pay_test"
     assert queried.outcome is QueryOrderOutcome.UNPAID
     assert queried.out_trade_no == "pay_test"
+    assert queried.transaction_id is None
+    assert queried.success_time is None
+    assert queried.amount_total is None
+    assert queried.currency is None
+    assert queried.appid is None
+    assert queried.mchid is None
     assert closed.outcome is CloseOrderOutcome.SUCCESS

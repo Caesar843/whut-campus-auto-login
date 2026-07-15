@@ -11,9 +11,16 @@ MOCK_MCH_ID = "mock-mch"
 
 
 class QueryOrderOutcome(str, Enum):
-    PAID = "PAID"
-    UNPAID = "UNPAID"
+    SUCCESS = "SUCCESS"
+    PAID = "SUCCESS"
+    NOTPAY = "NOTPAY"
+    UNPAID = "NOTPAY"
     CLOSED = "CLOSED"
+    REFUND = "REFUND"
+    REVOKED = "REVOKED"
+    USERPAYING = "USERPAYING"
+    PAYERROR = "PAYERROR"
+    UNKNOWN = "UNKNOWN"
     NOT_FOUND = "NOT_FOUND"
     UNCLEAR = "UNCLEAR"
     SIGNATURE_INVALID = "SIGNATURE_INVALID"
@@ -21,9 +28,9 @@ class QueryOrderOutcome(str, Enum):
 
 
 class CloseOrderOutcome(str, Enum):
-    SUCCESS = "SUCCESS"
-    PAID = "PAID"
     CLOSED = "CLOSED"
+    SUCCESS = "CLOSED"
+    PAID = "PAID"
     NOT_FOUND = "NOT_FOUND"
     REJECTED = "REJECTED"
     UNKNOWN = "UNKNOWN"
@@ -125,11 +132,6 @@ class MockPaymentGateway:
             outcome=QueryOrderOutcome.UNPAID,
             out_trade_no=order_id,
             trade_state="NOTPAY",
-            trade_type="NATIVE",
-            amount_total=990,
-            currency="CNY",
-            appid=MOCK_APP_ID,
-            mchid=MOCK_MCH_ID,
         )
 
     def close_order(self, order_id: str) -> CloseOrderResult:

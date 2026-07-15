@@ -32,6 +32,7 @@ from license_server.payment_gateway import (
 
 
 DEFAULT_NOTIFICATION_TOLERANCE_SECONDS = 300
+DEFAULT_RESPONSE_TOLERANCE_SECONDS = 300
 _MAX_NOTIFICATION_TIMESTAMP_DIGITS = 20
 _SQLITE_INT64_MAX = (1 << 63) - 1
 WECHAT_API_BASE_URL = "https://api.mch.weixin.qq.com"
@@ -46,10 +47,17 @@ SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
 class WechatPaymentError(RuntimeError):
-    def __init__(self, code: str, *, result_unknown: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        result_unknown: bool = False,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.result_unknown = result_unknown
+        self.retryable = retryable
 
 
 class WeChatNativePaymentGateway:
@@ -95,7 +103,11 @@ class WeChatNativePaymentGateway:
                 raise WechatPaymentError("PAYMENT_RESPONSE_INVALID")
         except WechatPaymentError as exc:
             if not exc.result_unknown and exc.code.startswith("PAYMENT_RESPONSE_"):
-                raise WechatPaymentError(exc.code, result_unknown=True) from exc
+                raise WechatPaymentError(
+                    exc.code,
+                    result_unknown=True,
+                    retryable=exc.retryable,
+                ) from exc
             raise
         return GatewayOrder(
             code_url=code_url,
@@ -107,75 +119,64 @@ class WeChatNativePaymentGateway:
     def query_order(self, order_id: str) -> QueryOrderResult:
         path = f"/v3/pay/transactions/out-trade-no/{quote(order_id, safe='')}"
         canonical_url = f"{path}?{urlencode({'mchid': self._config.mch_id})}"
-        try:
-            response = self._send("GET", canonical_url)
-        except WechatPaymentError as exc:
-            outcome = (
-                QueryOrderOutcome.SIGNATURE_INVALID
-                if exc.code.startswith("PAYMENT_RESPONSE_")
-                else QueryOrderOutcome.HTTP_UNKNOWN
-            )
-            return QueryOrderResult(outcome=outcome, out_trade_no=order_id)
-        if response.status_code == 404:
-            body = _optional_json_object(response.content)
-            outcome = (
-                QueryOrderOutcome.NOT_FOUND
-                if body.get("code") == "ORDER_NOT_EXIST"
-                else QueryOrderOutcome.UNCLEAR
-            )
-            return QueryOrderResult(
-                outcome=outcome,
-                out_trade_no=order_id,
-                request_id=_request_id(response),
-            )
-        if response.status_code >= 500:
-            return QueryOrderResult(
-                outcome=QueryOrderOutcome.HTTP_UNKNOWN,
-                out_trade_no=order_id,
-                request_id=_request_id(response),
-            )
+        response = self._send("GET", canonical_url)
         if response.status_code != 200:
-            return QueryOrderResult(
-                outcome=QueryOrderOutcome.UNCLEAR,
-                out_trade_no=order_id,
-                request_id=_request_id(response),
-            )
+            raise _upstream_response_error(response.status_code)
         try:
             body = _json_object(response.content)
+            returned_order_id = _required_text(body, "out_trade_no")
+            trade_state = _required_text(body, "trade_state")
+            if returned_order_id != order_id:
+                raise ValueError
+            outcomes = {
+                "SUCCESS": QueryOrderOutcome.SUCCESS,
+                "NOTPAY": QueryOrderOutcome.NOTPAY,
+                "CLOSED": QueryOrderOutcome.CLOSED,
+                "REFUND": QueryOrderOutcome.REFUND,
+                "REVOKED": QueryOrderOutcome.REVOKED,
+                "USERPAYING": QueryOrderOutcome.USERPAYING,
+                "PAYERROR": QueryOrderOutcome.PAYERROR,
+            }
+            outcome = outcomes.get(trade_state, QueryOrderOutcome.UNKNOWN)
+            safe_trade_state = (
+                trade_state if outcome is not QueryOrderOutcome.UNKNOWN else "UNKNOWN"
+            )
+            if outcome not in {QueryOrderOutcome.SUCCESS, QueryOrderOutcome.CLOSED}:
+                return QueryOrderResult(
+                    outcome=outcome,
+                    out_trade_no=returned_order_id,
+                    trade_state=safe_trade_state,
+                    request_id=_request_id(response),
+                )
             amount = body["amount"]
             if not isinstance(amount, dict):
                 raise ValueError
             appid = _required_text(body, "appid")
             mchid = _required_text(body, "mchid")
-            returned_order_id = _required_text(body, "out_trade_no")
-            trade_state = _required_text(body, "trade_state")
             trade_type = _required_text(body, "trade_type")
             amount_total = amount["total"]
             if not isinstance(amount_total, int) or isinstance(amount_total, bool):
                 raise ValueError
             currency = _required_text(amount, "currency")
-            transaction_id = _optional_text(body, "transaction_id")
-            success_time_text = _optional_text(body, "success_time")
-            success_time = _parse_datetime(success_time_text) if success_time_text else None
-            if trade_state == "SUCCESS" and (not transaction_id or not success_time):
-                raise ValueError
-        except (KeyError, TypeError, ValueError, WechatPaymentError):
-            return QueryOrderResult(
-                outcome=QueryOrderOutcome.UNCLEAR,
-                out_trade_no=order_id,
-                request_id=_request_id(response),
-            )
-        outcomes = {
-            "SUCCESS": QueryOrderOutcome.PAID,
-            "NOTPAY": QueryOrderOutcome.UNPAID,
-            "USERPAYING": QueryOrderOutcome.UNPAID,
-            "CLOSED": QueryOrderOutcome.CLOSED,
-        }
+            transaction_id = None
+            success_time = None
+            if outcome is QueryOrderOutcome.SUCCESS:
+                transaction_id = _optional_text(body, "transaction_id")
+                success_time_text = _optional_text(body, "success_time")
+                success_time = (
+                    _parse_datetime(success_time_text) if success_time_text else None
+                )
+                if not transaction_id or success_time is None:
+                    raise ValueError
+        except WechatPaymentError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WechatPaymentError("PAYMENT_RESPONSE_INVALID") from exc
         return QueryOrderResult(
-            outcome=outcomes.get(trade_state, QueryOrderOutcome.UNCLEAR),
+            outcome=outcome,
             out_trade_no=returned_order_id,
             transaction_id=transaction_id,
-            trade_state=trade_state,
+            trade_state=safe_trade_state,
             trade_type=trade_type,
             amount_total=amount_total,
             currency=currency,
@@ -187,27 +188,20 @@ class WeChatNativePaymentGateway:
 
     def close_order(self, order_id: str) -> CloseOrderResult:
         path = f"/v3/pay/transactions/out-trade-no/{quote(order_id, safe='')}/close"
-        try:
-            response = self._send("POST", path, {"mchid": self._config.mch_id})
-        except WechatPaymentError:
-            return CloseOrderResult(outcome=CloseOrderOutcome.UNKNOWN)
+        response = self._send("POST", path, {"mchid": self._config.mch_id})
         request_id = _request_id(response)
         if response.status_code == 204:
-            return CloseOrderResult(CloseOrderOutcome.SUCCESS, request_id)
-        body = _optional_json_object(response.content)
-        code = body.get("code")
-        outcomes = {
-            "SUCCESS": CloseOrderOutcome.SUCCESS,
-            "ORDER_PAID": CloseOrderOutcome.PAID,
-            "ORDER_ALREADY_PAID": CloseOrderOutcome.PAID,
-            "ORDER_CLOSED": CloseOrderOutcome.CLOSED,
-            "ORDER_NOT_EXIST": CloseOrderOutcome.NOT_FOUND,
-        }
-        if code in outcomes:
-            return CloseOrderResult(outcomes[code], request_id)
-        if 400 <= response.status_code < 500:
-            return CloseOrderResult(CloseOrderOutcome.REJECTED, request_id)
-        return CloseOrderResult(CloseOrderOutcome.UNKNOWN, request_id)
+            return CloseOrderResult(CloseOrderOutcome.CLOSED, request_id)
+        if response.status_code != 200:
+            raise _upstream_response_error(response.status_code)
+        body = _json_object(response.content)
+        code = _required_text(body, "code")
+        return CloseOrderResult(
+            CloseOrderOutcome.CLOSED
+            if code == "SUCCESS"
+            else CloseOrderOutcome.UNKNOWN,
+            request_id,
+        )
 
     def parse_and_verify_notification(
         self,
@@ -261,16 +255,42 @@ class WeChatNativePaymentGateway:
             raise WechatPaymentError(
                 "PAYMENT_CONNECT_TIMEOUT",
                 result_unknown=True,
+                retryable=True,
             ) from exc
-        except (httpx.PoolTimeout, httpx.ConnectError) as exc:
-            raise WechatPaymentError("PAYMENT_REQUEST_NOT_SENT") from exc
-        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.TransportError) as exc:
-            raise WechatPaymentError("PAYMENT_RESULT_UNKNOWN", result_unknown=True) from exc
+        except httpx.PoolTimeout as exc:
+            raise WechatPaymentError(
+                "PAYMENT_REQUEST_NOT_SENT",
+                retryable=True,
+            ) from exc
+        except httpx.ConnectError as exc:
+            raise WechatPaymentError(
+                "PAYMENT_NETWORK_UNAVAILABLE",
+                retryable=True,
+            ) from exc
+        except httpx.ReadTimeout as exc:
+            raise WechatPaymentError(
+                "PAYMENT_READ_TIMEOUT",
+                result_unknown=True,
+                retryable=True,
+            ) from exc
+        except httpx.WriteTimeout as exc:
+            raise WechatPaymentError(
+                "PAYMENT_WRITE_TIMEOUT",
+                result_unknown=True,
+                retryable=True,
+            ) from exc
+        except httpx.TransportError as exc:
+            raise WechatPaymentError(
+                "PAYMENT_TRANSPORT_ERROR",
+                result_unknown=True,
+                retryable=True,
+            ) from exc
         verify_response_signature(
             response.headers,
             response.content,
             public_key_id=self._config.public_key_id,
             public_key=self._public_key,
+            now=self._clock(),
         )
         return response
 
@@ -320,6 +340,8 @@ def verify_response_signature(
     *,
     public_key_id: str,
     public_key: rsa.RSAPublicKey,
+    now: datetime | None = None,
+    tolerance_seconds: int = DEFAULT_RESPONSE_TOLERANCE_SECONDS,
 ) -> None:
     normalized = {str(name).lower(): str(value) for name, value in headers.items()}
     required = (
@@ -332,6 +354,20 @@ def verify_response_signature(
         raise WechatPaymentError("PAYMENT_RESPONSE_SIGNATURE_MISSING")
     if normalized["wechatpay-serial"] != public_key_id:
         raise WechatPaymentError("PAYMENT_RESPONSE_KEY_ID_MISMATCH")
+    if now is not None:
+        timestamp_text = normalized["wechatpay-timestamp"]
+        try:
+            if (
+                not timestamp_text.isascii()
+                or not timestamp_text.isdecimal()
+                or len(timestamp_text) > _MAX_NOTIFICATION_TIMESTAMP_DIGITS
+            ):
+                raise ValueError
+            timestamp = int(timestamp_text)
+            if abs(int(_utc(now).timestamp()) - timestamp) > tolerance_seconds:
+                raise ValueError
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise WechatPaymentError("PAYMENT_RESPONSE_TIMESTAMP_INVALID") from exc
     try:
         signature = base64.b64decode(
             normalized["wechatpay-signature"],
@@ -353,6 +389,16 @@ def verify_response_signature(
         )
     except (binascii.Error, InvalidSignature, ValueError) as exc:
         raise WechatPaymentError("PAYMENT_RESPONSE_SIGNATURE_INVALID") from exc
+
+
+def _upstream_response_error(status_code: int) -> WechatPaymentError:
+    if status_code >= 500:
+        return WechatPaymentError(
+            "PAYMENT_UPSTREAM_UNAVAILABLE",
+            result_unknown=True,
+            retryable=True,
+        )
+    return WechatPaymentError("PAYMENT_UPSTREAM_REJECTED")
 
 
 def decrypt_notification_resource(
@@ -517,15 +563,6 @@ def _json_object(body: bytes) -> dict[str, object]:
     if not isinstance(value, dict):
         raise WechatPaymentError("PAYMENT_RESPONSE_INVALID")
     return value
-
-
-def _optional_json_object(body: bytes) -> dict[str, object]:
-    if not body:
-        return {}
-    try:
-        return _json_object(body)
-    except WechatPaymentError:
-        return {}
 
 
 def _optional_text(values: Mapping[str, object], key: str) -> str | None:
