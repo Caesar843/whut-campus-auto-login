@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from uuid import uuid4
 
@@ -26,6 +27,7 @@ from license_server.payment_gateway import (
     QueryOrderResult,
     mock_code_url,
 )
+from license_server.payment_reconciliation_repository import ensure_ready
 from license_server.signer import datetime_text
 from license_server.wechat_payment import WechatPaymentError
 
@@ -65,6 +67,27 @@ class PaymentConfirmationResult:
     idempotent: bool
 
 
+class TrustedOrderUpdateOutcome(str, Enum):
+    UPDATED = "UPDATED"
+    ALREADY_PAID = "ALREADY_PAID"
+    ALREADY_CLOSED = "ALREADY_CLOSED"
+    NOT_FOUND = "NOT_FOUND"
+    NOT_ELIGIBLE = "NOT_ELIGIBLE"
+    PAYMENT_FACT_PRESENT = "PAYMENT_FACT_PRESENT"
+    LOST_CLAIM = "LOST_CLAIM"
+
+
+@dataclass(frozen=True)
+class ReconciliationOrderSnapshot:
+    order_id: str
+    status: str
+    product_code: str
+    amount_fen: int
+    currency: str
+    provider: str
+    expires_at: datetime
+
+
 def create_or_restore_order(
     database_path: Path,
     *,
@@ -84,6 +107,11 @@ def create_or_restore_order(
     if provider not in {"mock", "wechat_native"}:
         raise PaymentServiceError("payment_provider_not_supported", status_code=503)
     now = _utc(now)
+    _close_expired_open_orders(
+        database_path,
+        device_fingerprint_hash=device_fingerprint_hash,
+        now=now,
+    )
     row = _payment_transaction(
         database_path,
         lambda connection: _prepare_local_order(
@@ -187,8 +215,7 @@ def _prepare_local_order(
     ttl_minutes: int,
     now: datetime,
 ):
-    _close_expired_open_orders(connection, now=now)
-    row = _open_order(connection, device_fingerprint_hash, now=now)
+    row = _open_order(connection, device_fingerprint_hash)
     if row is None:
         row = _insert_local_order(
             connection,
@@ -296,8 +323,13 @@ def get_order_for_device(
     now: datetime | None = None,
 ) -> PaymentOrderResult:
     now = _utc(now)
+    _close_expired_open_orders(
+        database_path,
+        device_fingerprint_hash=device_fingerprint_hash,
+        order_id=order_id,
+        now=now,
+    )
     with write_transaction(database_path) as connection:
-        _close_expired_open_orders(connection, now=now)
         row = connection.execute(
             """
             SELECT * FROM payment_orders
@@ -328,6 +360,133 @@ def confirm_paid_order(
             now=_utc(now),
         ),
     )
+
+
+def confirm_paid_order_from_query(
+    database_path: Path,
+    query: QueryOrderResult,
+    *,
+    expected_appid: str,
+    expected_mchid: str,
+    now: datetime,
+) -> PaymentConfirmationResult:
+    now = _utc(now)
+
+    def confirm(connection):
+        order = _order_by_id(connection, query.out_trade_no)
+        code = _query_evidence_error(
+            order,
+            query,
+            expected_appid=expected_appid,
+            expected_mchid=expected_mchid,
+        )
+        if code is not None:
+            raise PaymentServiceError(code, status_code=409)
+        evidence = PaymentEvidence(
+            source=PaymentEvidenceSource.WECHAT_QUERY,
+            out_trade_no=str(query.out_trade_no),
+            provider_transaction_id=str(query.transaction_id),
+            trade_type=str(query.trade_type),
+            trade_state=str(query.trade_state),
+            amount_fen=int(query.amount_total),
+            currency=str(query.currency),
+            paid_at=query.success_time,
+            appid=str(query.appid),
+            mchid=str(query.mchid),
+        )
+        return _confirm_paid_order_in_transaction(
+            connection,
+            evidence,
+            notification_id=None,
+            issued_by="payment_query",
+            now=now,
+            allow_expired=True,
+            mark_abnormal_on_error=False,
+        )
+
+    return _payment_transaction(database_path, confirm)
+
+
+def load_reconciliation_order(
+    database_path: Path,
+    order_id: str,
+) -> ReconciliationOrderSnapshot | None:
+    connection = connect(database_path)
+    try:
+        row = _order_by_id(connection, order_id)
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    expires_at = _parse_utc(str(row["expires_at"] or ""))
+    if expires_at is None:
+        raise PaymentServiceError("invalid_expires_at", status_code=409)
+    return ReconciliationOrderSnapshot(
+        order_id=str(row["order_id"]),
+        status=str(row["status"]),
+        product_code=str(row["product_code"]),
+        amount_fen=int(row["amount_fen"]),
+        currency=str(row["currency"]),
+        provider=str(row["provider"]),
+        expires_at=expires_at,
+    )
+
+
+def mark_open_order_closed_from_trusted_provider(
+    database_path: Path,
+    *,
+    order_id: str,
+    provider_trade_state: str,
+    claim_token: str,
+    expected_state_version: int,
+    now: datetime,
+) -> TrustedOrderUpdateOutcome:
+    now = _utc(now)
+
+    def close(connection):
+        if not _reconciliation_claim_is_current(
+            connection,
+            order_id=order_id,
+            claim_token=claim_token,
+            expected_state_version=expected_state_version,
+            now=now,
+        ):
+            return TrustedOrderUpdateOutcome.LOST_CLAIM
+        return _mark_open_order_closed_in_transaction(
+            connection,
+            order_id=order_id,
+            provider_trade_state=provider_trade_state,
+            now=now,
+        )
+
+    return _payment_transaction(
+        database_path,
+        close,
+    )
+
+
+def mark_open_order_abnormal_from_trusted_provider(
+    database_path: Path,
+    *,
+    order_id: str,
+    code: str,
+    now: datetime,
+) -> TrustedOrderUpdateOutcome:
+    def mark(connection):
+        order = _order_by_id(connection, order_id)
+        outcome = _trusted_order_update_outcome(connection, order)
+        if outcome is not None:
+            return outcome
+        if str(order["status"]) not in {
+            OrderStatus.CREATED.value,
+            OrderStatus.WAITING_PAYMENT.value,
+            OrderStatus.ABNORMAL.value,
+        }:
+            return TrustedOrderUpdateOutcome.NOT_ELIGIBLE
+        _mark_order_abnormal(connection, order_id, code, _utc(now))
+        return TrustedOrderUpdateOutcome.UPDATED
+
+    return _payment_transaction(database_path, mark)
 
 
 def _insert_local_order(
@@ -365,7 +524,7 @@ def _insert_local_order(
             ),
         )
     except sqlite3.IntegrityError:
-        existing = _open_order(connection, device_fingerprint_hash, now=now)
+        existing = _open_order(connection, device_fingerprint_hash)
         if existing is not None:
             return existing
         raise
@@ -512,16 +671,21 @@ def _apply_provider_query_result(
             )
             return _order_result(_order_by_id(connection, order_id))
         if query.outcome == QueryOrderOutcome.CLOSED:
-            now_text = datetime_text(now)
             connection.execute(
                 """
                 UPDATE payment_orders
-                SET status = 'CLOSED', open_slot = NULL, provider_trade_state = ?,
-                    closed_at = ?, updated_at = ?, security_error_code = NULL,
+                SET status = 'WAITING_PAYMENT', provider_trade_state = ?,
+                    updated_at = ?, security_error_code = NULL,
                     next_provider_query_at = NULL
-                WHERE order_id = ? AND status IN ('CREATED', 'WAITING_PAYMENT')
+                WHERE order_id = ? AND status = 'CREATED'
                 """,
-                (query.trade_state, now_text, now_text, order_id),
+                (query.trade_state, datetime_text(now), order_id),
+            )
+            _mark_open_order_closed_in_transaction(
+                connection,
+                order_id=order_id,
+                provider_trade_state=str(query.trade_state),
+                now=now,
             )
             return _order_result(_order_by_id(connection, order_id))
         codes = {
@@ -625,12 +789,21 @@ def _confirm_paid_order_in_transaction(
     notification_id: str | None,
     issued_by: str,
     now: datetime,
+    allow_expired: bool = False,
+    mark_abnormal_on_error: bool = True,
 ) -> PaymentConfirmationResult:
     order = _order_by_id(connection, evidence.out_trade_no)
     if order is None:
         raise PaymentServiceError("payment_order_not_found", status_code=404)
 
-    _validate_evidence(connection, order, evidence, now=now)
+    _validate_evidence(
+        connection,
+        order,
+        evidence,
+        now=now,
+        allow_expired=allow_expired,
+        mark_abnormal_on_error=mark_abnormal_on_error,
+    )
 
     existing_grant = connection.execute(
         "SELECT * FROM license_grants WHERE source_order_id = ?",
@@ -663,8 +836,10 @@ def _confirm_paid_order_in_transaction(
         (str(order["device_fingerprint_hash"]),),
     ).fetchone()
     if device is None:
-        _mark_order_abnormal(connection, evidence.out_trade_no, "device_not_found", now)
-        raise PaymentServiceError("device_not_found", status_code=409, commit=True)
+        if mark_abnormal_on_error:
+            _mark_order_abnormal(connection, evidence.out_trade_no, "device_not_found", now)
+            raise PaymentServiceError("device_not_found", status_code=409, commit=True)
+        raise PaymentServiceError("device_not_found", status_code=409)
 
     previous_paid = latest_paid_license(connection, int(device["id"]))
     previous_expires_at = (
@@ -841,20 +1016,40 @@ def _committed_payment_chain_is_valid_in_transaction(
     )
 
 
-def _validate_evidence(connection, order, evidence: PaymentEvidence, *, now: datetime) -> None:
-    code = _evidence_error(connection, order, evidence, now=now)
+def _validate_evidence(
+    connection,
+    order,
+    evidence: PaymentEvidence,
+    *,
+    now: datetime,
+    allow_expired: bool = False,
+    mark_abnormal_on_error: bool = True,
+) -> None:
+    code = _evidence_error(
+        connection,
+        order,
+        evidence,
+        now=now,
+        allow_expired=allow_expired,
+    )
     if code is None:
         return
     if code == "payment_order_expired":
-        _mark_order_expired(connection, str(order["order_id"]), now)
-        raise PaymentServiceError(code, status_code=409, commit=True)
-    if str(order["status"]) != OrderStatus.PAID.value:
+        raise PaymentServiceError(code, status_code=409)
+    if mark_abnormal_on_error and str(order["status"]) != OrderStatus.PAID.value:
         _mark_order_abnormal(connection, str(order["order_id"]), code, now)
         raise PaymentServiceError(code, status_code=409, commit=True)
     raise PaymentServiceError(code, status_code=409)
 
 
-def _evidence_error(connection, order, evidence: PaymentEvidence, *, now: datetime) -> str | None:
+def _evidence_error(
+    connection,
+    order,
+    evidence: PaymentEvidence,
+    *,
+    now: datetime,
+    allow_expired: bool = False,
+) -> str | None:
     status = str(order["status"])
     if status == OrderStatus.CLOSED.value:
         return "closed_order"
@@ -862,7 +1057,7 @@ def _evidence_error(connection, order, evidence: PaymentEvidence, *, now: dateti
     if status in {OrderStatus.CREATED.value, OrderStatus.WAITING_PAYMENT.value}:
         if expires_at is None:
             return "invalid_expires_at"
-        if expires_at <= now:
+        if expires_at <= now and not allow_expired:
             return "payment_order_expired"
     if (
         status == OrderStatus.CREATED.value
@@ -908,6 +1103,116 @@ def _provider_for(source: PaymentEvidenceSource) -> str:
     return "wechat_native"
 
 
+def _query_evidence_error(
+    order,
+    query: QueryOrderResult,
+    *,
+    expected_appid: str,
+    expected_mchid: str,
+) -> str | None:
+    if order is None:
+        return "payment_order_not_found"
+    if query.outcome is not QueryOrderOutcome.SUCCESS:
+        return "payment_query_state_mismatch"
+    if query.out_trade_no != str(order["order_id"]):
+        return "payment_query_order_mismatch"
+    if not query.transaction_id:
+        return "payment_query_transaction_missing"
+    if query.trade_state != "SUCCESS":
+        return "payment_query_state_mismatch"
+    if query.trade_type != "NATIVE":
+        return "payment_query_trade_type_mismatch"
+    if query.amount_total != int(order["amount_fen"]):
+        return "payment_query_amount_mismatch"
+    if query.currency != str(order["currency"]):
+        return "payment_query_currency_mismatch"
+    if query.appid != expected_appid or query.mchid != expected_mchid:
+        return "payment_query_merchant_mismatch"
+    if (
+        not isinstance(query.success_time, datetime)
+        or query.success_time.tzinfo is None
+        or query.success_time.utcoffset() is None
+    ):
+        return "payment_query_success_time_invalid"
+    if str(order["provider"]) != "wechat_native":
+        return "provider_mismatch"
+    if _order_product_error(order) is not None:
+        return "payment_query_product_mismatch"
+    if str(order["status"]) == OrderStatus.CLOSED.value:
+        return "closed_order"
+    return None
+
+
+def _trusted_order_update_outcome(connection, order):
+    if order is None:
+        return TrustedOrderUpdateOutcome.NOT_FOUND
+    status = str(order["status"])
+    if status == OrderStatus.PAID.value:
+        return TrustedOrderUpdateOutcome.ALREADY_PAID
+    if status == OrderStatus.CLOSED.value:
+        return TrustedOrderUpdateOutcome.ALREADY_CLOSED
+    payment_fact = connection.execute(
+        "SELECT 1 FROM license_grants WHERE source_order_id = ?",
+        (str(order["order_id"]),),
+    ).fetchone()
+    if payment_fact is not None or order["provider_transaction_id"] is not None:
+        return TrustedOrderUpdateOutcome.PAYMENT_FACT_PRESENT
+    return None
+
+
+def _reconciliation_claim_is_current(
+    connection,
+    *,
+    order_id: str,
+    claim_token: str,
+    expected_state_version: int,
+    now: datetime,
+) -> bool:
+    return connection.execute(
+        """SELECT 1 FROM payment_reconciliations
+           WHERE order_id=? AND reconcile_status='CLAIMED'
+             AND claim_token=? AND state_version=? AND lease_expires_at>?""",
+        (
+            order_id,
+            claim_token,
+            expected_state_version,
+            datetime_text(now),
+        ),
+    ).fetchone() is not None
+
+
+def _mark_open_order_closed_in_transaction(
+    connection,
+    *,
+    order_id: str,
+    provider_trade_state: str,
+    now: datetime,
+) -> TrustedOrderUpdateOutcome:
+    order = _order_by_id(connection, order_id)
+    outcome = _trusted_order_update_outcome(connection, order)
+    if outcome is not None:
+        return outcome
+    if str(order["status"]) != OrderStatus.WAITING_PAYMENT.value:
+        return TrustedOrderUpdateOutcome.NOT_ELIGIBLE
+    now_text = datetime_text(now)
+    cursor = connection.execute(
+        """UPDATE payment_orders
+           SET status='CLOSED', open_slot=NULL, provider_trade_state=?,
+               closed_at=?, updated_at=?, security_error_code=NULL
+           WHERE order_id=? AND status='WAITING_PAYMENT'
+             AND provider_transaction_id IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM license_grants WHERE source_order_id=payment_orders.order_id
+             )""",
+        (provider_trade_state, now_text, now_text, order_id),
+    )
+    return (
+        TrustedOrderUpdateOutcome.UPDATED
+        if cursor.rowcount == 1
+        else TrustedOrderUpdateOutcome.NOT_ELIGIBLE
+    )
+
+
 def _payment_transaction(database_path: Path, action):
     connection = connect(database_path)
     try:
@@ -929,35 +1234,51 @@ def _payment_transaction(database_path: Path, action):
         connection.close()
 
 
-def _close_expired_open_orders(connection, *, now: datetime) -> None:
-    now_text = datetime_text(now)
-    connection.execute(
-        """
-        UPDATE payment_orders
-        SET status = 'CLOSED',
-            open_slot = NULL,
-            closed_at = ?,
-            updated_at = ?,
-            security_error_code = 'expired'
-        WHERE status IN ('CREATED', 'WAITING_PAYMENT')
-          AND expires_at <= ?
-        """,
-        (now_text, now_text, now_text),
-    )
+def _close_expired_open_orders(
+    database_path: Path,
+    *,
+    now: datetime,
+    device_fingerprint_hash: str,
+    order_id: str | None = None,
+) -> None:
+    clauses = [
+        "device_fingerprint_hash = ?",
+        "status = 'WAITING_PAYMENT'",
+        "open_slot = 'open'",
+        "expires_at <= ?",
+    ]
+    params = [device_fingerprint_hash, datetime_text(now)]
+    if order_id is not None:
+        clauses.append("order_id = ?")
+        params.append(order_id)
+    connection = connect(database_path)
+    try:
+        rows = connection.execute(
+            "SELECT order_id FROM payment_orders WHERE " + " AND ".join(clauses),
+            params,
+        ).fetchall()
+    finally:
+        connection.close()
+    for row in rows:
+        ensure_ready(
+            database_path,
+            str(row["order_id"]),
+            now,
+            now,
+        )
 
 
-def _open_order(connection, device_fingerprint_hash: str, *, now: datetime):
+def _open_order(connection, device_fingerprint_hash: str):
     return connection.execute(
         """
         SELECT * FROM payment_orders
         WHERE device_fingerprint_hash = ?
           AND open_slot = 'open'
           AND status IN ('CREATED', 'WAITING_PAYMENT', 'ABNORMAL')
-          AND (status = 'ABNORMAL' OR expires_at > ?)
         ORDER BY id DESC
         LIMIT 1
         """,
-        (device_fingerprint_hash, datetime_text(now)),
+        (device_fingerprint_hash,),
     ).fetchone()
 
 
@@ -970,24 +1291,12 @@ def _mark_order_abnormal(connection, order_id: str, code: str, now: datetime) ->
             security_error_code = ?,
             updated_at = ?
         WHERE order_id = ? AND status IN ('CREATED', 'WAITING_PAYMENT', 'ABNORMAL')
+          AND provider_transaction_id IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM license_grants WHERE source_order_id = payment_orders.order_id
+          )
         """,
         (code, datetime_text(now), order_id),
-    )
-
-
-def _mark_order_expired(connection, order_id: str, now: datetime) -> None:
-    now_text = datetime_text(now)
-    connection.execute(
-        """
-        UPDATE payment_orders
-        SET status = 'CLOSED',
-            open_slot = NULL,
-            closed_at = ?,
-            updated_at = ?,
-            security_error_code = 'expired'
-        WHERE order_id = ? AND status IN ('CREATED', 'WAITING_PAYMENT')
-        """,
-        (now_text, now_text, order_id),
     )
 
 

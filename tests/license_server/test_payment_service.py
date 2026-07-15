@@ -22,6 +22,7 @@ from license_server.payment_service import (
     PaymentServiceError,
     confirm_paid_order,
     create_or_restore_order,
+    get_order_for_device,
 )
 from license_server.signer import datetime_text
 from license_server.wechat_payment import WechatPaymentError
@@ -90,7 +91,7 @@ def test_closed_order_cannot_be_confirmed_paid(tmp_path):
         confirm_paid_order(tmp_path / "license.sqlite3", _evidence(order.order_id))
 
 
-def test_expired_waiting_order_cannot_be_confirmed_paid(tmp_path):
+def test_expired_waiting_order_rejection_does_not_close_locally(tmp_path):
     order = _mock_order(tmp_path)
     now = datetime.now(timezone.utc).replace(microsecond=0)
     with connect(tmp_path / "license.sqlite3") as connection:
@@ -112,8 +113,120 @@ def test_expired_waiting_order_cannot_be_confirmed_paid(tmp_path):
             "SELECT status, open_slot, security_error_code FROM payment_orders WHERE order_id = ?",
             (order.order_id,),
         ).fetchone()
-        assert tuple(row) == ("CLOSED", None, "expired")
+        assert tuple(row) == ("WAITING_PAYMENT", "open", None)
         assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
+
+
+def test_expired_waiting_order_is_kept_and_scheduled_for_reconciliation(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    order = _mock_order(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    with connect(database_path) as connection:
+        connection.execute(
+            "UPDATE payment_orders SET expires_at = ? WHERE order_id = ?",
+            (datetime_text(now - timedelta(seconds=1)), order.order_id),
+        )
+        connection.commit()
+
+    class NoGateway(MockPaymentGateway):
+        def create_native_order(self, request):
+            raise AssertionError("must not create a second order")
+
+        def query_order(self, order_id):
+            raise AssertionError("expired WAITING_PAYMENT is reconciled later")
+
+        def close_order(self, order_id):
+            raise AssertionError("local expiry must not close upstream")
+
+    first = create_or_restore_order(
+        database_path,
+        device_fingerprint_hash="device-a",
+        product_code=ANNUAL_V1.product_code,
+        provider="mock",
+        ttl_minutes=15,
+        gateway=NoGateway(),
+        now=now,
+    )
+    second = create_or_restore_order(
+        database_path,
+        device_fingerprint_hash="device-a",
+        product_code=ANNUAL_V1.product_code,
+        provider="mock",
+        ttl_minutes=15,
+        gateway=NoGateway(),
+        now=now,
+    )
+
+    assert first.order_id == second.order_id == order.order_id
+    assert first.status == second.status == "WAITING_PAYMENT"
+    with connect(database_path) as connection:
+        payment = connection.execute(
+            "SELECT status, open_slot, closed_at FROM payment_orders WHERE order_id = ?",
+            (order.order_id,),
+        ).fetchone()
+        reconciliation = connection.execute(
+            "SELECT reconcile_status, next_attempt_at, query_attempt_count "
+            "FROM payment_reconciliations WHERE order_id = ?",
+            (order.order_id,),
+        ).fetchone()
+        assert connection.execute("SELECT COUNT(*) FROM payment_orders").fetchone()[0] == 1
+    assert tuple(payment) == ("WAITING_PAYMENT", "open", None)
+    assert tuple(reconciliation) == ("READY", datetime_text(now), 0)
+
+
+def test_expired_created_order_keeps_existing_recovery_path_without_reconciliation(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    order = _mock_order(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    with connect(database_path) as connection:
+        connection.execute(
+            """UPDATE payment_orders
+               SET status='CREATED', provider_code_url=NULL, expires_at=?,
+                   next_provider_query_at=NULL
+               WHERE order_id=?""",
+            (datetime_text(now - timedelta(seconds=1)), order.order_id),
+        )
+        connection.commit()
+
+    result = create_or_restore_order(
+        database_path,
+        device_fingerprint_hash="device-a",
+        product_code=ANNUAL_V1.product_code,
+        provider="mock",
+        ttl_minutes=15,
+        gateway=QueryOnlyGateway(QueryOrderOutcome.HTTP_UNKNOWN),
+        now=now,
+    )
+
+    assert result.order_id == order.order_id
+    assert result.status == "CREATED"
+    with connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payment_orders").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM payment_reconciliations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("status", ("PAID", "CLOSED"))
+def test_paid_and_closed_orders_are_not_added_to_reconciliation_on_get(tmp_path, status):
+    database_path = tmp_path / "license.sqlite3"
+    order = _mock_order(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    with connect(database_path) as connection:
+        connection.execute(
+            "UPDATE payment_orders SET status=?, open_slot=NULL, expires_at=? WHERE order_id=?",
+            (status, datetime_text(now - timedelta(seconds=1)), order.order_id),
+        )
+        connection.commit()
+
+    result = get_order_for_device(
+        database_path,
+        order_id=order.order_id,
+        device_fingerprint_hash="device-a",
+        now=now,
+    )
+
+    assert result.status == status
+    with connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payment_reconciliations").fetchone()[0] == 0
 
 
 def test_unexpired_paid_license_renews_from_existing_expiry(tmp_path):
@@ -494,6 +607,25 @@ def test_unknown_create_result_recovers_verified_paid_query_once(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM licenses WHERE license_type = 'paid'").fetchone()[0] == 1
 
 
+def test_unknown_create_result_recovers_verified_closed_query_without_grant(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    _client(tmp_path)[0].post("/device/register", json=_register_payload())
+    gateway = UnknownResultGateway(QueryOrderOutcome.CLOSED)
+
+    result = _create_wechat_order(database_path, gateway)
+
+    assert result.status == OrderStatus.CLOSED.value
+    assert gateway.queried == [gateway.created_order_id]
+    with connect(database_path) as connection:
+        order = connection.execute(
+            "SELECT status, open_slot, provider_trade_state, closed_at "
+            "FROM payment_orders"
+        ).fetchone()
+        assert tuple(order[:3]) == ("CLOSED", None, "CLOSED")
+        assert order["closed_at"] is not None
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -619,16 +751,23 @@ class UnknownResultGateway:
             "outcome": self.outcome,
             "out_trade_no": order_id,
         }
-        if self.outcome is QueryOrderOutcome.PAID:
+        if self.outcome in {QueryOrderOutcome.PAID, QueryOrderOutcome.CLOSED}:
             values.update(
-                transaction_id="4200000001",
-                trade_state="SUCCESS",
+                trade_state=(
+                    "SUCCESS"
+                    if self.outcome is QueryOrderOutcome.PAID
+                    else "CLOSED"
+                ),
                 trade_type="NATIVE",
                 amount_total=990,
                 currency="CNY",
-                success_time=datetime.now(timezone.utc).replace(microsecond=0),
                 appid="wx-test-app",
                 mchid="1900000109",
+            )
+        if self.outcome is QueryOrderOutcome.PAID:
+            values.update(
+                transaction_id="4200000001",
+                success_time=datetime.now(timezone.utc).replace(microsecond=0),
             )
         values.update(self.overrides)
         return QueryOrderResult(**values)
