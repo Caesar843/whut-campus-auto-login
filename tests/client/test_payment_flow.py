@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QApplication
 
 from desktop_app.payment_window import PaymentWindow
 from license_client.license_state import LicenseDecision, LicenseStatus, evaluate_local_license
-from license_client.payment_api import PaymentOrderResult
+from license_client.payment_api import PaymentOrderResult, PaymentRefreshResult
 from license_client.payment_state import PaymentStateStore
 from license_client.token_store import load_signed_license_token, save_signed_license_token
 from license_client.token_verify import verify_signed_license_token
@@ -46,6 +46,10 @@ def test_mock_payment_window_flow_refreshes_paid_license(tmp_path):
         api_client=payment_api,
         state_store=state_store,
         refresh_license_func=lambda: _refresh_license(server, public_key_b64, token_path),
+        save_license_token_func=lambda token: save_signed_license_token(
+            token,
+            token_path=token_path,
+        ),
     )
     _make_requests_sync(window)
 
@@ -68,12 +72,16 @@ def test_mock_payment_window_flow_refreshes_paid_license(tmp_path):
     assert verification.payload["license_type"] == "paid"
     assert "正式版" in window.payment_area.text()
     assert state_store.load() is None
+    assert payment_api.refreshed == [order_id]
+    assert payment_api.queried == []
 
 
 class _TestClientPaymentApi:
     def __init__(self, server, token):
         self.server = server
         self.token = token
+        self.queried = []
+        self.refreshed = []
 
     def create_or_resume_order(self, product_code):
         response = self.server.post(
@@ -85,9 +93,20 @@ class _TestClientPaymentApi:
         return _order(response.json())
 
     def get_order(self, order_id):
+        self.queried.append(order_id)
         response = self.server.get(f"/api/v1/payment/orders/{order_id}", headers=self._auth())
         assert response.status_code == 200
         return _order(response.json())
+
+    def refresh_order(self, order_id):
+        self.refreshed.append(order_id)
+        response = self.server.post(
+            f"/api/v1/payment/orders/{order_id}/refresh",
+            headers=self._auth(),
+            json={},
+        )
+        assert response.status_code in {200, 202}
+        return _refresh_order(response.json(), response.status_code)
 
     def _auth(self):
         return {"Authorization": f"Bearer {self.token}"}
@@ -110,7 +129,6 @@ def _refresh_license(server, public_key_b64, token_path):
     )
     decision = evaluate_local_license(verification)
     assert decision.status == LicenseStatus.PAID_ACTIVE
-    save_signed_license_token(signed_token, token_path=token_path)
     return LicenseDecision(
         status=decision.status,
         allowed=decision.allowed,
@@ -134,6 +152,21 @@ def _order(payload):
         created_at=payload["created_at"],
         expires_at=payload["expires_at"],
         paid_at=payload["paid_at"],
+    )
+
+
+def _refresh_order(payload, http_status):
+    return PaymentRefreshResult(
+        order_id=payload["order_id"],
+        status=payload["status"],
+        amount_fen=payload["amount_fen"],
+        currency=payload["currency"],
+        expires_at=payload["expires_at"],
+        paid_at=payload["paid_at"],
+        license_refresh_required=payload["license_refresh_required"],
+        refresh_result=payload["refresh_result"],
+        retry_after_seconds=payload["retry_after_seconds"],
+        http_status=http_status,
     )
 
 

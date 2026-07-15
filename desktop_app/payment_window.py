@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
@@ -26,6 +26,7 @@ from license_client.payment_api import (
     PaymentApiClient,
     PaymentApiError,
     PaymentOrderResult,
+    PaymentRefreshResult,
     payment_error_message,
 )
 from license_client.payment_state import PaymentStateStore, new_payment_state
@@ -38,6 +39,8 @@ LOGGER = logging.getLogger(__name__)
 POLL_INTERVAL_MS = 3_000
 POLL_TIMEOUT_SECONDS = 120
 ORDER_STATUSES_TO_POLL = {"WAITING_PAYMENT"}
+REFRESH_COOLDOWN_DEFAULT_SECONDS = 10
+REFRESH_COOLDOWN_MAX_SECONDS = 120
 
 
 class PaymentRefreshError(RuntimeError):
@@ -78,12 +81,14 @@ class PaymentWindow(QDialog):
         api_client: Optional[PaymentApiClient] = None,
         state_store: Optional[PaymentStateStore] = None,
         refresh_license_func: Optional[Callable[[], LicenseDecision]] = None,
+        save_license_token_func: Optional[Callable[[str], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._api_client = api_client or PaymentApiClient()
         self._state_store = state_store or PaymentStateStore()
         self._refresh_license = refresh_license_func or refresh_license_after_payment
+        self._save_license_token = save_license_token_func or save_signed_license_token
         self._request_in_flight = False
         self._generation = 0
         self._closed = False
@@ -91,6 +96,8 @@ class PaymentWindow(QDialog):
         self._last_order: Optional[PaymentOrderResult] = None
         self._poll_started_at: Optional[float] = None
         self._refresh_failed = False
+        self._manual_refresh_blocked = False
+        self._refresh_cooldown_generation: Optional[int] = None
         self._threads: list[QThread] = []
         self._workers: list[_PaymentWorker] = []
         self._build_ui()
@@ -100,6 +107,7 @@ class PaymentWindow(QDialog):
         self._closed = True
         self._generation += 1
         self._stop_polling()
+        self._cancel_refresh_cooldown()
         for thread in list(self._threads):
             thread.quit()
         super().closeEvent(event)
@@ -166,6 +174,10 @@ class PaymentWindow(QDialog):
         self._poll_timer.setInterval(POLL_INTERVAL_MS)
         self._poll_timer.timeout.connect(self._poll_once)
 
+        self._refresh_cooldown_timer = QTimer(self)
+        self._refresh_cooldown_timer.setSingleShot(True)
+        self._refresh_cooldown_timer.timeout.connect(self._finish_refresh_cooldown)
+
         self.create_button.clicked.connect(self._create_order)
         self.refresh_button.clicked.connect(self._manual_refresh)
         self.close_button.clicked.connect(self.close)
@@ -188,6 +200,9 @@ class PaymentWindow(QDialog):
     def _create_order(self) -> None:
         if self._request_in_flight:
             return
+        self._generation += 1
+        self._manual_refresh_blocked = False
+        self._cancel_refresh_cooldown()
         self._refresh_failed = False
         self._clear_error()
         self.payment_area.setText("正在创建支付订单...")
@@ -199,16 +214,25 @@ class PaymentWindow(QDialog):
 
     @Slot()
     def _manual_refresh(self) -> None:
-        if self._request_in_flight:
+        if (
+            self._request_in_flight
+            or self._refresh_cooldown_timer.isActive()
+            or self._manual_refresh_blocked
+        ):
             return
         self._clear_error()
         if self._refresh_failed:
             self._start_refresh_license()
             return
-        if self._current_order_id:
-            self._query_order()
-        else:
-            self._create_order()
+        if not self._current_order_id:
+            self._refresh_buttons()
+            return
+        order_id = self._current_order_id
+        self._poll_timer.stop()
+        self._start_request(
+            "refresh_order",
+            lambda: self._api_client.refresh_order(order_id),
+        )
 
     def _query_order(self) -> None:
         if self._request_in_flight or not self._current_order_id:
@@ -225,7 +249,7 @@ class PaymentWindow(QDialog):
             if elapsed >= POLL_TIMEOUT_SECONDS:
                 self._stop_polling()
                 self.payment_area.setText(
-                    "暂未确认支付结果。若你已经付款，请不要重复支付，可点击“手动刷新”或稍后重新打开软件刷新授权。"
+                    "暂未确认支付结果。若你已经付款，请不要重复支付，可点击“我已支付，刷新状态”或稍后重新打开软件刷新授权。"
                 )
                 self.payment_area.set_variant("warning")
                 return
@@ -279,10 +303,18 @@ class PaymentWindow(QDialog):
         if kind in {"create_order", "get_order"}:
             self._apply_order(result)
             return
+        if kind == "refresh_order":
+            self._apply_refresh_result(result)
+            return
         if kind == "refresh_license":
             self._apply_license_refresh(result)
 
-    def _apply_order(self, result: object) -> None:
+    def _apply_order(
+        self,
+        result: object,
+        *,
+        refresh_license_for_paid: bool = True,
+    ) -> None:
         if not isinstance(result, PaymentOrderResult):
             self._handle_error("get_order", PaymentApiError("invalid_response"))
             return
@@ -316,14 +348,58 @@ class PaymentWindow(QDialog):
         if result.status in ORDER_STATUSES_TO_POLL:
             self._start_polling()
         elif result.status == "PAID":
-            self._start_refresh_license()
+            self._cancel_refresh_cooldown()
+            self._stop_polling()
+            if refresh_license_for_paid:
+                self._start_refresh_license()
+            else:
+                self.payment_area.setText("支付状态已确认。")
+                self.payment_area.set_variant("warning")
         elif result.status in {"CLOSED", "ABNORMAL"}:
+            self._cancel_refresh_cooldown()
             self._stop_polling()
         self._refresh_buttons()
 
+    def _apply_refresh_result(self, result: object) -> None:
+        if (
+            not isinstance(result, PaymentRefreshResult)
+            or self._last_order is None
+            or result.order_id != self._current_order_id
+            or result.order_id != self._last_order.order_id
+        ):
+            self._handle_error("refresh_order", PaymentApiError("invalid_response"))
+            return
+        order = replace(
+            self._last_order,
+            status=result.status,
+            amount_fen=result.amount_fen,
+            currency=result.currency,
+            expires_at=result.expires_at,
+            paid_at=result.paid_at,
+        )
+        self._apply_order(
+            order,
+            refresh_license_for_paid=result.license_refresh_required,
+        )
+        if result.http_status == 202 and result.status not in {"PAID", "CLOSED", "ABNORMAL"}:
+            self.payment_area.setText("正在确认支付结果，请稍后")
+            self.payment_area.set_variant("warning")
+            self._resume_polling_if_waiting()
+            self._start_refresh_cooldown(result.retry_after_seconds)
+
     def _apply_license_refresh(self, result: object) -> None:
-        if not isinstance(result, LicenseDecision) or result.status != LicenseStatus.PAID_ACTIVE:
+        if (
+            not isinstance(result, LicenseDecision)
+            or result.status != LicenseStatus.PAID_ACTIVE
+            or not result.signed_license_token
+        ):
             self._handle_error("refresh_license", PaymentRefreshError("license_refresh_invalid"))
+            return
+        try:
+            self._save_license_token(result.signed_license_token)
+        except Exception as exc:
+            LOGGER.warning("Payment license token save failed: %s", exc.__class__.__name__)
+            self._handle_error("refresh_license", PaymentRefreshError("token_save_failed"))
             return
         self._state_store.clear()
         self._refresh_failed = False
@@ -338,15 +414,63 @@ class PaymentWindow(QDialog):
         if kind == "refresh_license":
             self._refresh_failed = True
             self._stop_polling()
-            self.payment_area.setText("支付成功，但授权刷新失败。请点击“重新刷新授权”。")
+            self.payment_area.setText("支付已确认，但授权刷新暂时失败。请稍后点击刷新授权。")
             self.payment_area.set_variant("warning")
             self._show_error(_refresh_error_message(error))
+        elif kind == "refresh_order":
+            self._handle_refresh_error(error)
         elif isinstance(error, PaymentApiError):
             self._show_error(payment_error_message(error))
         else:
             LOGGER.warning("Payment request failed: %s", error.__class__.__name__)
             self._show_error("支付请求失败，请稍后再试。")
         self._refresh_buttons()
+
+    def _handle_refresh_error(self, error: object) -> None:
+        code = error.code if isinstance(error, PaymentApiError) else ""
+        status_code = error.status_code if isinstance(error, PaymentApiError) else None
+        if code == "payment_refresh_rate_limited":
+            self.payment_area.setText("操作较频繁，请稍后再试")
+            self.payment_area.set_variant("warning")
+            self._resume_polling_if_waiting()
+            self._start_refresh_cooldown(error.retry_after_seconds)
+            return
+        if code == "PAYMENT_ORDER_PROCESSING":
+            self.payment_area.setText("订单正在处理中，请稍后再试")
+            self.payment_area.set_variant("warning")
+            self._resume_polling_if_waiting()
+            self._start_refresh_cooldown(REFRESH_COOLDOWN_DEFAULT_SECONDS)
+            return
+        if code in {
+            "PAYMENT_ORDER_REQUIRES_REVIEW",
+            "PAYMENT_RECONCILIATION_REQUIRES_REVIEW",
+        }:
+            self.payment_area.setText("暂时无法自动确认，请联系售后处理")
+            self.payment_area.set_variant("warning")
+            self._manual_refresh_blocked = True
+            self._stop_polling()
+            return
+        if code == "payment_order_not_found":
+            self.payment_area.setText("当前支付状态无法刷新，请重新打开支付窗口")
+            self.payment_area.set_variant("warning")
+            self._manual_refresh_blocked = True
+            self._stop_polling()
+            return
+        if code == "payment_refresh_contract_error":
+            self.payment_area.setText("当前支付状态暂时无法刷新")
+            self.payment_area.set_variant("warning")
+            self._manual_refresh_blocked = True
+            self._stop_polling()
+            return
+        if status_code == 409:
+            self.payment_area.setText("当前订单无法自动刷新")
+            self.payment_area.set_variant("warning")
+            self._manual_refresh_blocked = True
+            self._stop_polling()
+            return
+        self.payment_area.setText("暂时无法确认支付结果，请稍后再试")
+        self.payment_area.set_variant("warning")
+        self._resume_polling_if_waiting()
 
     def _show_payment_area(self, order: PaymentOrderResult) -> None:
         variant = "success" if order.status == "PAID" else "neutral"
@@ -366,6 +490,35 @@ class PaymentWindow(QDialog):
         self._poll_timer.stop()
         self._poll_started_at = None
 
+    def _resume_polling_if_waiting(self) -> None:
+        if (
+            not self._closed
+            and self._last_order is not None
+            and self._last_order.status == "WAITING_PAYMENT"
+        ):
+            self._start_polling()
+
+    def _start_refresh_cooldown(self, seconds: object) -> None:
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 1:
+            bounded_seconds = REFRESH_COOLDOWN_DEFAULT_SECONDS
+        else:
+            bounded_seconds = min(seconds, REFRESH_COOLDOWN_MAX_SECONDS)
+        self._refresh_cooldown_generation = self._generation
+        self._refresh_cooldown_timer.start(bounded_seconds * 1_000)
+        self._refresh_buttons()
+
+    @Slot()
+    def _finish_refresh_cooldown(self) -> None:
+        generation = self._refresh_cooldown_generation
+        self._refresh_cooldown_generation = None
+        if self._closed or generation != self._generation:
+            return
+        self._refresh_buttons()
+
+    def _cancel_refresh_cooldown(self) -> None:
+        self._refresh_cooldown_timer.stop()
+        self._refresh_cooldown_generation = None
+
     def _show_error(self, message: str) -> None:
         self.error_label.setText(message)
         self.error_label.set_variant("error")
@@ -380,8 +533,18 @@ class PaymentWindow(QDialog):
         current_status = self._last_order.status if self._last_order else ""
         can_create = current_status in {"", "CLOSED"} and not self._refresh_failed
         self.create_button.setEnabled((not busy) and can_create)
-        self.refresh_button.setEnabled((not busy) and bool(self._current_order_id or self._refresh_failed))
-        self.refresh_button.setText("重新刷新授权" if self._refresh_failed else "手动刷新")
+        can_refresh_order = (
+            bool(self._current_order_id)
+            and current_status in {"CREATED", "WAITING_PAYMENT"}
+            and not self._manual_refresh_blocked
+            and not self._refresh_cooldown_timer.isActive()
+        )
+        self.refresh_button.setEnabled(
+            (not busy) and (self._refresh_failed or can_refresh_order)
+        )
+        self.refresh_button.setText(
+            "重新刷新授权" if self._refresh_failed else "我已支付，刷新状态"
+        )
         if current_status == "CLOSED":
             self.create_button.setText("重新创建订单")
         elif current_status == "PAID":
@@ -416,7 +579,6 @@ def refresh_license_after_payment() -> LicenseDecision:
     decision = evaluate_local_license(verification)
     if decision.status != LicenseStatus.PAID_ACTIVE:
         raise PaymentRefreshError(verification.error or decision.reason or "license_refresh_invalid")
-    save_signed_license_token(api_result.signed_license_token)
     return LicenseDecision(
         status=decision.status,
         allowed=decision.allowed,
@@ -471,6 +633,7 @@ def _refresh_error_message(error: object) -> str:
             "missing_signed_license_token": "授权服务器未返回可用授权凭证，请稍后重试。",
             "missing_public_key": "客户端缺少授权验签公钥，请检查配置。",
             "license_refresh_invalid": "授权刷新结果无效，请稍后重试或联系支持。",
+            "token_save_failed": "授权凭证保存失败，请稍后重新刷新授权。",
         }.get(error.code, "授权刷新失败，请稍后重试。")
     return "授权刷新失败，请稍后重试。"
 

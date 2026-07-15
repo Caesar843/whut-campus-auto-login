@@ -22,6 +22,8 @@ PAYMENT_CONNECT_TIMEOUT_SECONDS = 3.0
 PAYMENT_READ_TIMEOUT_SECONDS = 5.0
 PAYMENT_TIMEOUT = (PAYMENT_CONNECT_TIMEOUT_SECONDS, PAYMENT_READ_TIMEOUT_SECONDS)
 PAYMENT_ORDER_ID_RE = re.compile(r"^pay_[0-9a-f]{32}$")
+REFRESH_RETRY_DEFAULT_SECONDS = 10
+REFRESH_RETRY_MAX_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -38,14 +40,38 @@ class PaymentOrderResult:
     paid_at: Optional[str]
 
 
+@dataclass(frozen=True)
+class PaymentRefreshResult:
+    order_id: str
+    status: str
+    amount_fen: int
+    currency: str
+    expires_at: str
+    paid_at: Optional[str]
+    license_refresh_required: bool
+    refresh_result: str
+    retry_after_seconds: Optional[int]
+    http_status: int
+
+
 class PaymentApiError(RuntimeError):
-    def __init__(self, code: str, *, status_code: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        status_code: Optional[int] = None,
+        retry_after_seconds: Optional[int] = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
     def __repr__(self) -> str:
-        return f"PaymentApiError(code={self.code!r}, status_code={self.status_code!r})"
+        return (
+            f"PaymentApiError(code={self.code!r}, status_code={self.status_code!r}, "
+            f"retry_after_seconds={self.retry_after_seconds!r})"
+        )
 
 
 class PaymentApiClient:
@@ -84,7 +110,40 @@ class PaymentApiClient:
         response = self._request("get", f"/api/v1/payment/orders/{quoted_order_id}")
         return _order_result(response)
 
+    def refresh_order(self, order_id: str) -> PaymentRefreshResult:
+        clean_order_id = _validated_order_id(order_id)
+        quoted_order_id = quote(clean_order_id, safe="")
+        response = self._send(
+            "post",
+            f"/api/v1/payment/orders/{quoted_order_id}/refresh",
+            json={},
+        )
+        payload = _json_payload(response)
+        if response.status_code >= 400:
+            raise PaymentApiError(
+                _refresh_error_code(response.status_code, payload),
+                status_code=response.status_code,
+                retry_after_seconds=(
+                    _retry_after_seconds(response, payload)
+                    if response.status_code == 429
+                    else None
+                ),
+            )
+        if response.status_code not in {200, 202}:
+            raise PaymentApiError("invalid_response", status_code=response.status_code)
+        return _refresh_result(payload, http_status=response.status_code)
+
     def _request(self, method: str, path: str, **kwargs) -> dict[str, object]:
+        response = self._send(method, path, **kwargs)
+        payload = _json_payload(response)
+        if response.status_code >= 400:
+            raise PaymentApiError(
+                _error_code(response.status_code, payload),
+                status_code=response.status_code,
+            )
+        return payload
+
+    def _send(self, method: str, path: str, **kwargs):
         token = self._signed_token()
         url = f"{self.base_url}{path}"
         headers = {"Authorization": f"Bearer {token}"}
@@ -113,14 +172,7 @@ class PaymentApiClient:
             raise PaymentApiError("network_unreachable") from exc
         except requests.RequestException as exc:
             raise PaymentApiError("network_unreachable") from exc
-
-        payload = _json_payload(response)
-        if response.status_code >= 400:
-            raise PaymentApiError(
-                _error_code(response.status_code, payload),
-                status_code=response.status_code,
-            )
-        return payload
+        return response
 
     def _signed_token(self) -> str:
         loaded = self._token_loader()
@@ -211,6 +263,28 @@ def _error_code(status_code: int, payload: dict[str, object]) -> str:
     return "invalid_response"
 
 
+def _refresh_error_code(status_code: int, payload: dict[str, object]) -> str:
+    detail = str(payload.get("detail") or "").strip()
+    public_conflicts = {
+        "PAYMENT_ORDER_PROCESSING",
+        "PAYMENT_ORDER_REQUIRES_REVIEW",
+        "PAYMENT_RECONCILIATION_REQUIRES_REVIEW",
+    }
+    if status_code in {401, 403}:
+        return "token_rejected"
+    if status_code == 404:
+        return "payment_order_not_found"
+    if status_code == 409:
+        return detail if detail in public_conflicts else "payment_refresh_conflict"
+    if status_code == 422:
+        return "payment_refresh_contract_error"
+    if status_code == 429:
+        return "payment_refresh_rate_limited"
+    if status_code >= 500:
+        return "server_error"
+    return "invalid_response"
+
+
 def _order_result(payload: dict[str, object]) -> PaymentOrderResult:
     required = {
         "order_id",
@@ -240,6 +314,88 @@ def _order_result(payload: dict[str, object]) -> PaymentOrderResult:
         expires_at=str(payload["expires_at"]),
         paid_at=_optional_text(payload.get("paid_at")),
     )
+
+
+def _refresh_result(
+    payload: dict[str, object],
+    *,
+    http_status: int,
+) -> PaymentRefreshResult:
+    required = {
+        "order_id",
+        "status",
+        "amount_fen",
+        "currency",
+        "expires_at",
+        "paid_at",
+        "license_refresh_required",
+        "refresh_result",
+        "retry_after_seconds",
+    }
+    if any(key not in payload for key in required):
+        raise PaymentApiError("invalid_response", status_code=http_status)
+    amount_value = payload["amount_fen"]
+    license_refresh_required = payload["license_refresh_required"]
+    if isinstance(amount_value, bool) or not isinstance(license_refresh_required, bool):
+        raise PaymentApiError("invalid_response", status_code=http_status)
+    try:
+        order_id = _validated_order_id(str(payload["order_id"]))
+        amount_fen = int(amount_value)
+    except (PaymentApiError, TypeError, ValueError) as exc:
+        raise PaymentApiError("invalid_response", status_code=http_status) from exc
+    status = str(payload["status"] or "").strip().upper()
+    currency = str(payload["currency"] or "").strip().upper()
+    expires_at = str(payload["expires_at"] or "").strip()
+    refresh_result = str(payload["refresh_result"] or "").strip().upper()
+    if (
+        status not in {"CREATED", "WAITING_PAYMENT", "PAID", "CLOSED", "ABNORMAL"}
+        or amount_fen < 0
+        or not currency
+        or not expires_at
+        or not refresh_result
+    ):
+        raise PaymentApiError("invalid_response", status_code=http_status)
+    retry_after = _bounded_positive_seconds(payload["retry_after_seconds"])
+    if http_status == 202 and retry_after is None:
+        retry_after = REFRESH_RETRY_DEFAULT_SECONDS
+    return PaymentRefreshResult(
+        order_id=order_id,
+        status=status,
+        amount_fen=amount_fen,
+        currency=currency,
+        expires_at=expires_at,
+        paid_at=_optional_text(payload["paid_at"]),
+        license_refresh_required=license_refresh_required,
+        refresh_result=refresh_result,
+        retry_after_seconds=retry_after,
+        http_status=http_status,
+    )
+
+
+def _retry_after_seconds(response, payload: dict[str, object]) -> int:
+    headers = getattr(response, "headers", {})
+    for value in (
+        headers.get("Retry-After") if hasattr(headers, "get") else None,
+        payload.get("retry_after_seconds"),
+    ):
+        seconds = _bounded_positive_seconds(value)
+        if seconds is not None:
+            return seconds
+    return REFRESH_RETRY_DEFAULT_SECONDS
+
+
+def _bounded_positive_seconds(value: object) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        seconds = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        seconds = int(value.strip())
+    else:
+        return None
+    if seconds < 1:
+        return None
+    return min(seconds, REFRESH_RETRY_MAX_SECONDS)
 
 
 def _optional_text(value: object) -> Optional[str]:
