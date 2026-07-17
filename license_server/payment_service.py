@@ -82,6 +82,7 @@ class TrustedOrderUpdateOutcome(str, Enum):
     NOT_ELIGIBLE = "NOT_ELIGIBLE"
     PAYMENT_FACT_PRESENT = "PAYMENT_FACT_PRESENT"
     LOST_CLAIM = "LOST_CLAIM"
+    CONFLICT = "CONFLICT"
 
 
 @dataclass(frozen=True)
@@ -369,18 +370,33 @@ def confirm_paid_order(
     )
 
 
-def confirm_paid_order_from_query(
+def confirm_paid_order_from_query_and_terminate_reconciliation(
     database_path: Path,
     query: QueryOrderResult,
     *,
+    order_id: str,
+    claim_token: str,
+    expected_state_version: int,
     expected_appid: str,
     expected_mchid: str,
     now: datetime,
-) -> PaymentConfirmationResult:
-    now = _utc(now)
+    clock: Callable[[], datetime] | None = None,
+) -> TrustedOrderUpdateOutcome:
+    fallback_now = _utc(now)
 
     def confirm(connection):
-        order = _order_by_id(connection, query.out_trade_no)
+        operation_time = _utc(clock() if clock is not None else fallback_now)
+        if not reconciliation_claim_is_current_in_transaction(
+            connection,
+            order_id=order_id,
+            claim_token=claim_token,
+            expected_state_version=expected_state_version,
+            operation_time=operation_time,
+        ):
+            return TrustedOrderUpdateOutcome.LOST_CLAIM
+        order = _order_by_id(connection, order_id)
+        if order is None:
+            return TrustedOrderUpdateOutcome.NOT_ELIGIBLE
         code = _query_evidence_error(
             order,
             query,
@@ -388,7 +404,7 @@ def confirm_paid_order_from_query(
             expected_mchid=expected_mchid,
         )
         if code is not None:
-            raise PaymentServiceError(code, status_code=409)
+            return TrustedOrderUpdateOutcome.CONFLICT
         evidence = PaymentEvidence(
             source=PaymentEvidenceSource.WECHAT_QUERY,
             out_trade_no=str(query.out_trade_no),
@@ -401,14 +417,36 @@ def confirm_paid_order_from_query(
             appid=str(query.appid),
             mchid=str(query.mchid),
         )
-        return _confirm_paid_order_in_transaction(
+        confirmation = _confirm_paid_order_in_transaction(
             connection,
             evidence,
             notification_id=None,
             issued_by="payment_query",
-            now=now,
+            now=operation_time,
             allow_expired=True,
             mark_abnormal_on_error=False,
+        )
+        update = terminate_claim_in_transaction(
+            connection,
+            claim_token=claim_token,
+            expected_state_version=expected_state_version,
+            terminal_at=operation_time,
+            terminal_reason=(
+                "ORDER_ALREADY_PAID" if confirmation.idempotent else "PAYMENT_CONFIRMED"
+            ),
+            trusted_trade_state="SUCCESS",
+            last_error_code=None,
+            query_completed=True,
+        )
+        if update.outcome is not UpdateOutcome.UPDATED:
+            raise PaymentServiceError(
+                "payment_reconciliation_invalid_state",
+                status_code=409,
+            )
+        return (
+            TrustedOrderUpdateOutcome.ALREADY_PAID
+            if confirmation.idempotent
+            else TrustedOrderUpdateOutcome.UPDATED
         )
 
     return _payment_transaction(database_path, confirm)
@@ -439,7 +477,7 @@ def load_reconciliation_order(
     )
 
 
-def mark_open_order_closed_from_trusted_provider(
+def mark_open_order_closed_and_terminate_reconciliation(
     database_path: Path,
     *,
     order_id: str,
@@ -447,6 +485,7 @@ def mark_open_order_closed_from_trusted_provider(
     claim_token: str,
     expected_state_version: int,
     now: datetime,
+    close_completed: bool = False,
     clock: Callable[[], datetime] | None = None,
 ) -> TrustedOrderUpdateOutcome:
     fallback_now = _utc(now)
@@ -461,17 +500,45 @@ def mark_open_order_closed_from_trusted_provider(
             operation_time=operation_time,
         ):
             return TrustedOrderUpdateOutcome.LOST_CLAIM
-        return _mark_open_order_closed_in_transaction(
+        outcome = _mark_open_order_closed_in_transaction(
             connection,
             order_id=order_id,
             provider_trade_state=provider_trade_state,
             now=operation_time,
         )
+        if outcome is TrustedOrderUpdateOutcome.ALREADY_PAID:
+            terminal_reason = "ORDER_ALREADY_PAID"
+            last_error_code = None
+        elif outcome in {
+            TrustedOrderUpdateOutcome.UPDATED,
+            TrustedOrderUpdateOutcome.ALREADY_CLOSED,
+        }:
+            terminal_reason = "PROVIDER_CLOSED"
+            last_error_code = None
+        else:
+            terminal_reason = "LOCAL_CLOSE_REVIEW"
+            last_error_code = "LOCAL_CLOSE_REVIEW"
+        terminal_values = dict(
+            connection=connection,
+            claim_token=claim_token,
+            expected_state_version=expected_state_version,
+            terminal_at=operation_time,
+            terminal_reason=terminal_reason,
+            last_error_code=last_error_code,
+            query_completed=True,
+            close_completed=close_completed,
+        )
+        if outcome is not TrustedOrderUpdateOutcome.ALREADY_PAID:
+            terminal_values["trusted_trade_state"] = provider_trade_state
+        update = terminate_claim_in_transaction(**terminal_values)
+        if update.outcome is not UpdateOutcome.UPDATED:
+            raise PaymentServiceError(
+                "payment_reconciliation_invalid_state",
+                status_code=409,
+            )
+        return outcome
 
-    return _payment_transaction(
-        database_path,
-        close,
-    )
+    return _payment_transaction(database_path, close)
 
 
 def mark_open_order_abnormal_and_terminate_reconciliation(

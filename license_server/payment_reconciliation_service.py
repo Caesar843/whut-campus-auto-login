@@ -23,10 +23,10 @@ from license_server.payment_reconciliation_repository import (
 from license_server.payment_service import (
     PaymentServiceError,
     TrustedOrderUpdateOutcome,
-    confirm_paid_order_from_query,
+    confirm_paid_order_from_query_and_terminate_reconciliation,
     load_reconciliation_order,
     mark_open_order_abnormal_and_terminate_reconciliation,
-    mark_open_order_closed_from_trusted_provider,
+    mark_open_order_closed_and_terminate_reconciliation,
 )
 from license_server.wechat_payment import WechatPaymentError
 
@@ -170,12 +170,16 @@ class PaymentReconciliationService:
     ) -> ReconciliationResult:
         try:
             confirmation_time = self._now()
-            confirmation = confirm_paid_order_from_query(
+            outcome = confirm_paid_order_from_query_and_terminate_reconciliation(
                 self.database_path,
                 query,
+                order_id=claim.order_id,
+                claim_token=claim.claim_token,
+                expected_state_version=claim.state_version,
                 expected_appid=self.expected_appid,
                 expected_mchid=self.expected_mchid,
                 now=confirmation_time,
+                clock=self.clock,
             )
         except PaymentServiceError:
             return self._terminate_and_mark_abnormal(
@@ -184,26 +188,21 @@ class PaymentReconciliationService:
                 trade_state="SUCCESS",
                 error="PAYMENT_QUERY_MISMATCH",
             )
-        update = terminate_claim(
-            self.database_path,
-            claim_token=claim.claim_token,
-            expected_state_version=claim.state_version,
-            terminal_at=self._now(),
-            terminal_reason=(
-                "ORDER_ALREADY_PAID" if confirmation.idempotent else "PAYMENT_CONFIRMED"
-            ),
-            trusted_trade_state="SUCCESS",
-            last_error_code=None,
-            query_completed=True,
-            clock=self.clock,
-        )
-        if update.outcome is UpdateOutcome.LOST_CLAIM:
-            return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM_AFTER_PAYMENT)
-        return ReconciliationResult(
-            ReconciliationOutcome.ALREADY_PAID
-            if confirmation.idempotent
-            else ReconciliationOutcome.PAID
-        )
+        if outcome is TrustedOrderUpdateOutcome.LOST_CLAIM:
+            return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
+        if outcome in {
+            TrustedOrderUpdateOutcome.CONFLICT,
+            TrustedOrderUpdateOutcome.NOT_ELIGIBLE,
+        }:
+            return self._terminate_and_mark_abnormal(
+                claim,
+                reason="PAYMENT_QUERY_MISMATCH",
+                trade_state="SUCCESS",
+                error="PAYMENT_QUERY_MISMATCH",
+            )
+        if outcome is TrustedOrderUpdateOutcome.ALREADY_PAID:
+            return ReconciliationResult(ReconciliationOutcome.ALREADY_PAID)
+        return ReconciliationResult(ReconciliationOutcome.PAID)
 
     def _terminate_and_mark_abnormal(
         self,
@@ -258,20 +257,17 @@ class PaymentReconciliationService:
                 reason="CLOSED_QUERY_MISMATCH",
                 error="CLOSED_QUERY_MISMATCH",
             )
-        local = mark_open_order_closed_from_trusted_provider(
+        local = mark_open_order_closed_and_terminate_reconciliation(
             self.database_path,
             order_id=claim.order_id,
             provider_trade_state="CLOSED",
             claim_token=claim.claim_token,
             expected_state_version=claim.state_version,
             now=self._now(),
+            close_completed=False,
             clock=self.clock,
         )
-        return self._finish_closed(
-            claim,
-            local=local,
-            close_completed=False,
-        )
+        return self._finish_closed(local)
 
     def _notpay(
         self,
@@ -317,60 +313,31 @@ class PaymentReconciliationService:
             )
         if closed.outcome is not CloseOrderOutcome.CLOSED:
             return self._retry_close(close_claim.claim)
-        local = mark_open_order_closed_from_trusted_provider(
+        local = mark_open_order_closed_and_terminate_reconciliation(
             self.database_path,
             order_id=claim.order_id,
             provider_trade_state="CLOSED",
             claim_token=close_claim.claim.claim_token,
             expected_state_version=close_claim.claim.state_version,
             now=self._now(),
+            close_completed=True,
             clock=self.clock,
         )
-        return self._finish_closed(
-            close_claim.claim,
-            local=local,
-            close_completed=True,
-        )
+        return self._finish_closed(local)
 
     def _finish_closed(
         self,
-        claim: ReconciliationClaim,
-        *,
         local: TrustedOrderUpdateOutcome,
-        close_completed: bool,
     ) -> ReconciliationResult:
         if local is TrustedOrderUpdateOutcome.LOST_CLAIM:
             return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
         if local is TrustedOrderUpdateOutcome.ALREADY_PAID:
-            return self._terminate_paid_race(claim)
+            return ReconciliationResult(ReconciliationOutcome.ALREADY_PAID)
         if local is TrustedOrderUpdateOutcome.ALREADY_CLOSED:
-            outcome = ReconciliationOutcome.ALREADY_CLOSED
-        elif local is TrustedOrderUpdateOutcome.UPDATED:
-            outcome = ReconciliationOutcome.CLOSED
-        else:
-            return self._terminate(
-                claim,
-                reason="LOCAL_CLOSE_REVIEW",
-                trade_state="CLOSED",
-                error="LOCAL_CLOSE_REVIEW",
-                query_completed=True,
-                close_completed=close_completed,
-            )
-        update = terminate_claim(
-            self.database_path,
-            claim_token=claim.claim_token,
-            expected_state_version=claim.state_version,
-            terminal_at=self._now(),
-            terminal_reason="PROVIDER_CLOSED",
-            trusted_trade_state="CLOSED",
-            last_error_code=None,
-            query_completed=True,
-            close_completed=close_completed,
-            clock=self.clock,
-        )
-        if update.outcome is UpdateOutcome.LOST_CLAIM:
-            return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
-        return ReconciliationResult(outcome)
+            return ReconciliationResult(ReconciliationOutcome.ALREADY_CLOSED)
+        if local is TrustedOrderUpdateOutcome.UPDATED:
+            return ReconciliationResult(ReconciliationOutcome.CLOSED)
+        return ReconciliationResult(ReconciliationOutcome.TERMINAL_ABNORMAL)
 
     def _retry_query(
         self,

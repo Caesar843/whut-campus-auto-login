@@ -1,5 +1,6 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from threading import Event
 
@@ -77,7 +78,7 @@ def test_success_confirms_payment_once_and_terminates_reconciliation(tmp_path):
     assert gateway.closed == []
     with connect(path) as connection:
         order = connection.execute(
-            "SELECT status, open_slot, provider_transaction_id FROM payment_orders"
+            "SELECT status, open_slot, provider_transaction_id, paid_at FROM payment_orders"
         ).fetchone()
         grant = connection.execute(
             "SELECT issued_by FROM license_grants"
@@ -85,12 +86,112 @@ def test_success_confirms_payment_once_and_terminates_reconciliation(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM licenses WHERE license_type='paid'").fetchone()[0] == 1
     record = get(path, claim.order_id)
-    assert tuple(order) == ("PAID", None, "4200000001")
+    assert tuple(order) == ("PAID", None, "4200000001", datetime_text(NOW))
     assert grant["issued_by"] == "payment_query"
     assert record.reconcile_status == "TERMINAL"
     assert record.terminal_reason == "PAYMENT_CONFIRMED"
     assert record.trusted_trade_state == "SUCCESS"
     assert record.last_query_at == NOW
+    assert record.claim_token is None
+    assert record.claimed_by is None
+    assert record.claimed_at is None
+    assert record.lease_expires_at is None
+    assert record.state_version == claim.state_version + 1
+
+
+@pytest.mark.parametrize(
+    "failing_sql",
+    (
+        "INSERT INTO licenses",
+        "INSERT INTO license_grants",
+        "UPDATE payment_orders",
+        "UPDATE payment_reconciliations",
+    ),
+)
+def test_success_and_terminal_roll_back_together_on_each_write_failure(
+    tmp_path, monkeypatch, failing_sql
+):
+    path, claim = _claimed_order(tmp_path)
+    before = get(path, claim.order_id)
+    real_connect = payment_service.connect
+    monkeypatch.setattr(
+        payment_service,
+        "connect",
+        lambda database_path: _FailAfterExecuteConnection(
+            real_connect(database_path), failing_sql
+        ),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        _service(path, FakeGateway(_success(claim.order_id))).reconcile_claim(
+            claim,
+            now=NOW,
+        )
+
+    with connect(path) as connection:
+        order = connection.execute(
+            "SELECT status, open_slot, provider_transaction_id, paid_at FROM payment_orders"
+        ).fetchone()
+        assert tuple(order) == ("WAITING_PAYMENT", "open", None, None)
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM licenses WHERE license_type='paid'"
+        ).fetchone()[0] == 0
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert get(path, claim.order_id) == before
+    recovered = claim_order(
+        path,
+        order_id=claim.order_id,
+        worker_id="worker-2",
+        now=NOW + timedelta(seconds=60),
+        lease_seconds=60,
+    )
+    assert recovered.claim is not None
+    assert recovered.claim.claim_token != claim.claim_token
+
+
+@pytest.mark.parametrize("claim_kind", ("token", "version"))
+def test_success_with_stale_claim_does_not_commit_payment(tmp_path, claim_kind):
+    path, claim = _claimed_order(tmp_path)
+    stale = replace(
+        claim,
+        claim_token="stale-token" if claim_kind == "token" else claim.claim_token,
+        state_version=claim.state_version + (claim_kind == "version"),
+    )
+    before = get(path, claim.order_id)
+
+    result = _service(path, FakeGateway(_success(claim.order_id))).reconcile_claim(
+        stale,
+        now=NOW,
+    )
+
+    assert result.outcome is ReconciliationOutcome.LOST_CLAIM
+    assert _order_state(path) == ("WAITING_PAYMENT", "open")
+    assert get(path, claim.order_id) == before
+    with connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM licenses WHERE license_type='paid'"
+        ).fetchone()[0] == 0
+
+
+def test_success_at_lease_boundary_does_not_commit_payment(tmp_path):
+    clock = _MutableClock(NOW)
+    path, claim = _claimed_order(tmp_path, lease_seconds=1)
+    before = get(path, claim.order_id)
+    gateway = FakeGateway(
+        _success(claim.order_id),
+        on_query=lambda: clock.set(NOW + timedelta(seconds=1)),
+    )
+
+    result = _service(path, gateway, clock=clock).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.LOST_CLAIM
+    assert _order_state(path) == ("WAITING_PAYMENT", "open")
+    assert get(path, claim.order_id) == before
+    with connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
 
 
 def test_notpay_before_expiry_reschedules_without_closing_or_grant(tmp_path):
@@ -163,6 +264,80 @@ def test_expired_notpay_closes_upstream_then_locally_and_terminates(tmp_path):
     assert record.trusted_trade_state == "CLOSED"
     assert record.last_query_at == NOW
     assert record.last_close_at == NOW
+    assert record.claim_token is None
+    assert record.claimed_by is None
+    assert record.claimed_at is None
+    assert record.lease_expires_at is None
+    assert record.state_version == claim.state_version + 2
+
+
+@pytest.mark.parametrize(
+    "failing_sql",
+    ("UPDATE payment_orders", "UPDATE payment_reconciliations"),
+)
+def test_closed_and_terminal_roll_back_together_on_each_write_failure(
+    tmp_path, monkeypatch, failing_sql
+):
+    path, claim = _claimed_order(tmp_path)
+    before = get(path, claim.order_id)
+    real_connect = payment_service.connect
+    monkeypatch.setattr(
+        payment_service,
+        "connect",
+        lambda database_path: _FailAfterExecuteConnection(
+            real_connect(database_path), failing_sql
+        ),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        _service(path, FakeGateway(_closed_query(claim.order_id))).reconcile_claim(
+            claim,
+            now=NOW,
+        )
+
+    with connect(path) as connection:
+        order = connection.execute(
+            "SELECT status, open_slot, closed_at FROM payment_orders"
+        ).fetchone()
+        assert tuple(order) == ("WAITING_PAYMENT", "open", None)
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM licenses WHERE license_type='paid'"
+        ).fetchone()[0] == 0
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert get(path, claim.order_id) == before
+    recovered = claim_order(
+        path,
+        order_id=claim.order_id,
+        worker_id="worker-2",
+        now=NOW + timedelta(seconds=60),
+        lease_seconds=60,
+    )
+    assert recovered.claim is not None
+    assert recovered.claim.claim_token != claim.claim_token
+
+
+@pytest.mark.parametrize("claim_kind", ("token", "version"))
+def test_closed_with_stale_claim_does_not_close_order(tmp_path, claim_kind):
+    path, claim = _claimed_order(tmp_path)
+    stale = replace(
+        claim,
+        claim_token="stale-token" if claim_kind == "token" else claim.claim_token,
+        state_version=claim.state_version + (claim_kind == "version"),
+    )
+    before = get(path, claim.order_id)
+
+    result = _service(path, FakeGateway(_closed_query(claim.order_id))).reconcile_claim(
+        stale,
+        now=NOW,
+    )
+
+    assert result.outcome is ReconciliationOutcome.LOST_CLAIM
+    assert _order_state(path) == ("WAITING_PAYMENT", "open")
+    assert get(path, claim.order_id) == before
+    with connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
 
 
 def test_close_result_after_lease_expiry_without_reclaimer_does_not_close(tmp_path):
@@ -289,9 +464,63 @@ def test_callback_and_query_threads_issue_exactly_one_grant(tmp_path):
     with connect(path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM licenses WHERE license_type='paid'").fetchone()[0] == 1
+    assert get(path, claim.order_id).reconcile_status == "TERMINAL"
 
 
-def test_success_payment_commits_even_when_old_claim_was_reclaimed(tmp_path):
+def test_query_write_lock_before_callback_still_issues_one_grant(tmp_path, monkeypatch):
+    path, claim = _claimed_order(tmp_path)
+    query_locked = Event()
+    release_query = Event()
+    callback_attempted = Event()
+    real_connect = payment_service.connect
+    connect_count = 0
+
+    def connect_factory(database_path):
+        nonlocal connect_count
+        connect_count += 1
+        connection = real_connect(database_path)
+        if connect_count == 1:
+            return _PauseAfterBeginConnection(
+                connection,
+                query_locked,
+                release_query,
+            )
+        if connect_count == 2:
+            return _SignalBeforeBeginConnection(connection, callback_attempted)
+        return connection
+
+    monkeypatch.setattr(payment_service, "connect", connect_factory)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        query_future = executor.submit(
+            _service(path, FakeGateway(_success(claim.order_id))).reconcile_claim,
+            claim,
+            now=NOW,
+        )
+        assert query_locked.wait(timeout=5)
+        callback_future = executor.submit(
+            confirm_paid_order,
+            path,
+            _callback_evidence(claim.order_id),
+            issued_by="wechat_callback",
+            now=NOW,
+        )
+        assert callback_attempted.wait(timeout=5)
+        release_query.set()
+        query_result = query_future.result(timeout=5)
+        callback_result = callback_future.result(timeout=5)
+
+    assert query_result.outcome is ReconciliationOutcome.PAID
+    assert callback_result.idempotent is True
+    with connect(path) as connection:
+        assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM licenses WHERE license_type='paid'"
+        ).fetchone()[0] == 1
+    assert get(path, claim.order_id).reconcile_status == "TERMINAL"
+
+
+def test_success_payment_does_not_commit_when_old_claim_was_reclaimed(tmp_path):
     path, old_claim = _claimed_order(tmp_path)
     reclaimed = []
 
@@ -310,24 +539,14 @@ def test_success_payment_commits_even_when_old_claim_was_reclaimed(tmp_path):
         FakeGateway(_success(old_claim.order_id), on_query=reclaim),
     ).reconcile_claim(old_claim, now=NOW)
 
-    assert result.outcome is ReconciliationOutcome.LOST_CLAIM_AFTER_PAYMENT
+    assert result.outcome is ReconciliationOutcome.LOST_CLAIM
     assert reclaimed[0] is not None
     with connect(path) as connection:
-        assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
-        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+        assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "WAITING_PAYMENT"
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
     record = get(path, old_claim.order_id)
     assert record.claim_token == reclaimed[0].claim_token
     assert record.reconcile_status == "CLAIMED"
-
-    follow_up = _service(
-        path,
-        FakeGateway(_success(old_claim.order_id)),
-    ).reconcile_claim(reclaimed[0], now=NOW + timedelta(seconds=60))
-
-    assert follow_up.outcome is ReconciliationOutcome.ALREADY_PAID
-    assert get(path, old_claim.order_id).reconcile_status == "TERMINAL"
-    with connect(path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize(
@@ -460,6 +679,9 @@ def test_closed_query_cannot_overwrite_concurrent_paid_order(tmp_path):
     with connect(path) as connection:
         assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
         assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "TERMINAL"
+    assert record.terminal_reason == "ORDER_ALREADY_PAID"
     assert gateway.closed == []
 
 
@@ -797,6 +1019,9 @@ def test_close_result_cannot_overwrite_callback_paid_race(tmp_path):
     with connect(path) as connection:
         assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
         assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "TERMINAL"
+    assert record.terminal_reason == "ORDER_ALREADY_PAID"
 
 
 def test_stale_close_result_cannot_close_order_after_claim_is_reclaimed(tmp_path):
@@ -1123,6 +1348,37 @@ class _FailAfterExecuteConnection:
         if self._failing_sql in " ".join(sql.split()):
             raise sqlite3.OperationalError("database is locked")
         return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+class _PauseAfterBeginConnection:
+    def __init__(self, connection, entered, release):
+        self._connection = connection
+        self._entered = entered
+        self._release = release
+
+    def execute(self, sql, parameters=()):
+        cursor = self._connection.execute(sql, parameters)
+        if " ".join(sql.split()) == "BEGIN IMMEDIATE":
+            self._entered.set()
+            assert self._release.wait(timeout=5)
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+class _SignalBeforeBeginConnection:
+    def __init__(self, connection, attempted):
+        self._connection = connection
+        self._attempted = attempted
+
+    def execute(self, sql, parameters=()):
+        if " ".join(sql.split()) == "BEGIN IMMEDIATE":
+            self._attempted.set()
+        return self._connection.execute(sql, parameters)
 
     def __getattr__(self, name):
         return getattr(self._connection, name)
