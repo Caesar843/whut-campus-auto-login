@@ -111,6 +111,14 @@ class PaymentReconciliationService:
         now: datetime,
     ) -> ReconciliationResult:
         _utc(now)
+        return self._query_once(claim, allow_close_attempt=True)
+
+    def _query_once(
+        self,
+        claim: ReconciliationClaim,
+        *,
+        allow_close_attempt: bool,
+    ) -> ReconciliationResult:
         try:
             query = self.gateway.query_order(claim.order_id)
         except WechatPaymentError as exc:
@@ -118,6 +126,7 @@ class PaymentReconciliationService:
                 return self._retry_query(
                     claim,
                     error="QUERY_GATEWAY_RETRYABLE",
+                    allow_exhaustion=allow_close_attempt,
                 )
             return self._terminate_and_mark_abnormal(
                 claim,
@@ -128,6 +137,7 @@ class PaymentReconciliationService:
             return self._retry_query(
                 claim,
                 error="QUERY_GATEWAY_RETRYABLE",
+                allow_exhaustion=allow_close_attempt,
             )
         if query.out_trade_no != claim.order_id:
             return self._terminate_and_mark_abnormal(
@@ -138,7 +148,7 @@ class PaymentReconciliationService:
         if query.outcome is QueryOrderOutcome.SUCCESS:
             return self._success(claim, query=query)
         if query.outcome is QueryOrderOutcome.NOTPAY:
-            return self._notpay(claim)
+            return self._notpay(claim, allow_close_attempt=allow_close_attempt)
         if query.outcome is QueryOrderOutcome.CLOSED:
             return self._closed(claim, query=query)
         if query.outcome is QueryOrderOutcome.USERPAYING:
@@ -150,11 +160,26 @@ class PaymentReconciliationService:
             QueryOrderOutcome.UNKNOWN: "UNKNOWN_REVIEW_REQUIRED",
         }
         if query.outcome in abnormal_reasons:
+            if (
+                not allow_close_attempt
+                and query.outcome is QueryOrderOutcome.UNKNOWN
+            ):
+                return self._retry_query(
+                    claim,
+                    trade_state="UNKNOWN",
+                    allow_exhaustion=False,
+                )
             return self._terminate_and_mark_abnormal(
                 claim,
                 reason=abnormal_reasons[query.outcome],
                 trade_state=query.outcome.value,
                 error=abnormal_reasons[query.outcome],
+            )
+        if not allow_close_attempt:
+            return self._retry_query(
+                claim,
+                error="QUERY_RESULT_UNCLEAR",
+                allow_exhaustion=False,
             )
         return self._terminate(
             claim,
@@ -225,6 +250,8 @@ class PaymentReconciliationService:
         )
         if outcome is TrustedOrderUpdateOutcome.LOST_CLAIM:
             return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
+        if outcome is TrustedOrderUpdateOutcome.ALREADY_PAID:
+            return ReconciliationResult(ReconciliationOutcome.ALREADY_PAID)
         return ReconciliationResult(ReconciliationOutcome.TERMINAL_ABNORMAL)
 
     def _closed(
@@ -272,6 +299,8 @@ class PaymentReconciliationService:
     def _notpay(
         self,
         claim: ReconciliationClaim,
+        *,
+        allow_close_attempt: bool,
     ) -> ReconciliationResult:
         order = load_reconciliation_order(self.database_path, claim.order_id)
         if order is None:
@@ -283,7 +312,9 @@ class PaymentReconciliationService:
             )
         if order.status == "PAID":
             return self._terminate_paid_race(claim)
-        if self._now() < order.expires_at:
+        if not allow_close_attempt or self._now() < order.expires_at:
+            return self._retry_query(claim, trade_state="NOTPAY")
+        if claim.close_attempt_count >= self.policy.max_close_attempts:
             return self._retry_query(claim, trade_state="NOTPAY")
         close_claim = begin_close_attempt(
             self.database_path,
@@ -310,6 +341,11 @@ class PaymentReconciliationService:
             return self._retry_close(
                 close_claim.claim,
                 error="CLOSE_GATEWAY_RETRYABLE",
+            )
+        if closed.outcome is CloseOrderOutcome.PAID:
+            return self._query_once(
+                close_claim.claim,
+                allow_close_attempt=False,
             )
         if closed.outcome is not CloseOrderOutcome.CLOSED:
             return self._retry_close(close_claim.claim)
@@ -345,11 +381,16 @@ class PaymentReconciliationService:
         *,
         trade_state: str | None = None,
         error: str | None = None,
+        allow_exhaustion: bool = True,
     ) -> ReconciliationResult:
         order = load_reconciliation_order(self.database_path, claim.order_id)
         if order is not None and order.status == "PAID":
             return self._terminate_paid_race(claim)
-        if claim.query_attempt_count >= self.policy.max_query_attempts:
+        if (
+            allow_exhaustion
+            and trade_state not in {"NOTPAY", "USERPAYING"}
+            and claim.query_attempt_count >= self.policy.max_query_attempts
+        ):
             return self._terminate(
                 claim,
                 reason="QUERY_RETRY_EXHAUSTED",
@@ -357,18 +398,25 @@ class PaymentReconciliationService:
                 error=error,
             )
         operation_time = self._now()
+        next_attempt_at = operation_time + timedelta(
+            seconds=_retry_delay(
+                min(claim.query_attempt_count, self.policy.max_query_attempts),
+                self.policy.query_retry_base_seconds,
+                self.policy.query_retry_max_seconds,
+            )
+        )
+        if (
+            trade_state == "NOTPAY"
+            and order is not None
+            and operation_time < order.expires_at
+        ):
+            next_attempt_at = min(next_attempt_at, order.expires_at)
         values = dict(
             database_path=self.database_path,
             claim_token=claim.claim_token,
             expected_state_version=claim.state_version,
             completed_at=operation_time,
-            next_attempt_at=operation_time + timedelta(
-                seconds=_retry_delay(
-                    claim.query_attempt_count,
-                    self.policy.query_retry_base_seconds,
-                    self.policy.query_retry_max_seconds,
-                )
-            ),
+            next_attempt_at=next_attempt_at,
             last_error_code=error,
             query_completed=True,
             clock=self.clock,

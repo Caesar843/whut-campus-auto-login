@@ -7,6 +7,14 @@ from threading import Event
 import pytest
 
 from license_server import payment_service
+from license_server.config import (
+    DEFAULT_PAYMENT_RECONCILIATION_CLOSE_RETRY_BASE_SECONDS,
+    DEFAULT_PAYMENT_RECONCILIATION_CLOSE_RETRY_MAX_SECONDS,
+    DEFAULT_PAYMENT_RECONCILIATION_MAX_CLOSE_ATTEMPTS,
+    DEFAULT_PAYMENT_RECONCILIATION_MAX_QUERY_ATTEMPTS,
+    DEFAULT_PAYMENT_RECONCILIATION_QUERY_RETRY_BASE_SECONDS,
+    DEFAULT_PAYMENT_RECONCILIATION_QUERY_RETRY_MAX_SECONDS,
+)
 from license_server.db import connect, initialize_database
 from license_server.payment import ANNUAL_V1, PaymentEvidence, PaymentEvidenceSource
 from license_server.payment_gateway import (
@@ -27,6 +35,7 @@ from license_server.payment_reconciliation_service import (
     PaymentReconciliationService,
     ReconciliationOutcome,
 )
+from license_server.payment_routes import _REFRESH_POLICY
 from license_server.payment_service import confirm_paid_order
 from license_server.wechat_payment import WechatPaymentError
 from license_server.signer import datetime_text
@@ -42,6 +51,14 @@ POLICY = PaymentReconciliationPolicy(
     close_retry_base_seconds=3,
     close_retry_max_seconds=9,
     max_close_attempts=2,
+)
+DEFAULT_WORKER_SERVICE_POLICY = PaymentReconciliationPolicy(
+    query_retry_base_seconds=DEFAULT_PAYMENT_RECONCILIATION_QUERY_RETRY_BASE_SECONDS,
+    query_retry_max_seconds=DEFAULT_PAYMENT_RECONCILIATION_QUERY_RETRY_MAX_SECONDS,
+    max_query_attempts=DEFAULT_PAYMENT_RECONCILIATION_MAX_QUERY_ATTEMPTS,
+    close_retry_base_seconds=DEFAULT_PAYMENT_RECONCILIATION_CLOSE_RETRY_BASE_SECONDS,
+    close_retry_max_seconds=DEFAULT_PAYMENT_RECONCILIATION_CLOSE_RETRY_MAX_SECONDS,
+    max_close_attempts=DEFAULT_PAYMENT_RECONCILIATION_MAX_CLOSE_ATTEMPTS,
 )
 
 
@@ -214,6 +231,22 @@ def test_notpay_before_expiry_reschedules_without_closing_or_grant(tmp_path):
     assert gateway.closed == []
 
 
+def test_default_worker_policy_keeps_notpay_queryable_until_order_expiry(tmp_path):
+    _assert_notpay_lifecycle_reaches_close(
+        tmp_path,
+        DEFAULT_WORKER_SERVICE_POLICY,
+        order_id="worker-policy-order",
+    )
+
+
+def test_manual_refresh_policy_keeps_notpay_queryable_until_order_expiry(tmp_path):
+    _assert_notpay_lifecycle_reaches_close(
+        tmp_path,
+        _REFRESH_POLICY,
+        order_id="manual-policy-order",
+    )
+
+
 def test_query_result_after_lease_expiry_without_reclaimer_loses_claim(tmp_path):
     clock = _MutableClock(NOW)
     path, claim = _claimed_order(tmp_path, lease_seconds=1)
@@ -269,6 +302,189 @@ def test_expired_notpay_closes_upstream_then_locally_and_terminates(tmp_path):
     assert record.claimed_at is None
     assert record.lease_expires_at is None
     assert record.state_version == claim.state_version + 2
+
+
+def test_close_paid_forces_one_follow_up_query_and_confirms_success(tmp_path):
+    path, claim = _claimed_order(tmp_path, expires_at=NOW)
+    gateway = SequenceGateway(
+        [
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+            _success(claim.order_id),
+        ],
+        CloseOrderResult(CloseOrderOutcome.PAID),
+    )
+
+    result = _service(path, gateway).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.PAID
+    assert gateway.queried == [claim.order_id, claim.order_id]
+    assert gateway.closed == [claim.order_id]
+    with connect(path) as connection:
+        assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM licenses WHERE license_type='paid'"
+        ).fetchone()[0] == 1
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "TERMINAL"
+    assert record.terminal_reason == "PAYMENT_CONFIRMED"
+
+
+def test_close_paid_follow_up_closed_uses_existing_atomic_close(tmp_path):
+    path, claim = _claimed_order(tmp_path, expires_at=NOW)
+    gateway = SequenceGateway(
+        [
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+            _closed_query(claim.order_id),
+        ],
+        CloseOrderResult(CloseOrderOutcome.PAID),
+    )
+
+    result = _service(path, gateway).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.CLOSED
+    assert gateway.queried == [claim.order_id, claim.order_id]
+    assert gateway.closed == [claim.order_id]
+    assert _order_state(path) == ("CLOSED", None)
+    assert get(path, claim.order_id).terminal_reason == "PROVIDER_CLOSED"
+
+
+@pytest.mark.parametrize(
+    "follow_up",
+    ("NOTPAY", "USERPAYING", "UNKNOWN", "RETRYABLE"),
+)
+def test_close_paid_uncertain_follow_up_stays_queryable_without_second_close(
+    tmp_path, follow_up
+):
+    path, claim = _claimed_order(tmp_path, expires_at=NOW)
+    query_result = (
+        WechatPaymentError("PAYMENT_READ_TIMEOUT", retryable=True)
+        if follow_up == "RETRYABLE"
+        else _simple_query(claim.order_id, QueryOrderOutcome[follow_up])
+    )
+    gateway = SequenceGateway(
+        [
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+            query_result,
+        ],
+        CloseOrderResult(CloseOrderOutcome.PAID),
+    )
+
+    result = _service(path, gateway).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.RESCHEDULED
+    assert gateway.queried == [claim.order_id, claim.order_id]
+    assert gateway.closed == [claim.order_id]
+    assert _order_state(path) == ("WAITING_PAYMENT", "open")
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "READY"
+    assert record.terminal_reason is None
+    with connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
+
+
+def test_last_close_attempt_paid_returns_to_query_instead_of_exhausting(tmp_path):
+    clock = _MutableClock(NOW)
+    path, claim = _claimed_order(
+        tmp_path,
+        expires_at=NOW,
+        close_attempt_count=POLICY.max_close_attempts - 1,
+    )
+    gateway = SequenceGateway(
+        [
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+        ],
+        CloseOrderResult(CloseOrderOutcome.PAID),
+    )
+
+    service = _service(path, gateway, clock=clock)
+    result = service.reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.RESCHEDULED
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "READY"
+    assert record.terminal_reason is None
+    assert record.close_attempt_count == POLICY.max_close_attempts
+    assert gateway.queried == [claim.order_id, claim.order_id]
+    assert gateway.closed == [claim.order_id]
+
+    clock.set(record.next_attempt_at)
+    next_claim = claim_order(
+        path,
+        order_id=claim.order_id,
+        worker_id="next-worker",
+        now=clock.current,
+        lease_seconds=60,
+    ).claim
+    assert next_claim is not None
+
+    result = service.reconcile_claim(next_claim, now=clock.current)
+
+    assert result.outcome is ReconciliationOutcome.RESCHEDULED
+    assert gateway.queried == [claim.order_id] * 3
+    assert gateway.closed == [claim.order_id]
+    record = get(path, claim.order_id)
+    assert record.close_attempt_count == POLICY.max_close_attempts
+    assert record.reconcile_status == "READY"
+
+
+def test_callback_between_close_paid_and_follow_up_query_remains_idempotent(tmp_path):
+    path, claim = _claimed_order(tmp_path, expires_at=NOW)
+    gateway = SequenceGateway(
+        [
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+            _success(claim.order_id),
+        ],
+        CloseOrderResult(CloseOrderOutcome.PAID),
+        on_queries=[
+            None,
+            lambda: confirm_paid_order(
+                path,
+                _callback_evidence(claim.order_id),
+                issued_by="wechat_callback",
+                now=NOW - timedelta(seconds=1),
+            ),
+        ],
+    )
+
+    result = _service(path, gateway).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.ALREADY_PAID
+    with connect(path) as connection:
+        assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM licenses WHERE license_type='paid'"
+        ).fetchone()[0] == 1
+    assert get(path, claim.order_id).terminal_reason == "ORDER_ALREADY_PAID"
+
+
+def test_close_paid_follow_up_crossing_lease_has_no_side_effects(tmp_path):
+    clock = _MutableClock(NOW)
+    path, claim = _claimed_order(tmp_path, expires_at=NOW, lease_seconds=1)
+    gateway = SequenceGateway(
+        [
+            _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+            _success(claim.order_id),
+        ],
+        CloseOrderResult(CloseOrderOutcome.PAID),
+        on_close=lambda: clock.set(NOW + timedelta(seconds=1)),
+    )
+
+    result = _service(path, gateway, clock=clock).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.LOST_CLAIM
+    assert gateway.queried == [claim.order_id, claim.order_id]
+    assert gateway.closed == [claim.order_id]
+    assert _order_state(path) == ("WAITING_PAYMENT", "open")
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "CLAIMED"
+    assert record.claim_token == claim.claim_token
+    with connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -592,7 +808,7 @@ def test_success_mismatch_marks_open_order_abnormal_without_grant(
     assert get(path, claim.order_id).reconcile_status == "TERMINAL"
 
 
-def test_mismatched_success_cannot_overwrite_concurrent_paid_order(tmp_path):
+def test_mismatched_success_reports_concurrent_paid_order_as_already_paid(tmp_path):
     path, claim = _claimed_order(tmp_path)
     gateway = FakeGateway(
         _success(claim.order_id, amount_total=1),
@@ -606,21 +822,28 @@ def test_mismatched_success_cannot_overwrite_concurrent_paid_order(tmp_path):
 
     result = _service(path, gateway).reconcile_claim(claim, now=NOW)
 
-    assert result.outcome is ReconciliationOutcome.TERMINAL_ABNORMAL
+    assert result.outcome is ReconciliationOutcome.ALREADY_PAID
     with connect(path) as connection:
         assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
         assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM licenses WHERE license_type='paid'"
+        ).fetchone()[0] == 1
+    assert get(path, claim.order_id).terminal_reason == "ORDER_ALREADY_PAID"
 
 
-def test_notpay_at_query_limit_terminates_without_changing_order(tmp_path):
+def test_notpay_at_query_limit_remains_ready_without_changing_order(tmp_path):
     path, claim = _claimed_order(tmp_path, query_attempt_count=2)
     result = _service(
         path,
         FakeGateway(_simple_query(claim.order_id, QueryOrderOutcome.NOTPAY)),
     ).reconcile_claim(claim, now=NOW)
 
-    assert result.outcome is ReconciliationOutcome.TERMINAL_ABNORMAL
-    assert get(path, claim.order_id).terminal_reason == "QUERY_RETRY_EXHAUSTED"
+    assert result.outcome is ReconciliationOutcome.RESCHEDULED
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "READY"
+    assert record.terminal_reason is None
+    assert record.next_attempt_at <= NOW + timedelta(minutes=1)
     with connect(path) as connection:
         assert tuple(connection.execute("SELECT status, open_slot FROM payment_orders").fetchone()) == (
             "WAITING_PAYMENT",
@@ -777,17 +1000,51 @@ def test_userpaying_reschedules_even_after_local_expiry(tmp_path):
         assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "WAITING_PAYMENT"
 
 
-def test_userpaying_at_query_limit_terminates_without_changing_order(tmp_path):
-    path, claim = _claimed_order(tmp_path, expires_at=NOW, query_attempt_count=2)
+@pytest.mark.parametrize(
+    "expires_at",
+    (NOW + timedelta(minutes=1), NOW, NOW - timedelta(minutes=1)),
+)
+def test_userpaying_at_query_limit_remains_ready_without_closing(
+    tmp_path, expires_at
+):
+    path, claim = _claimed_order(
+        tmp_path,
+        expires_at=expires_at,
+        query_attempt_count=POLICY.max_query_attempts - 1,
+    )
+    gateway = FakeGateway(
+        _simple_query(claim.order_id, QueryOrderOutcome.USERPAYING)
+    )
+    result = _service(
+        path,
+        gateway,
+    ).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.RESCHEDULED
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "READY"
+    assert record.terminal_reason is None
+    assert record.next_attempt_at == NOW + timedelta(seconds=8)
+    assert gateway.closed == []
+    with connect(path) as connection:
+        assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "WAITING_PAYMENT"
+
+
+def test_huge_pending_attempt_count_keeps_backoff_finite_and_bounded(tmp_path):
+    path, claim = _claimed_order(
+        tmp_path,
+        query_attempt_count=10**9,
+    )
+
     result = _service(
         path,
         FakeGateway(_simple_query(claim.order_id, QueryOrderOutcome.USERPAYING)),
     ).reconcile_claim(claim, now=NOW)
 
-    assert result.outcome is ReconciliationOutcome.TERMINAL_ABNORMAL
-    assert get(path, claim.order_id).terminal_reason == "QUERY_RETRY_EXHAUSTED"
-    with connect(path) as connection:
-        assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "WAITING_PAYMENT"
+    assert result.outcome is ReconciliationOutcome.RESCHEDULED
+    record = get(path, claim.order_id)
+    assert record.next_attempt_at == NOW + timedelta(seconds=8)
+    assert record.reconcile_status == "READY"
 
 
 @pytest.mark.parametrize(
@@ -842,12 +1099,14 @@ def test_abnormal_trade_states_preserve_concurrent_paid_license(tmp_path, outcom
         ),
     )
 
-    _service(path, gateway).reconcile_claim(claim, now=NOW)
+    result = _service(path, gateway).reconcile_claim(claim, now=NOW)
 
+    assert result.outcome is ReconciliationOutcome.ALREADY_PAID
     with connect(path) as connection:
         assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
         assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM licenses WHERE license_type='paid'").fetchone()[0] == 1
+    assert get(path, claim.order_id).terminal_reason == "ORDER_ALREADY_PAID"
 
 
 def test_retryable_query_error_reschedules_with_safe_code(tmp_path):
@@ -1254,6 +1513,32 @@ class FakeGateway:
         raise AssertionError("notifications are outside reconciliation")
 
 
+class SequenceGateway(FakeGateway):
+    def __init__(
+        self,
+        query_results,
+        close_result,
+        *,
+        on_queries=None,
+        on_close=None,
+    ):
+        super().__init__(None, close_result, on_close=on_close)
+        self.query_results = list(query_results)
+        self.on_queries = list(on_queries or [None] * len(self.query_results))
+
+    def query_order(self, order_id):
+        index = len(self.queried)
+        self.queried.append(order_id)
+        assert index < len(self.query_results)
+        callback = self.on_queries[index]
+        if callback is not None:
+            callback()
+        result = self.query_results[index]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
 def _service(path, gateway, policy=POLICY, clock=None):
     return PaymentReconciliationService(
         database_path=path,
@@ -1263,6 +1548,47 @@ def _service(path, gateway, policy=POLICY, clock=None):
         policy=policy,
         clock=clock or (lambda: NOW),
     )
+
+
+def _assert_notpay_lifecycle_reaches_close(tmp_path, policy, *, order_id):
+    expires_at = NOW + timedelta(seconds=900)
+    clock = _MutableClock(NOW)
+    path, claim = _claimed_order(
+        tmp_path,
+        expires_at=expires_at,
+        order_id=order_id,
+    )
+    gateway = FakeGateway(
+        _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+        CloseOrderResult(CloseOrderOutcome.CLOSED),
+    )
+    service = _service(path, gateway, policy, clock=clock)
+
+    while clock.current < expires_at:
+        result = service.reconcile_claim(claim, now=clock.current)
+        assert result.outcome is ReconciliationOutcome.RESCHEDULED
+        assert _order_state(path) == ("WAITING_PAYMENT", "open")
+        record = get(path, claim.order_id)
+        assert record.reconcile_status == "READY"
+        assert record.terminal_reason is None
+        assert clock.current < record.next_attempt_at <= expires_at
+        clock.set(record.next_attempt_at)
+        claimed = claim_order(
+            path,
+            order_id=claim.order_id,
+            worker_id="next-worker",
+            now=clock.current,
+            lease_seconds=60,
+        )
+        assert claimed.claim is not None
+        claim = claimed.claim
+
+    result = service.reconcile_claim(claim, now=clock.current)
+    assert result.outcome is ReconciliationOutcome.CLOSED
+    assert gateway.closed == [claim.order_id]
+    assert _order_state(path) == ("CLOSED", None)
+    with connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
 
 
 def _claimed_order(

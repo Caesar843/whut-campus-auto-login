@@ -192,6 +192,17 @@ class WeChatNativePaymentGateway:
         request_id = _request_id(response)
         if response.status_code == 204:
             return CloseOrderResult(CloseOrderOutcome.CLOSED, request_id)
+        if response.status_code == 400:
+            try:
+                error_body = _json_object(response.content)
+            except WechatPaymentError:
+                pass
+            else:
+                if (
+                    isinstance(error_body.get("code"), str)
+                    and error_body["code"] == "ORDER_PAID"
+                ):
+                    return CloseOrderResult(CloseOrderOutcome.PAID, request_id)
         if response.status_code != 200:
             raise _upstream_response_error(response.status_code)
         body = _json_object(response.content)

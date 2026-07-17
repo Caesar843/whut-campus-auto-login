@@ -262,6 +262,92 @@ def test_close_maps_only_verified_200_or_204_success_to_closed(tmp_path):
         assert _gateway(config, response).close_order("pay_test").outcome is expected
 
 
+def test_close_maps_verified_400_order_paid_exactly_to_paid(tmp_path):
+    private_key, config = _config(tmp_path)
+
+    def paid(request):
+        return _signed_response(
+            private_key,
+            request,
+            400,
+            b'{"code":"ORDER_PAID","message":"ignored"}',
+        )
+
+    assert (
+        _gateway(config, paid).close_order("pay_test").outcome
+        is CloseOrderOutcome.PAID
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        b"not-json",
+        b"[]",
+        b"{}",
+        b'{"code":true}',
+        b'{"code":"ORDER_NOT_EXIST"}',
+        b'{"code":"SYSTEM_ERROR","message":"order already paid"}',
+    ),
+)
+def test_close_never_infers_paid_from_untrusted_400_payload_shapes(tmp_path, body):
+    private_key, config = _config(tmp_path)
+
+    def rejected(request):
+        return _signed_response(private_key, request, 400, body)
+
+    with pytest.raises(WechatPaymentError) as exc_info:
+        _gateway(config, rejected).close_order("pay_test")
+
+    assert exc_info.value.code == "PAYMENT_UPSTREAM_REJECTED"
+
+
+def test_close_rejects_unsigned_400_order_paid(tmp_path):
+    _private_key, config = _config(tmp_path)
+
+    def untrusted(request):
+        return httpx.Response(
+            400,
+            content=b'{"code":"ORDER_PAID"}',
+            request=request,
+        )
+
+    with pytest.raises(WechatPaymentError) as exc_info:
+        _gateway(config, untrusted).close_order("pay_test")
+
+    assert exc_info.value.code == "PAYMENT_RESPONSE_SIGNATURE_MISSING"
+
+
+def test_close_rejects_invalid_or_stale_signed_400_order_paid(tmp_path):
+    private_key, config = _config(tmp_path)
+    other_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def invalid_signature(request):
+        return _signed_response(
+            other_private_key,
+            request,
+            400,
+            b'{"code":"ORDER_PAID"}',
+        )
+
+    with pytest.raises(WechatPaymentError) as exc_info:
+        _gateway(config, invalid_signature).close_order("pay_test")
+    assert exc_info.value.code == "PAYMENT_RESPONSE_SIGNATURE_INVALID"
+
+    def stale(request):
+        return _signed_response(
+            private_key,
+            request,
+            400,
+            b'{"code":"ORDER_PAID"}',
+            timestamp=int((NOW - timedelta(minutes=6)).timestamp()),
+        )
+
+    with pytest.raises(WechatPaymentError) as exc_info:
+        _gateway(config, stale).close_order("pay_test")
+    assert exc_info.value.code == "PAYMENT_RESPONSE_TIMESTAMP_INVALID"
+
+
 def test_close_rejects_signature_transport_http_and_invalid_body(tmp_path):
     private_key, config = _config(tmp_path)
 
@@ -284,7 +370,7 @@ def test_close_rejects_signature_transport_http_and_invalid_body(tmp_path):
             private_key,
             request,
             400,
-            b'{"code":"ORDER_PAID","message":"ignored"}',
+            b'{"code":"ORDER_NOT_EXIST","message":"ignored"}',
         )
 
     with pytest.raises(WechatPaymentError) as exc_info:
