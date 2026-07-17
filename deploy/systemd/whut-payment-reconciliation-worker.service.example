@@ -2,7 +2,6 @@
 Description=WHUT License WeChat Payment Reconciliation Worker
 Wants=network-online.target
 After=network-online.target whut-license-server.service
-Requires=whut-license-server.service
 
 [Service]
 Type=simple

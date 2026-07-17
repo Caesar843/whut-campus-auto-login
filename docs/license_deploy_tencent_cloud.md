@@ -132,6 +132,8 @@ sudo journalctl -u whut-license-server -f
 
 支付对账补偿 Worker 是 Web 服务之外的独立进程，用于支付回调缺失时的后台补偿。它不影响客户端手动刷新支付状态：Worker 默认关闭或未运行时，手动刷新仍可正常使用。该进程默认关闭，安装 unit 不代表启用或启动。
 
+reconciliation Worker 与 Web 服务是两个独立 systemd unit。Worker unit 中的 `After=whut-license-server.service` 只提供共同启动时的顺序，不会把 Worker 生命周期绑定到 Web 服务；重启 Web 服务不会停止该 Worker，Web 服务重启后应单独确认该 Worker 状态。Worker 不会因为 Web 服务再次启动而自动启动，启用 Worker 必须是单独的管理员动作。
+
 保持环境文件中的总开关为：
 
 ```bash

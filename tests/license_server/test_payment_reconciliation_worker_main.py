@@ -399,22 +399,45 @@ def test_worker_systemd_unit_is_separate_default_safe_and_secret_free():
     unit = Path(
         "deploy/systemd/whut-payment-reconciliation-worker.service.example"
     ).read_text(encoding="utf-8")
+    unit_directives = _systemd_section_directives(unit, "Unit")
+    service_directives = _systemd_section_directives(unit, "Service")
+    install_directives = _systemd_section_directives(unit, "Install")
 
-    for required in (
-        "User=whutlogin",
-        "Group=whutlogin",
-        "WorkingDirectory=/opt/whut-campus-auto-login",
-        "EnvironmentFile=/etc/whut-campus-auto-login/license-server.env",
-        "After=network-online.target whut-license-server.service",
-        "Requires=whut-license-server.service",
-        "ExecStart=/opt/whut-campus-auto-login/.venv/bin/python -m license_server.payment_reconciliation_worker_main",
-        "Restart=on-failure",
-        "RestartPreventExitStatus=2",
-        "KillSignal=SIGTERM",
-        "TimeoutStopSec=30",
-        "WantedBy=multi-user.target",
+    assert _systemd_directive_words(unit_directives, "After") >= {
+        "network-online.target",
+        "whut-license-server.service",
+    }
+    assert unit_directives["Wants"] == ["network-online.target"]
+    for coupling_directive in (
+        "Requires",
+        "Requisite",
+        "BindsTo",
+        "PartOf",
+        "Upholds",
+        "PropagatesStopTo",
+        "StopPropagatedFrom",
     ):
-        assert required in unit
+        assert "whut-license-server.service" not in _systemd_directive_words(
+            unit_directives,
+            coupling_directive,
+        )
+    assert service_directives["User"] == ["whutlogin"]
+    assert service_directives["Group"] == ["whutlogin"]
+    assert service_directives["WorkingDirectory"] == [
+        "/opt/whut-campus-auto-login"
+    ]
+    assert service_directives["EnvironmentFile"] == [
+        "/etc/whut-campus-auto-login/license-server.env"
+    ]
+    assert service_directives["ExecStart"] == [
+        "/opt/whut-campus-auto-login/.venv/bin/python -m license_server.payment_reconciliation_worker_main"
+    ]
+    assert service_directives["Restart"] == ["on-failure"]
+    assert service_directives["RestartSec"] == ["5"]
+    assert service_directives["RestartPreventExitStatus"] == ["2"]
+    assert service_directives["KillSignal"] == ["SIGTERM"]
+    assert service_directives["TimeoutStopSec"] == ["30"]
+    assert install_directives["WantedBy"] == ["multi-user.target"]
     for forbidden in (
         "User=root",
         "uvicorn",
@@ -478,6 +501,11 @@ def test_deployment_document_covers_default_disabled_operations_and_rollback():
         "systemctl disable whut-payment-reconciliation-worker.service",
         "手动刷新",
         "回调缺失",
+        "Web 服务之外的独立进程",
+        "重启 Web 服务不会停止该 Worker",
+        "Web 服务重启后应单独确认该 Worker 状态",
+        "不会因为 Web 服务再次启动而自动启动",
+        "启用 Worker 必须是单独的管理员动作",
         "真实微信商户",
         "本轮不启用",
         "不得与 Notification Worker 混用入口或 unit",
@@ -485,6 +513,7 @@ def test_deployment_document_covers_default_disabled_operations_and_rollback():
     ):
         assert required in document
     assert "systemctl enable --now whut-payment-reconciliation-worker.service" not in document
+    assert "Web 重启会自动恢复 Worker" not in document
 
 
 def test_notification_worker_unit_remains_separate():
@@ -550,3 +579,24 @@ def _run_module(values):
         timeout=10,
         check=False,
     )
+
+
+def _systemd_section_directives(unit, section):
+    current_section = None
+    directives = {}
+    for raw_line in unit.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1]
+            continue
+        if current_section != section or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        directives.setdefault(key, []).append(value.strip())
+    return directives
+
+
+def _systemd_directive_words(directives, key):
+    return {word for value in directives.get(key, []) for word in value.split()}
