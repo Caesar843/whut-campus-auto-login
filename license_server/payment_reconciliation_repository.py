@@ -5,7 +5,7 @@ import math
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -169,12 +169,14 @@ def ensure_ready(
 
 
 def claim_next_due(
-    database_path: Path, *, worker_id: str, now: datetime, lease_seconds: float
+    database_path: Path, *, worker_id: str, now: datetime, lease_seconds: float,
+    clock: Callable[[], datetime] | None = None,
 ) -> ReconciliationClaim | None:
     worker_id = _required_text(worker_id)
-    now_text, lease_text = _lease_times(now, lease_seconds)
+    _lease_times(now, lease_seconds)
 
     def claim(connection: sqlite3.Connection) -> ReconciliationClaim | None:
+        now_text, lease_text = _lease_times(_operation_time(now, clock), lease_seconds)
         row = connection.execute(
             f"""SELECT r.order_id FROM payment_reconciliations r
                 JOIN payment_orders o ON o.order_id = r.order_id
@@ -191,13 +193,15 @@ def claim_next_due(
 
 def claim_order(
     database_path: Path, *, order_id: str, worker_id: str,
-    now: datetime, lease_seconds: float
+    now: datetime, lease_seconds: float,
+    clock: Callable[[], datetime] | None = None,
 ) -> ClaimOrderResult:
     order_id = _required_text(order_id)
     worker_id = _required_text(worker_id)
-    now_text, lease_text = _lease_times(now, lease_seconds)
+    _lease_times(now, lease_seconds)
 
     def claim(connection: sqlite3.Connection) -> ClaimOrderResult:
+        now_text, lease_text = _lease_times(_operation_time(now, clock), lease_seconds)
         row = connection.execute(
             """SELECT r.*, o.status AS order_status
                FROM payment_reconciliations r JOIN payment_orders o ON o.order_id=r.order_id
@@ -223,13 +227,15 @@ def claim_order(
 
 
 def begin_close_attempt(
-    database_path: Path, *, claim_token: str, expected_state_version: int, now: datetime
+    database_path: Path, *, claim_token: str, expected_state_version: int, now: datetime,
+    clock: Callable[[], datetime] | None = None,
 ) -> ClaimUpdateResult:
     token = _required_text(claim_token)
     version = _version(expected_state_version)
-    now_text = _datetime_text(now)
+    _datetime_text(now)
 
     def update(connection: sqlite3.Connection) -> ClaimUpdateResult:
+        now_text = _datetime_text(_operation_time(now, clock))
         cursor = connection.execute(
             """UPDATE payment_reconciliations
                SET close_attempt_count=close_attempt_count+1,
@@ -254,16 +260,18 @@ def reschedule_claim(
     trusted_trade_state: str | None | object = _UNSET,
     last_error_code: str | None | object = _UNSET,
     query_completed: bool = False, close_completed: bool = False,
+    clock: Callable[[], datetime] | None = None,
 ) -> RecordUpdateResult:
-    completed_text = _datetime_text(completed_at)
-    next_text = _datetime_text(next_attempt_at)
-    if next_text <= completed_text:
+    completed = _normalized_datetime(completed_at)
+    next_attempt = _normalized_datetime(next_attempt_at)
+    if next_attempt <= completed:
         raise PaymentReconciliationRepositoryError("PAYMENT_RECONCILIATION_INPUT_INVALID")
     return _finish_claim(
-        database_path, claim_token, expected_state_version, completed_text,
-        next_text=next_text, terminal_reason=None,
+        database_path, claim_token, expected_state_version, completed,
+        retry_delay=next_attempt - completed, terminal_reason=None,
         trusted_trade_state=trusted_trade_state, last_error_code=last_error_code,
         query_completed=query_completed, close_completed=close_completed,
+        clock=clock,
     )
 
 
@@ -273,13 +281,62 @@ def terminate_claim(
     trusted_trade_state: str | None | object = _UNSET,
     last_error_code: str | None | object = _UNSET,
     query_completed: bool = False, close_completed: bool = False,
+    clock: Callable[[], datetime] | None = None,
 ) -> RecordUpdateResult:
     reason = _safe_code(terminal_reason)
     return _finish_claim(
-        database_path, claim_token, expected_state_version, _datetime_text(terminal_at),
-        next_text=None, terminal_reason=reason,
+        database_path, claim_token, expected_state_version,
+        _normalized_datetime(terminal_at), retry_delay=None, terminal_reason=reason,
         trusted_trade_state=trusted_trade_state, last_error_code=last_error_code,
         query_completed=query_completed, close_completed=close_completed,
+        clock=clock,
+    )
+
+
+def reconciliation_claim_is_current_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    order_id: str,
+    claim_token: str,
+    expected_state_version: int,
+    operation_time: datetime,
+) -> bool:
+    return connection.execute(
+        """SELECT 1 FROM payment_reconciliations
+           WHERE order_id=? AND reconcile_status='CLAIMED'
+             AND claim_token=? AND state_version=? AND lease_expires_at>?""",
+        (
+            _required_text(order_id),
+            _required_text(claim_token),
+            _version(expected_state_version),
+            _datetime_text(operation_time),
+        ),
+    ).fetchone() is not None
+
+
+def terminate_claim_in_transaction(
+    connection: sqlite3.Connection,
+    *,
+    claim_token: str,
+    expected_state_version: int,
+    terminal_at: datetime,
+    terminal_reason: str,
+    trusted_trade_state: str | None | object = _UNSET,
+    last_error_code: str | None | object = _UNSET,
+    query_completed: bool = False,
+    close_completed: bool = False,
+) -> RecordUpdateResult:
+    return _finish_claim_in_transaction(
+        connection,
+        token=_required_text(claim_token),
+        version=_version(expected_state_version),
+        completed_text=_datetime_text(terminal_at),
+        next_text=None,
+        terminal_reason=_safe_code(terminal_reason),
+        trade=_optional_trade_state(trusted_trade_state),
+        error=_optional_safe_code(last_error_code),
+        query_completed=query_completed,
+        close_completed=close_completed,
     )
 
 
@@ -318,8 +375,9 @@ def _claim_record(row):
 
 
 def _finish_claim(
-    database_path, claim_token, expected_state_version, completed_text, *, next_text,
+    database_path, claim_token, expected_state_version, completed_at, *, retry_delay,
     terminal_reason, trusted_trade_state, last_error_code, query_completed, close_completed,
+    clock,
 ):
     token = _required_text(claim_token)
     version = _version(expected_state_version)
@@ -329,42 +387,68 @@ def _finish_claim(
         raise PaymentReconciliationRepositoryError("PAYMENT_RECONCILIATION_INPUT_INVALID")
 
     def update(connection):
-        current = connection.execute(
-            "SELECT order_id FROM payment_reconciliations WHERE claim_token=?",
-            (token,),
-        ).fetchone()
-        assignments = [
-            "reconcile_status=?", "next_attempt_at=?", "claim_token=NULL", "claimed_by=NULL",
-            "claimed_at=NULL", "lease_expires_at=NULL", "terminal_reason=?", "terminal_at=?",
-            "state_version=state_version+1", "updated_at=?",
-        ]
-        values = ["TERMINAL" if terminal_reason else "READY", next_text, terminal_reason,
-                  completed_text if terminal_reason else None, completed_text]
-        if query_completed:
-            assignments.append("last_query_at=?"); values.append(completed_text)
-        if close_completed:
-            assignments.append("last_close_at=?"); values.append(completed_text)
-        if trade is not _UNSET:
-            assignments.append("trusted_trade_state=?"); values.append(trade)
-        if error is not _UNSET:
-            assignments.append("last_error_code=?"); values.append(error)
-        values.extend((token, version, completed_text))
-        cursor = connection.execute(
-            f"UPDATE payment_reconciliations SET {', '.join(assignments)} "
-            "WHERE reconcile_status='CLAIMED' AND claim_token=? AND state_version=? AND lease_expires_at>?",
-            values,
+        operation_time = _operation_time(completed_at, clock)
+        next_text = (
+            _datetime_text(operation_time + retry_delay)
+            if retry_delay is not None
+            else None
         )
-        if cursor.rowcount != 1:
-            return RecordUpdateResult(UpdateOutcome.LOST_CLAIM, None)
-        if current is None:
-            raise PaymentReconciliationRepositoryError("PAYMENT_RECONCILIATION_SCHEMA_INVALID")
-        row = connection.execute(
-            "SELECT * FROM payment_reconciliations WHERE order_id=?",
-            (current["order_id"],),
-        ).fetchone()
-        return RecordUpdateResult(UpdateOutcome.UPDATED, _record(row))
+        return _finish_claim_in_transaction(
+            connection,
+            token=token,
+            version=version,
+            completed_text=_datetime_text(operation_time),
+            next_text=next_text,
+            terminal_reason=terminal_reason,
+            trade=trade,
+            error=error,
+            query_completed=query_completed,
+            close_completed=close_completed,
+        )
 
     return _run_write(database_path, update)
+
+
+def _finish_claim_in_transaction(
+    connection, *, token, version, completed_text, next_text, terminal_reason,
+    trade, error, query_completed, close_completed,
+):
+    if not isinstance(query_completed, bool) or not isinstance(close_completed, bool):
+        raise PaymentReconciliationRepositoryError("PAYMENT_RECONCILIATION_INPUT_INVALID")
+    current = connection.execute(
+        "SELECT order_id FROM payment_reconciliations WHERE claim_token=?",
+        (token,),
+    ).fetchone()
+    assignments = [
+        "reconcile_status=?", "next_attempt_at=?", "claim_token=NULL", "claimed_by=NULL",
+        "claimed_at=NULL", "lease_expires_at=NULL", "terminal_reason=?", "terminal_at=?",
+        "state_version=state_version+1", "updated_at=?",
+    ]
+    values = ["TERMINAL" if terminal_reason else "READY", next_text, terminal_reason,
+              completed_text if terminal_reason else None, completed_text]
+    if query_completed:
+        assignments.append("last_query_at=?"); values.append(completed_text)
+    if close_completed:
+        assignments.append("last_close_at=?"); values.append(completed_text)
+    if trade is not _UNSET:
+        assignments.append("trusted_trade_state=?"); values.append(trade)
+    if error is not _UNSET:
+        assignments.append("last_error_code=?"); values.append(error)
+    values.extend((token, version, completed_text))
+    cursor = connection.execute(
+        f"UPDATE payment_reconciliations SET {', '.join(assignments)} "
+        "WHERE reconcile_status='CLAIMED' AND claim_token=? AND state_version=? AND lease_expires_at>?",
+        values,
+    )
+    if cursor.rowcount != 1:
+        return RecordUpdateResult(UpdateOutcome.LOST_CLAIM, None)
+    if current is None:
+        raise PaymentReconciliationRepositoryError("PAYMENT_RECONCILIATION_SCHEMA_INVALID")
+    row = connection.execute(
+        "SELECT * FROM payment_reconciliations WHERE order_id=?",
+        (current["order_id"],),
+    ).fetchone()
+    return RecordUpdateResult(UpdateOutcome.UPDATED, _record(row))
 
 
 def _lease_times(now: datetime, lease_seconds: float) -> tuple[str, str]:
@@ -518,6 +602,18 @@ def _datetime_text(value: datetime) -> str:
             "PAYMENT_RECONCILIATION_INPUT_INVALID"
         )
     return datetime_text(value)
+
+
+def _normalized_datetime(value: datetime) -> datetime:
+    _datetime_text(value)
+    return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def _operation_time(
+    fallback: datetime,
+    clock: Callable[[], datetime] | None,
+) -> datetime:
+    return _normalized_datetime(clock() if clock is not None else fallback)
 
 
 def _optional_datetime(value: object) -> datetime | None:

@@ -1,5 +1,6 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Barrier
 
@@ -368,6 +369,47 @@ def test_each_cas_operation_enforces_strict_lease(tmp_path, operation, offset, e
     else:
         result = terminate_claim(path, terminal_at=at, terminal_reason="ORDER_CLOSED", **common)
     assert result.outcome is expected
+
+
+def test_reschedule_reads_operation_clock_after_write_lock(tmp_path, monkeypatch):
+    from license_server import payment_reconciliation_repository as repository
+
+    path = tmp_path / "clock.sqlite3"
+    initialize_database(path)
+    _insert_order(path, "order-1", "WAITING_PAYMENT")
+    ensure_ready(path, "order-1", NOW, NOW)
+    claim = claim_next_due(path, worker_id="worker-1", now=NOW, lease_seconds=10)
+    lock_held = False
+    real_write_transaction = repository.write_transaction
+
+    @contextmanager
+    def tracked_write_transaction(database_path):
+        nonlocal lock_held
+        with real_write_transaction(database_path) as connection:
+            lock_held = True
+            try:
+                yield connection
+            finally:
+                lock_held = False
+
+    def clock():
+        assert lock_held
+        return NOW + timedelta(seconds=1)
+
+    monkeypatch.setattr(repository, "write_transaction", tracked_write_transaction)
+    result = reschedule_claim(
+        path,
+        claim_token=claim.claim_token,
+        expected_state_version=claim.state_version,
+        completed_at=NOW,
+        next_attempt_at=NOW + timedelta(seconds=2),
+        query_completed=True,
+        clock=clock,
+    )
+
+    assert result.outcome is UpdateOutcome.UPDATED
+    assert result.record.updated_at == NOW + timedelta(seconds=1)
+    assert result.record.last_query_at == NOW + timedelta(seconds=1)
 
 
 def test_reschedule_preserves_omitted_history_and_can_explicitly_clear_codes(tmp_path):

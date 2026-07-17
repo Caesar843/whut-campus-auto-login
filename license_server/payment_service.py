@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 from license_client.constants import PAID_LICENSE_DAYS
@@ -27,7 +28,12 @@ from license_server.payment_gateway import (
     QueryOrderResult,
     mock_code_url,
 )
-from license_server.payment_reconciliation_repository import ensure_ready
+from license_server.payment_reconciliation_repository import (
+    UpdateOutcome,
+    ensure_ready,
+    reconciliation_claim_is_current_in_transaction,
+    terminate_claim_in_transaction,
+)
 from license_server.signer import datetime_text
 from license_server.wechat_payment import WechatPaymentError
 
@@ -70,6 +76,7 @@ class PaymentConfirmationResult:
 class TrustedOrderUpdateOutcome(str, Enum):
     UPDATED = "UPDATED"
     ALREADY_PAID = "ALREADY_PAID"
+    ALREADY_ABNORMAL = "ALREADY_ABNORMAL"
     ALREADY_CLOSED = "ALREADY_CLOSED"
     NOT_FOUND = "NOT_FOUND"
     NOT_ELIGIBLE = "NOT_ELIGIBLE"
@@ -440,23 +447,25 @@ def mark_open_order_closed_from_trusted_provider(
     claim_token: str,
     expected_state_version: int,
     now: datetime,
+    clock: Callable[[], datetime] | None = None,
 ) -> TrustedOrderUpdateOutcome:
-    now = _utc(now)
+    fallback_now = _utc(now)
 
     def close(connection):
-        if not _reconciliation_claim_is_current(
+        operation_time = _utc(clock() if clock is not None else fallback_now)
+        if not reconciliation_claim_is_current_in_transaction(
             connection,
             order_id=order_id,
             claim_token=claim_token,
             expected_state_version=expected_state_version,
-            now=now,
+            operation_time=operation_time,
         ):
             return TrustedOrderUpdateOutcome.LOST_CLAIM
         return _mark_open_order_closed_in_transaction(
             connection,
             order_id=order_id,
             provider_trade_state=provider_trade_state,
-            now=now,
+            now=operation_time,
         )
 
     return _payment_transaction(
@@ -465,26 +474,78 @@ def mark_open_order_closed_from_trusted_provider(
     )
 
 
-def mark_open_order_abnormal_from_trusted_provider(
+def mark_open_order_abnormal_and_terminate_reconciliation(
     database_path: Path,
     *,
     order_id: str,
+    claim_token: str,
+    expected_state_version: int,
+    terminal_reason: str,
+    trusted_trade_state: str | None,
     code: str,
     now: datetime,
+    clock: Callable[[], datetime] | None = None,
 ) -> TrustedOrderUpdateOutcome:
+    fallback_now = _utc(now)
+
     def mark(connection):
+        operation_time = _utc(clock() if clock is not None else fallback_now)
+        if not reconciliation_claim_is_current_in_transaction(
+            connection,
+            order_id=order_id,
+            claim_token=claim_token,
+            expected_state_version=expected_state_version,
+            operation_time=operation_time,
+        ):
+            return TrustedOrderUpdateOutcome.LOST_CLAIM
         order = _order_by_id(connection, order_id)
         outcome = _trusted_order_update_outcome(connection, order)
-        if outcome is not None:
-            return outcome
-        if str(order["status"]) not in {
+        if outcome in {
+            TrustedOrderUpdateOutcome.ALREADY_PAID,
+            TrustedOrderUpdateOutcome.PAYMENT_FACT_PRESENT,
+        }:
+            final_outcome = TrustedOrderUpdateOutcome.ALREADY_PAID
+            final_reason = "ORDER_ALREADY_PAID"
+            final_error = None
+        elif outcome is not None:
+            final_outcome = outcome
+            final_reason = terminal_reason
+            final_error = code
+        elif str(order["status"]) == OrderStatus.ABNORMAL.value:
+            final_outcome = TrustedOrderUpdateOutcome.ALREADY_ABNORMAL
+            final_reason = terminal_reason
+            final_error = code
+        elif str(order["status"]) in {
             OrderStatus.CREATED.value,
             OrderStatus.WAITING_PAYMENT.value,
-            OrderStatus.ABNORMAL.value,
         }:
-            return TrustedOrderUpdateOutcome.NOT_ELIGIBLE
-        _mark_order_abnormal(connection, order_id, code, _utc(now))
-        return TrustedOrderUpdateOutcome.UPDATED
+            _mark_order_abnormal(connection, order_id, code, operation_time)
+            final_outcome = TrustedOrderUpdateOutcome.UPDATED
+            final_reason = terminal_reason
+            final_error = code
+        else:
+            final_outcome = TrustedOrderUpdateOutcome.NOT_ELIGIBLE
+            final_reason = terminal_reason
+            final_error = code
+
+        terminal_values = dict(
+            connection=connection,
+            claim_token=claim_token,
+            expected_state_version=expected_state_version,
+            terminal_at=operation_time,
+            terminal_reason=final_reason,
+            last_error_code=final_error,
+            query_completed=True,
+        )
+        if trusted_trade_state is not None and final_outcome is not TrustedOrderUpdateOutcome.ALREADY_PAID:
+            terminal_values["trusted_trade_state"] = trusted_trade_state
+        update = terminate_claim_in_transaction(**terminal_values)
+        if update.outcome is not UpdateOutcome.UPDATED:
+            raise PaymentServiceError(
+                "payment_reconciliation_invalid_state",
+                status_code=409,
+            )
+        return final_outcome
 
     return _payment_transaction(database_path, mark)
 
@@ -1158,27 +1219,6 @@ def _trusted_order_update_outcome(connection, order):
     if payment_fact is not None or order["provider_transaction_id"] is not None:
         return TrustedOrderUpdateOutcome.PAYMENT_FACT_PRESENT
     return None
-
-
-def _reconciliation_claim_is_current(
-    connection,
-    *,
-    order_id: str,
-    claim_token: str,
-    expected_state_version: int,
-    now: datetime,
-) -> bool:
-    return connection.execute(
-        """SELECT 1 FROM payment_reconciliations
-           WHERE order_id=? AND reconcile_status='CLAIMED'
-             AND claim_token=? AND state_version=? AND lease_expires_at>?""",
-        (
-            order_id,
-            claim_token,
-            expected_state_version,
-            datetime_text(now),
-        ),
-    ).fetchone() is not None
 
 
 def _mark_open_order_closed_in_transaction(

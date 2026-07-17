@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from license_server.db import connect
 from license_server.payment_reconciliation_repository import (
@@ -19,6 +20,10 @@ from license_server.payment_reconciliation_service import (
 )
 from license_server.signer import datetime_text
 from license_server.wechat_payment import WechatPaymentError
+
+
+def _server_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -65,6 +70,10 @@ class PaymentReconciliationWorker:
     policy: PaymentReconciliationWorkerPolicy = field(
         default_factory=PaymentReconciliationWorkerPolicy
     )
+    clock: Callable[[], datetime] = field(
+        default=_server_utc_now,
+        repr=False,
+    )
     _next_scan_at: datetime | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -78,6 +87,8 @@ class PaymentReconciliationWorker:
         self.worker_id = self.worker_id.strip()
         if not self.worker_id or len(self.worker_id) > 128:
             raise ValueError("PAYMENT_RECONCILIATION_WORKER_ID_INVALID")
+        if not callable(self.clock):
+            raise ValueError("PAYMENT_RECONCILIATION_WORKER_TIME_INVALID")
 
     def schedule_recent_waiting_orders(self, *, now: datetime) -> int:
         now = _utc_datetime(now)
@@ -119,6 +130,7 @@ class PaymentReconciliationWorker:
 
     def run_once(self, *, now: datetime, stop_event: object | None = None) -> WorkerCycleResult:
         now = _utc_datetime(now)
+        operation_clock = lambda: max(now, self._now())
         scheduled_count = 0
         infrastructure_error_count = 0
         if self._next_scan_at is None or now >= self._next_scan_at:
@@ -143,11 +155,13 @@ class PaymentReconciliationWorker:
             if stop_event is not None and stop_event.is_set():
                 break
             try:
+                claim_time = operation_clock()
                 claim = claim_next_due(
                     self.database_path,
                     worker_id=self.worker_id,
-                    now=now,
+                    now=claim_time,
                     lease_seconds=self.policy.lease_seconds,
+                    clock=operation_clock,
                 )
             except (
                 ConnectionError,
@@ -163,7 +177,10 @@ class PaymentReconciliationWorker:
                 break
             claimed_count += 1
             try:
-                result = self.reconciliation_service.reconcile_claim(claim, now=now)
+                result = self.reconciliation_service.reconcile_claim(
+                    claim,
+                    now=operation_clock(),
+                )
             except (
                 ConnectionError,
                 TimeoutError,
@@ -191,12 +208,15 @@ class PaymentReconciliationWorker:
         )
 
     def run_forever(self, stop_event: object, *, now_fn=None) -> None:
-        clock = now_fn or (lambda: datetime.now(timezone.utc))
+        clock = now_fn or self.clock
         while not stop_event.is_set():
             self.run_once(now=clock(), stop_event=stop_event)
             if stop_event.is_set():
                 break
             stop_event.wait(self.policy.idle_wait_seconds)
+
+    def _now(self) -> datetime:
+        return _utc_datetime(self.clock())
 
 
 def _utc_datetime(value: datetime) -> datetime:

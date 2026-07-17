@@ -1,9 +1,11 @@
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Event
 
 import pytest
 
+from license_server import payment_service
 from license_server.db import connect, initialize_database
 from license_server.payment import ANNUAL_V1, PaymentEvidence, PaymentEvidenceSource
 from license_server.payment_gateway import (
@@ -111,6 +113,33 @@ def test_notpay_before_expiry_reschedules_without_closing_or_grant(tmp_path):
     assert gateway.closed == []
 
 
+def test_query_result_after_lease_expiry_without_reclaimer_loses_claim(tmp_path):
+    clock = _MutableClock(NOW)
+    path, claim = _claimed_order(tmp_path, lease_seconds=1)
+    before_order = _order_state(path)
+    before_task = get(path, claim.order_id)
+    gateway = FakeGateway(
+        _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+        on_query=lambda: clock.set(NOW + timedelta(seconds=1)),
+    )
+
+    result = _service(path, gateway, clock=clock).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.LOST_CLAIM
+    assert _order_state(path) == before_order
+    expired = get(path, claim.order_id)
+    assert expired == before_task
+    reclaimed = claim_order(
+        path,
+        order_id=claim.order_id,
+        worker_id="worker-2",
+        now=NOW + timedelta(seconds=1),
+        lease_seconds=60,
+    )
+    assert reclaimed.claim is not None
+    assert reclaimed.claim.claim_token != claim.claim_token
+
+
 def test_expired_notpay_closes_upstream_then_locally_and_terminates(tmp_path):
     path, claim = _claimed_order(tmp_path, expires_at=NOW)
     gateway = FakeGateway(
@@ -134,6 +163,73 @@ def test_expired_notpay_closes_upstream_then_locally_and_terminates(tmp_path):
     assert record.trusted_trade_state == "CLOSED"
     assert record.last_query_at == NOW
     assert record.last_close_at == NOW
+
+
+def test_close_result_after_lease_expiry_without_reclaimer_does_not_close(tmp_path):
+    clock = _MutableClock(NOW)
+    path, claim = _claimed_order(tmp_path, expires_at=NOW, lease_seconds=1)
+    gateway = FakeGateway(
+        _simple_query(claim.order_id, QueryOrderOutcome.NOTPAY),
+        CloseOrderResult(CloseOrderOutcome.CLOSED),
+        on_close=lambda: clock.set(NOW + timedelta(seconds=1)),
+    )
+
+    result = _service(path, gateway, clock=clock).reconcile_claim(claim, now=NOW)
+
+    assert result.outcome is ReconciliationOutcome.LOST_CLAIM
+    assert _order_state(path) == ("WAITING_PAYMENT", "open")
+    record = get(path, claim.order_id)
+    assert record.reconcile_status == "CLAIMED"
+    assert record.claim_token == claim.claim_token
+    assert record.last_close_at is None
+    assert record.close_attempt_count == 1
+
+
+@pytest.mark.parametrize(
+    "failing_sql",
+    ("UPDATE payment_orders", "UPDATE payment_reconciliations"),
+)
+def test_abnormal_and_terminal_roll_back_together_on_each_write_failure(
+    tmp_path, monkeypatch, failing_sql
+):
+    path, claim = _claimed_order(tmp_path)
+    before = get(path, claim.order_id)
+    real_connect = payment_service.connect
+    monkeypatch.setattr(
+        payment_service,
+        "connect",
+        lambda database_path: _FailAfterExecuteConnection(
+            real_connect(database_path), failing_sql
+        ),
+    )
+    service = PaymentReconciliationService(
+        database_path=path,
+        gateway=FakeGateway(_simple_query(claim.order_id, QueryOrderOutcome.UNKNOWN)),
+        expected_appid=APP_ID,
+        expected_mchid=MCH_ID,
+        policy=POLICY,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        service.reconcile_claim(claim, now=NOW)
+
+    assert _order_state(path) == ("WAITING_PAYMENT", "open")
+    after = get(path, claim.order_id)
+    assert after == before
+    recovered = claim_order(
+        path,
+        order_id=claim.order_id,
+        worker_id="worker-2",
+        now=NOW + timedelta(seconds=60),
+        lease_seconds=60,
+    )
+    assert recovered.claim is not None
+    assert recovered.claim.claim_token != claim.claim_token
+    with connect(path) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
 
 
 def test_callback_during_success_query_keeps_one_grant_and_finishes_idempotently(tmp_path):
@@ -933,13 +1029,14 @@ class FakeGateway:
         raise AssertionError("notifications are outside reconciliation")
 
 
-def _service(path, gateway, policy=POLICY):
+def _service(path, gateway, policy=POLICY, clock=None):
     return PaymentReconciliationService(
         database_path=path,
         gateway=gateway,
         expected_appid=APP_ID,
         expected_mchid=MCH_ID,
         policy=policy,
+        clock=clock or (lambda: NOW),
     )
 
 
@@ -950,6 +1047,7 @@ def _claimed_order(
     order_id="order-1",
     query_attempt_count=0,
     close_attempt_count=0,
+    lease_seconds=60,
 ):
     path = tmp_path / "license.sqlite3"
     initialize_database(path)
@@ -991,10 +1089,43 @@ def _claimed_order(
         order_id=order_id,
         worker_id="worker-1",
         now=NOW,
-        lease_seconds=60,
+        lease_seconds=lease_seconds,
     )
     assert result.claim is not None
     return path, result.claim
+
+
+def _order_state(path):
+    with connect(path) as connection:
+        return tuple(
+            connection.execute("SELECT status, open_slot FROM payment_orders").fetchone()
+        )
+
+
+class _MutableClock:
+    def __init__(self, current):
+        self.current = current
+
+    def __call__(self):
+        return self.current
+
+    def set(self, value):
+        self.current = value
+
+
+class _FailAfterExecuteConnection:
+    def __init__(self, connection, failing_sql):
+        self._connection = connection
+        self._failing_sql = failing_sql
+
+    def execute(self, sql, parameters=()):
+        cursor = self._connection.execute(sql, parameters)
+        if self._failing_sql in " ".join(sql.split()):
+            raise sqlite3.OperationalError("database is locked")
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 def _success(order_id, **overrides):

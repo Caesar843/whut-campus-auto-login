@@ -197,6 +197,38 @@ def test_run_once_discovers_and_processes_at_most_cycle_limit(tmp_path):
     assert {processed_at for _, processed_at in service.claims} == {NOW}
 
 
+def test_run_once_uses_fresh_clock_for_each_claim_in_same_cycle(tmp_path):
+    path = _database(tmp_path)
+    for order_id in ("order-1", "order-2"):
+        _insert_order(path, order_id, "WAITING_PAYMENT", NOW)
+        ensure_ready(path, order_id, NOW, NOW)
+    clock = _MutableClock(NOW)
+
+    def process(_claim, _now):
+        if clock.current == NOW:
+            clock.set(NOW + timedelta(seconds=10))
+        return ReconciliationResult(ReconciliationOutcome.RESCHEDULED)
+
+    service = _RecordingService(process)
+    worker = _worker(path, service=service, clock=clock, max_claims_per_cycle=2)
+
+    result = worker.run_once(now=NOW)
+
+    assert result.claimed_count == result.processed_count == 2
+    first, second = (item[0] for item in service.claims)
+    assert first.claimed_at == NOW
+    assert second.claimed_at == NOW + timedelta(seconds=10)
+    assert second.lease_expires_at == NOW + timedelta(seconds=70)
+    assert second.query_attempt_count == second.state_version == 1
+    assert result.infrastructure_error_count == 0
+    assert result.no_work is False
+    assert [claim.order_id for claim, _ in service.claims] == ["order-1", "order-2"]
+    assert {processed_at for _, processed_at in service.claims} == {
+        NOW,
+        NOW + timedelta(seconds=10),
+    }
+
+
 def test_run_once_claims_persisted_due_task_outside_scan_window(tmp_path):
     path = _database(tmp_path)
     created_at = NOW - timedelta(days=1)
@@ -729,16 +761,20 @@ def test_stale_http_result_cannot_overwrite_reclaimed_worker_result(tmp_path):
     release = threading.Event()
     old_gateway = _BlockingGateway(_notpay("http-order"), entered, release)
     new_gateway = _FakeGateway(_notpay("http-order"))
+    old_clock = _MutableClock(NOW)
+    new_clock = _MutableClock(NOW + timedelta(seconds=1))
     old_worker = _worker(
         path,
-        service=_real_service(path, old_gateway),
+        service=_real_service(path, old_gateway, clock=old_clock),
         worker_id="old-worker",
+        clock=old_clock,
         lease_seconds=1,
     )
     new_worker = _worker(
         path,
-        service=_real_service(path, new_gateway),
+        service=_real_service(path, new_gateway, clock=new_clock),
         worker_id="new-worker",
+        clock=new_clock,
         lease_seconds=60,
     )
 
@@ -817,7 +853,14 @@ class _RecordingService:
         return ReconciliationResult(ReconciliationOutcome.RESCHEDULED)
 
 
-def _worker(path, *, service=None, worker_id="reconciliation-worker-test0001", **policy_overrides):
+def _worker(
+    path,
+    *,
+    service=None,
+    worker_id="reconciliation-worker-test0001",
+    clock=None,
+    **policy_overrides,
+):
     module = _worker_module()
     policy_values = {
         "scan_interval_seconds": 30,
@@ -833,6 +876,7 @@ def _worker(path, *, service=None, worker_id="reconciliation-worker-test0001", *
         reconciliation_service=service or _RecordingService(),
         worker_id=worker_id,
         policy=module.PaymentReconciliationWorkerPolicy(**policy_values),
+        clock=clock or (lambda: NOW),
     )
 
 
@@ -936,14 +980,26 @@ class _BlockingGateway(_FakeGateway):
         return self.query_result
 
 
-def _real_service(path, gateway):
+def _real_service(path, gateway, *, clock=None):
     return PaymentReconciliationService(
         database_path=path,
         gateway=gateway,
         expected_appid=APP_ID,
         expected_mchid=MCH_ID,
         policy=SERVICE_POLICY,
+        clock=clock or (lambda: NOW),
     )
+
+
+class _MutableClock:
+    def __init__(self, current):
+        self.current = current
+
+    def __call__(self):
+        return self.current
+
+    def set(self, value):
+        self.current = value
 
 
 def _notpay(order_id):
