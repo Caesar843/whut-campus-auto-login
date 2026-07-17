@@ -8,7 +8,7 @@ import os
 import string
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
 from urllib.parse import unquote, urlsplit
 
 from cryptography.exceptions import UnsupportedAlgorithm
@@ -22,6 +22,14 @@ from cryptography.hazmat.primitives.serialization import (
 from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
 from license_server.payment import ANNUAL_V1
 
+if TYPE_CHECKING:
+    from license_server.payment_reconciliation_service import (
+        PaymentReconciliationPolicy,
+    )
+    from license_server.payment_reconciliation_worker import (
+        PaymentReconciliationWorkerPolicy,
+    )
+
 DEFAULT_ENVIRONMENT = "development"
 VALID_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_PAYMENT_CHANNELS = ("wechat_pay",)
@@ -33,6 +41,18 @@ MAX_PAYMENT_NOTIFICATION_MAX_ATTEMPTS = 100
 DEFAULT_PAYMENT_NOTIFICATION_LEASE_SECONDS = 60
 DEFAULT_PAYMENT_NOTIFICATION_RETRY_BASE_SECONDS = 5
 DEFAULT_PAYMENT_NOTIFICATION_RETRY_MAX_SECONDS = 300
+DEFAULT_PAYMENT_RECONCILIATION_WORKER_SCAN_INTERVAL_SECONDS = 30
+DEFAULT_PAYMENT_RECONCILIATION_WORKER_RECENT_ORDER_WINDOW_SECONDS = 600
+DEFAULT_PAYMENT_RECONCILIATION_WORKER_MAX_CLAIMS_PER_CYCLE = 10
+DEFAULT_PAYMENT_RECONCILIATION_WORKER_LEASE_SECONDS = 60
+DEFAULT_PAYMENT_RECONCILIATION_WORKER_IDLE_WAIT_SECONDS = 1
+DEFAULT_PAYMENT_RECONCILIATION_WORKER_MAX_ORDERS_PER_SCAN = 100
+DEFAULT_PAYMENT_RECONCILIATION_QUERY_RETRY_BASE_SECONDS = 5
+DEFAULT_PAYMENT_RECONCILIATION_QUERY_RETRY_MAX_SECONDS = 300
+DEFAULT_PAYMENT_RECONCILIATION_MAX_QUERY_ATTEMPTS = 8
+DEFAULT_PAYMENT_RECONCILIATION_CLOSE_RETRY_BASE_SECONDS = 5
+DEFAULT_PAYMENT_RECONCILIATION_CLOSE_RETRY_MAX_SECONDS = 300
+DEFAULT_PAYMENT_RECONCILIATION_MAX_CLOSE_ATTEMPTS = 8
 VALID_PAYMENT_PROVIDERS = {"disabled", "mock", "wechat_native"}
 MOCK_ADMIN_TOKEN_MIN_LENGTH = 16
 SHA256_HEX_LENGTH = 64
@@ -80,6 +100,9 @@ class LicenseServerConfig:
     payment_notification_lease_seconds: int
     payment_notification_retry_base_seconds: int
     payment_notification_retry_max_seconds: int
+    payment_reconciliation_worker_enabled: bool
+    payment_reconciliation_worker_policy: PaymentReconciliationWorkerPolicy
+    payment_reconciliation_policy: PaymentReconciliationPolicy
     admin_enabled: bool
     admin_operator_name: str
     admin_access_token_sha256: str | None
@@ -88,24 +111,34 @@ class LicenseServerConfig:
 def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
     values = os.environ if env is None else env
     environment = _environment_from_env(values)
-    worker_enabled = _boolean_from_env(
+    notification_worker_enabled = _boolean_from_env(
         values,
         "PAYMENT_NOTIFICATION_WORKER_ENABLED",
+    )
+    reconciliation_worker_enabled = _boolean_from_env(
+        values,
+        "PAYMENT_RECONCILIATION_WORKER_ENABLED",
     )
     database_path = _database_path_from_env(
         values,
         environment,
-        worker_enabled=worker_enabled,
+        notification_worker_enabled=notification_worker_enabled,
+        reconciliation_worker_enabled=reconciliation_worker_enabled,
     )
     private_key_b64 = _private_key_from_env(values, environment)
     payment_price_fen = _payment_price_fen_from_env(values)
     payment_currency = _payment_currency_from_env(values)
     payment_provider = _payment_provider_from_env(values, environment)
-    if worker_enabled and payment_provider != "wechat_native":
+    if notification_worker_enabled and payment_provider != "wechat_native":
         raise RuntimeError(
             "PAYMENT_NOTIFICATION_WORKER_ENABLED requires "
             "PAYMENT_PROVIDER=wechat_native."
         )
+    if reconciliation_worker_enabled and payment_provider != "wechat_native":
+        raise RuntimeError("PAYMENT_RECONCILIATION_WORKER_PROVIDER_UNAVAILABLE")
+    reconciliation_worker_policy, reconciliation_policy = (
+        _payment_reconciliation_policies_from_env(values)
+    )
     return LicenseServerConfig(
         environment=environment,
         database_path=database_path,
@@ -118,7 +151,7 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
         payment_currency=payment_currency,
         payment_channels=_payment_channels_from_env(values),
         payment_order_ttl_minutes=_payment_order_ttl_minutes_from_env(values),
-        payment_notification_worker_enabled=worker_enabled,
+        payment_notification_worker_enabled=notification_worker_enabled,
         payment_notification_worker_poll_seconds=(
             _payment_notification_worker_poll_seconds_from_env(values)
         ),
@@ -134,6 +167,9 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
         payment_notification_retry_max_seconds=(
             DEFAULT_PAYMENT_NOTIFICATION_RETRY_MAX_SECONDS
         ),
+        payment_reconciliation_worker_enabled=reconciliation_worker_enabled,
+        payment_reconciliation_worker_policy=reconciliation_worker_policy,
+        payment_reconciliation_policy=reconciliation_policy,
         admin_enabled=_admin_enabled_from_env(values),
         admin_operator_name=values.get("ADMIN_OPERATOR_NAME", "").strip(),
         admin_access_token_sha256=_admin_access_token_sha256_from_env(values),
@@ -171,7 +207,8 @@ def _database_path_from_env(
     values: Mapping[str, str],
     environment: str,
     *,
-    worker_enabled: bool,
+    notification_worker_enabled: bool,
+    reconciliation_worker_enabled: bool,
 ) -> Path:
     database_url = values.get("DATABASE_URL", "").strip()
     license_db_path = values.get("LICENSE_DB_PATH", "").strip()
@@ -181,9 +218,13 @@ def _database_path_from_env(
         database_path = _sqlite_database_path(database_url)
     else:
         database_path = Path(license_db_path or "license_server.sqlite3")
-    if worker_enabled and not _is_absolute_path(database_path):
+    if notification_worker_enabled and not _is_absolute_path(database_path):
         raise RuntimeError(
             "PAYMENT_NOTIFICATION_WORKER_DATABASE_PATH_NOT_ABSOLUTE"
+        )
+    if reconciliation_worker_enabled and not _is_absolute_path(database_path):
+        raise RuntimeError(
+            "PAYMENT_RECONCILIATION_WORKER_DATABASE_PATH_NOT_ABSOLUTE"
         )
     if environment == "production" and not _is_absolute_path(database_path):
         raise RuntimeError(
@@ -400,7 +441,10 @@ def _payment_order_ttl_minutes_from_env(values: Mapping[str, str]) -> int:
 
 
 def _boolean_from_env(values: Mapping[str, str], name: str) -> bool:
-    raw_value = values.get(name, "").strip().lower()
+    value = values.get(name, "")
+    if not isinstance(value, str):
+        raise RuntimeError(f"{name} must be true or false.")
+    raw_value = value.strip().lower()
     if raw_value in TRUE_VALUES:
         return True
     if raw_value in FALSE_VALUES:
@@ -458,6 +502,111 @@ def _payment_notification_max_attempts_from_env(
             f"{MAX_PAYMENT_NOTIFICATION_MAX_ATTEMPTS}."
         )
     return max_attempts
+
+
+def _payment_reconciliation_policies_from_env(
+    values: Mapping[str, str],
+) -> tuple[PaymentReconciliationWorkerPolicy, PaymentReconciliationPolicy]:
+    from license_server.payment_reconciliation_service import (
+        PaymentReconciliationPolicy,
+    )
+    from license_server.payment_reconciliation_worker import (
+        PaymentReconciliationWorkerPolicy,
+    )
+
+    worker_values = {
+        "scan_interval_seconds": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_WORKER_SCAN_INTERVAL_SECONDS",
+            DEFAULT_PAYMENT_RECONCILIATION_WORKER_SCAN_INTERVAL_SECONDS,
+        ),
+        "recent_order_window_seconds": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_WORKER_RECENT_ORDER_WINDOW_SECONDS",
+            DEFAULT_PAYMENT_RECONCILIATION_WORKER_RECENT_ORDER_WINDOW_SECONDS,
+        ),
+        "max_claims_per_cycle": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_WORKER_MAX_CLAIMS_PER_CYCLE",
+            DEFAULT_PAYMENT_RECONCILIATION_WORKER_MAX_CLAIMS_PER_CYCLE,
+        ),
+        "lease_seconds": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_WORKER_LEASE_SECONDS",
+            DEFAULT_PAYMENT_RECONCILIATION_WORKER_LEASE_SECONDS,
+        ),
+        "idle_wait_seconds": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_WORKER_IDLE_WAIT_SECONDS",
+            DEFAULT_PAYMENT_RECONCILIATION_WORKER_IDLE_WAIT_SECONDS,
+        ),
+        "max_orders_per_scan": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_WORKER_MAX_ORDERS_PER_SCAN",
+            DEFAULT_PAYMENT_RECONCILIATION_WORKER_MAX_ORDERS_PER_SCAN,
+        ),
+    }
+    service_values = {
+        "query_retry_base_seconds": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_QUERY_RETRY_BASE_SECONDS",
+            DEFAULT_PAYMENT_RECONCILIATION_QUERY_RETRY_BASE_SECONDS,
+        ),
+        "query_retry_max_seconds": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_QUERY_RETRY_MAX_SECONDS",
+            DEFAULT_PAYMENT_RECONCILIATION_QUERY_RETRY_MAX_SECONDS,
+        ),
+        "max_query_attempts": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_MAX_QUERY_ATTEMPTS",
+            DEFAULT_PAYMENT_RECONCILIATION_MAX_QUERY_ATTEMPTS,
+        ),
+        "close_retry_base_seconds": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_CLOSE_RETRY_BASE_SECONDS",
+            DEFAULT_PAYMENT_RECONCILIATION_CLOSE_RETRY_BASE_SECONDS,
+        ),
+        "close_retry_max_seconds": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_CLOSE_RETRY_MAX_SECONDS",
+            DEFAULT_PAYMENT_RECONCILIATION_CLOSE_RETRY_MAX_SECONDS,
+        ),
+        "max_close_attempts": _strict_positive_integer_from_env(
+            values,
+            "PAYMENT_RECONCILIATION_MAX_CLOSE_ATTEMPTS",
+            DEFAULT_PAYMENT_RECONCILIATION_MAX_CLOSE_ATTEMPTS,
+        ),
+    }
+    try:
+        return (
+            PaymentReconciliationWorkerPolicy(**worker_values),
+            PaymentReconciliationPolicy(**service_values),
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _strict_positive_integer_from_env(
+    values: Mapping[str, str],
+    name: str,
+    default: int,
+) -> int:
+    value = values.get(name, str(default))
+    if not isinstance(value, str):
+        raise RuntimeError(f"{name} must be a positive decimal integer.")
+    raw_value = value
+    if (
+        not raw_value
+        or not raw_value.isascii()
+        or not raw_value.isdigit()
+        or len(raw_value) > 10
+    ):
+        raise RuntimeError(f"{name} must be a positive decimal integer.")
+    parsed = int(raw_value)
+    if parsed <= 0:
+        raise RuntimeError(f"{name} must be a positive decimal integer.")
+    return parsed
 
 
 def _admin_enabled_from_env(values: Mapping[str, str]) -> bool:

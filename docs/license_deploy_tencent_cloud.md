@@ -128,6 +128,38 @@ sudo journalctl -u whut-license-server -f
 
 上线前确认 journald 留存策略，例如 `/etc/systemd/journald.conf` 中的 `SystemMaxUse`、`MaxRetentionSec` 或所在系统的集中日志方案。不要在日志中记录管理员 Token、支付密钥、私钥或校园网凭据。
 
+### 支付对账补偿 Worker
+
+支付对账补偿 Worker 是 Web 服务之外的独立进程，用于支付回调缺失时的后台补偿。它不影响客户端手动刷新支付状态：Worker 默认关闭或未运行时，手动刷新仍可正常使用。该进程默认关闭，安装 unit 不代表启用或启动。
+
+保持环境文件中的总开关为：
+
+```bash
+PAYMENT_RECONCILIATION_WORKER_ENABLED=false
+```
+
+安装独立 unit 后只刷新 systemd 配置并确认它仍为 disabled、inactive：
+
+```bash
+sudo cp deploy/systemd/whut-payment-reconciliation-worker.service.example /etc/systemd/system/whut-payment-reconciliation-worker.service
+sudo systemctl daemon-reload
+sudo systemctl is-enabled whut-payment-reconciliation-worker.service
+sudo systemctl is-active whut-payment-reconciliation-worker.service
+```
+
+启用前必须逐项确认：Web 服务已完成数据库迁移；当前数据库精确匹配 Schema V5；环境文件使用绝对 SQLite 路径；`PAYMENT_PROVIDER=wechat_native` 且微信支付配置完整；生产网络和真实微信商户查单、关单权限已经验证；已经取得完整数据库备份。Worker 自身只做只读 Schema V5 启动门禁，不会执行迁移，也不会创建或修复数据库。
+
+上述生产前置条件和真实微信商户验证未全部完成时，不得把总开关改为 true，不得启用或启动该 unit。本轮不启用该 Worker，不声称已验证生产网络、真实微信商户查单或关单，也不声称生产数据库已出现 claim。启动日志不得出现 Secret。该进程不得与 Notification Worker 混用入口或 unit。
+
+停止并保持关闭的回滚方式：
+
+```bash
+sudo systemctl stop whut-payment-reconciliation-worker.service
+sudo systemctl disable whut-payment-reconciliation-worker.service
+```
+
+随后把环境文件恢复为 `PAYMENT_RECONCILIATION_WORKER_ENABLED=false`。不要通过 Worker 入口运行数据库迁移；需要迁移时仍由既有 Web 服务部署流程在备份和维护窗口内完成。
+
 ## Nginx
 
 复制示例文件：

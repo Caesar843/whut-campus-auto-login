@@ -44,6 +44,209 @@ def test_payment_notification_worker_defaults_are_disabled_and_bounded(tmp_path)
     assert config.payment_notification_retry_max_seconds == 300
 
 
+def test_payment_reconciliation_worker_defaults_are_disabled_and_bounded(tmp_path):
+    config = load_config(_production_env(tmp_path, PAYMENT_PROVIDER="disabled"))
+
+    assert config.payment_reconciliation_worker_enabled is False
+    assert config.payment_reconciliation_worker_policy.scan_interval_seconds == 30
+    assert config.payment_reconciliation_worker_policy.recent_order_window_seconds == 600
+    assert config.payment_reconciliation_worker_policy.max_claims_per_cycle == 10
+    assert config.payment_reconciliation_worker_policy.lease_seconds == 60
+    assert config.payment_reconciliation_worker_policy.idle_wait_seconds == 1
+    assert config.payment_reconciliation_worker_policy.max_orders_per_scan == 100
+    assert config.payment_reconciliation_policy.query_retry_base_seconds == 5
+    assert config.payment_reconciliation_policy.query_retry_max_seconds == 300
+    assert config.payment_reconciliation_policy.max_query_attempts == 8
+    assert config.payment_reconciliation_policy.close_retry_base_seconds == 5
+    assert config.payment_reconciliation_policy.close_retry_max_seconds == 300
+    assert config.payment_reconciliation_policy.max_close_attempts == 8
+
+
+@pytest.mark.parametrize("value", ("1", "true", "yes", "on", "TRUE"))
+def test_payment_reconciliation_worker_accepts_enabled_values(tmp_path, value):
+    env = _wechat_env(tmp_path)
+    env["PAYMENT_RECONCILIATION_WORKER_ENABLED"] = value
+
+    assert load_config(env).payment_reconciliation_worker_enabled is True
+
+
+@pytest.mark.parametrize("value", ("0", "false", "no", "off", "", "FALSE"))
+def test_payment_reconciliation_worker_accepts_disabled_values(tmp_path, value):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_RECONCILIATION_WORKER_ENABLED=value,
+    )
+
+    assert load_config(env).payment_reconciliation_worker_enabled is False
+
+
+@pytest.mark.parametrize("value", ("enabled", "2", "none"))
+def test_payment_reconciliation_worker_rejects_invalid_boolean(tmp_path, value):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_RECONCILIATION_WORKER_ENABLED=value,
+    )
+
+    with pytest.raises(RuntimeError, match="PAYMENT_RECONCILIATION_WORKER_ENABLED"):
+        load_config(env)
+
+
+RECONCILIATION_INTEGER_SETTINGS = (
+    ("PAYMENT_RECONCILIATION_WORKER_SCAN_INTERVAL_SECONDS", 30),
+    ("PAYMENT_RECONCILIATION_WORKER_RECENT_ORDER_WINDOW_SECONDS", 600),
+    ("PAYMENT_RECONCILIATION_WORKER_MAX_CLAIMS_PER_CYCLE", 10),
+    ("PAYMENT_RECONCILIATION_WORKER_LEASE_SECONDS", 60),
+    ("PAYMENT_RECONCILIATION_WORKER_IDLE_WAIT_SECONDS", 1),
+    ("PAYMENT_RECONCILIATION_WORKER_MAX_ORDERS_PER_SCAN", 100),
+    ("PAYMENT_RECONCILIATION_QUERY_RETRY_BASE_SECONDS", 5),
+    ("PAYMENT_RECONCILIATION_QUERY_RETRY_MAX_SECONDS", 300),
+    ("PAYMENT_RECONCILIATION_MAX_QUERY_ATTEMPTS", 8),
+    ("PAYMENT_RECONCILIATION_CLOSE_RETRY_BASE_SECONDS", 5),
+    ("PAYMENT_RECONCILIATION_CLOSE_RETRY_MAX_SECONDS", 300),
+    ("PAYMENT_RECONCILIATION_MAX_CLOSE_ATTEMPTS", 8),
+)
+
+
+@pytest.mark.parametrize(("name", "expected"), RECONCILIATION_INTEGER_SETTINGS)
+def test_payment_reconciliation_worker_accepts_strict_positive_integer_settings(
+    tmp_path, name, expected
+):
+    env = _production_env(tmp_path, PAYMENT_PROVIDER="disabled")
+    env[name] = f"00{expected}"
+
+    config = load_config(env)
+
+    values = {
+        "PAYMENT_RECONCILIATION_WORKER_SCAN_INTERVAL_SECONDS": (
+            config.payment_reconciliation_worker_policy.scan_interval_seconds
+        ),
+        "PAYMENT_RECONCILIATION_WORKER_RECENT_ORDER_WINDOW_SECONDS": (
+            config.payment_reconciliation_worker_policy.recent_order_window_seconds
+        ),
+        "PAYMENT_RECONCILIATION_WORKER_MAX_CLAIMS_PER_CYCLE": (
+            config.payment_reconciliation_worker_policy.max_claims_per_cycle
+        ),
+        "PAYMENT_RECONCILIATION_WORKER_LEASE_SECONDS": (
+            config.payment_reconciliation_worker_policy.lease_seconds
+        ),
+        "PAYMENT_RECONCILIATION_WORKER_IDLE_WAIT_SECONDS": (
+            config.payment_reconciliation_worker_policy.idle_wait_seconds
+        ),
+        "PAYMENT_RECONCILIATION_WORKER_MAX_ORDERS_PER_SCAN": (
+            config.payment_reconciliation_worker_policy.max_orders_per_scan
+        ),
+        "PAYMENT_RECONCILIATION_QUERY_RETRY_BASE_SECONDS": (
+            config.payment_reconciliation_policy.query_retry_base_seconds
+        ),
+        "PAYMENT_RECONCILIATION_QUERY_RETRY_MAX_SECONDS": (
+            config.payment_reconciliation_policy.query_retry_max_seconds
+        ),
+        "PAYMENT_RECONCILIATION_MAX_QUERY_ATTEMPTS": (
+            config.payment_reconciliation_policy.max_query_attempts
+        ),
+        "PAYMENT_RECONCILIATION_CLOSE_RETRY_BASE_SECONDS": (
+            config.payment_reconciliation_policy.close_retry_base_seconds
+        ),
+        "PAYMENT_RECONCILIATION_CLOSE_RETRY_MAX_SECONDS": (
+            config.payment_reconciliation_policy.close_retry_max_seconds
+        ),
+        "PAYMENT_RECONCILIATION_MAX_CLOSE_ATTEMPTS": (
+            config.payment_reconciliation_policy.max_close_attempts
+        ),
+    }
+    assert values[name] == expected
+
+
+@pytest.mark.parametrize(("name", "_default"), RECONCILIATION_INTEGER_SETTINGS)
+@pytest.mark.parametrize(
+    "value",
+    ("", "0", "-1", "+1", "1.5", "nan", "inf", "true", "９", "9" * 5000, True),
+)
+def test_payment_reconciliation_worker_rejects_non_strict_integer_settings(
+    tmp_path, name, _default, value
+):
+    env = _production_env(tmp_path, PAYMENT_PROVIDER="disabled")
+    env[name] = value
+
+    with pytest.raises(RuntimeError, match=name) as exc_info:
+        load_config(env)
+
+    if str(value):
+        assert str(value) not in str(exc_info.value) or str(value) == name
+
+
+@pytest.mark.parametrize("value", (" 1", "1 ", "\t1", "1\t"))
+def test_payment_reconciliation_worker_rejects_integer_whitespace(tmp_path, value):
+    env = _production_env(tmp_path, PAYMENT_PROVIDER="disabled")
+    name = "PAYMENT_RECONCILIATION_WORKER_SCAN_INTERVAL_SECONDS"
+    env[name] = value
+
+    with pytest.raises(RuntimeError, match=name):
+        load_config(env)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {
+            "PAYMENT_RECONCILIATION_WORKER_SCAN_INTERVAL_SECONDS": "1",
+            "PAYMENT_RECONCILIATION_WORKER_IDLE_WAIT_SECONDS": "2",
+        },
+        {
+            "PAYMENT_RECONCILIATION_QUERY_RETRY_BASE_SECONDS": "10",
+            "PAYMENT_RECONCILIATION_QUERY_RETRY_MAX_SECONDS": "5",
+        },
+        {
+            "PAYMENT_RECONCILIATION_CLOSE_RETRY_BASE_SECONDS": "10",
+            "PAYMENT_RECONCILIATION_CLOSE_RETRY_MAX_SECONDS": "5",
+        },
+    ),
+)
+def test_payment_reconciliation_worker_reuses_policy_cross_field_validation(
+    tmp_path, overrides
+):
+    env = _production_env(tmp_path, PAYMENT_PROVIDER="disabled", **overrides)
+
+    with pytest.raises(RuntimeError, match="PAYMENT_RECONCILIATION_.*POLICY_INVALID"):
+        load_config(env)
+
+
+def test_enabled_payment_reconciliation_worker_rejects_non_wechat_provider(tmp_path):
+    env = _production_env(
+        tmp_path,
+        LICENSE_SERVER_ENV="development",
+        PAYMENT_PROVIDER="mock",
+        PAYMENT_MOCK_ADMIN_TOKEN="localR4ndomValue123456",
+        PAYMENT_RECONCILIATION_WORKER_ENABLED="true",
+    )
+
+    with pytest.raises(RuntimeError, match="PAYMENT_RECONCILIATION_WORKER_PROVIDER"):
+        load_config(env)
+
+
+@pytest.mark.parametrize("environment", ("development", "test", "production"))
+def test_enabled_payment_reconciliation_worker_requires_absolute_database_path(
+    monkeypatch, tmp_path, environment
+):
+    env = _wechat_env(tmp_path)
+    env.update(
+        LICENSE_SERVER_ENV=environment,
+        DATABASE_URL="sqlite:///relative-reconciliation.sqlite3",
+        PAYMENT_RECONCILIATION_WORKER_ENABLED="true",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="PAYMENT_RECONCILIATION_WORKER_DATABASE_PATH_NOT_ABSOLUTE",
+    ):
+        load_config(env)
+
+    assert not (tmp_path / "relative-reconciliation.sqlite3").exists()
+
+
 @pytest.mark.parametrize("value", ("1", "true", "yes", "on", "TRUE"))
 def test_payment_notification_worker_accepts_enabled_values(tmp_path, value):
     env = _wechat_env(tmp_path)
