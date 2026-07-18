@@ -6,6 +6,7 @@ from threading import Barrier
 
 import pytest
 
+from license_server import payment_reconciliation_repository as repository
 from license_server.db import connect, initialize_database
 from license_server.payment_reconciliation_repository import (
     EnsureReadyOutcome,
@@ -412,6 +413,138 @@ def test_reschedule_reads_operation_clock_after_write_lock(tmp_path, monkeypatch
     assert result.record.last_query_at == NOW + timedelta(seconds=1)
 
 
+@pytest.mark.parametrize(
+    ("order_status", "expected_outcome", "expected_status", "terminal_reason"),
+    (
+        ("WAITING_PAYMENT", "rescheduled", "READY", None),
+        ("PAID", "already_paid", "TERMINAL", "ORDER_ALREADY_PAID"),
+        ("CLOSED", "already_closed", "TERMINAL", "PROVIDER_CLOSED"),
+        ("ABNORMAL", "already_abnormal", "TERMINAL", "ORDER_ALREADY_ABNORMAL"),
+    ),
+)
+def test_resolve_retry_claim_uses_authoritative_order_state(
+    tmp_path,
+    order_status,
+    expected_outcome,
+    expected_status,
+    terminal_reason,
+):
+    path = tmp_path / f"retry-{order_status}.sqlite3"
+    initialize_database(path)
+    _insert_order(path, "order-1", "WAITING_PAYMENT")
+    ensure_ready(path, "order-1", NOW, NOW)
+    claim = claim_next_due(path, worker_id="worker-1", now=NOW, lease_seconds=30)
+    if order_status != "WAITING_PAYMENT":
+        with connect(path) as connection:
+            values = {
+                "PAID": ("PAID", None, datetime_text(NOW), None),
+                "CLOSED": ("CLOSED", None, None, datetime_text(NOW)),
+                "ABNORMAL": ("ABNORMAL", "open", None, None),
+            }[order_status]
+            connection.execute(
+                "UPDATE payment_orders SET status=?, open_slot=?, paid_at=?, closed_at=? "
+                "WHERE order_id='order-1'",
+                values,
+            )
+            connection.commit()
+
+    result = repository.resolve_retry_claim(
+        path,
+        order_id=claim.order_id,
+        claim_token=claim.claim_token,
+        expected_state_version=claim.state_version,
+        completed_at=NOW + timedelta(seconds=1),
+        next_attempt_at=NOW + timedelta(seconds=5),
+        last_error_code="QUERY_GATEWAY_RETRYABLE",
+        query_completed=True,
+    )
+
+    assert result.outcome.value == expected_outcome
+    record = get(path, "order-1")
+    assert record.reconcile_status == expected_status
+    assert record.terminal_reason == terminal_reason
+    assert record.claim_token is None
+    assert record.claimed_by is None
+    assert record.claimed_at is None
+    assert record.lease_expires_at is None
+    assert record.state_version == claim.state_version + 1
+    if expected_status == "READY":
+        assert record.next_attempt_at == NOW + timedelta(seconds=5)
+        assert record.terminal_at is None
+    else:
+        assert record.next_attempt_at is None
+        assert record.terminal_at == NOW + timedelta(seconds=1)
+
+
+@pytest.mark.parametrize("stale_kind", ("token", "version", "lease"))
+def test_resolve_retry_claim_rejects_stale_claim_without_side_effects(
+    tmp_path, stale_kind
+):
+    path = tmp_path / f"stale-{stale_kind}.sqlite3"
+    initialize_database(path)
+    _insert_order(path, "order-1", "WAITING_PAYMENT")
+    ensure_ready(path, "order-1", NOW, NOW)
+    claim = claim_next_due(path, worker_id="worker-1", now=NOW, lease_seconds=10)
+    before_order = _order_row(path, "order-1")
+    before_task = _raw_task(path, "order-1")
+    token = "stale-token" if stale_kind == "token" else claim.claim_token
+    version = claim.state_version + 1 if stale_kind == "version" else claim.state_version
+    completed_at = NOW + timedelta(seconds=10 if stale_kind == "lease" else 1)
+
+    result = repository.resolve_retry_claim(
+        path,
+        order_id=claim.order_id,
+        claim_token=token,
+        expected_state_version=version,
+        completed_at=completed_at,
+        next_attempt_at=completed_at + timedelta(seconds=1),
+        query_completed=True,
+    )
+
+    assert result.outcome.value == "lost_claim"
+    assert _order_row(path, "order-1") == before_order
+    assert _raw_task(path, "order-1") == before_task
+
+
+def test_resolve_retry_claim_write_failure_rolls_back_without_mutation(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "retry-write-failure.sqlite3"
+    initialize_database(path)
+    _insert_order(path, "order-1", "WAITING_PAYMENT")
+    ensure_ready(path, "order-1", NOW, NOW)
+    claim = claim_next_due(path, worker_id="worker-1", now=NOW, lease_seconds=30)
+    before_order = _order_row(path, "order-1")
+    before_task = _raw_task(path, "order-1")
+    real_write_transaction = repository.write_transaction
+
+    @contextmanager
+    def failing_write_transaction(database_path):
+        with real_write_transaction(database_path) as connection:
+            yield _FailingReconciliationUpdateConnection(connection)
+
+    monkeypatch.setattr(repository, "write_transaction", failing_write_transaction)
+
+    with pytest.raises(PaymentReconciliationRepositoryError):
+        repository.resolve_retry_claim(
+            path,
+            order_id=claim.order_id,
+            claim_token=claim.claim_token,
+            expected_state_version=claim.state_version,
+            completed_at=NOW + timedelta(seconds=1),
+            next_attempt_at=NOW + timedelta(seconds=2),
+            query_completed=True,
+        )
+
+    assert _order_row(path, "order-1") == before_order
+    assert _raw_task(path, "order-1") == before_task
+    with connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM licenses WHERE license_type='paid'").fetchone()[0] == 0
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_reschedule_preserves_omitted_history_and_can_explicitly_clear_codes(tmp_path):
     path = tmp_path / "db.sqlite3"
     initialize_database(path)
@@ -554,3 +687,16 @@ def _raw_task(database_path, order_id):
             "SELECT * FROM payment_reconciliations WHERE order_id = ?", (order_id,)
         ).fetchone()
         return tuple(row) if row is not None else None
+
+
+class _FailingReconciliationUpdateConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql, parameters=()):
+        if "UPDATE payment_reconciliations" in " ".join(sql.split()):
+            raise sqlite3.OperationalError("database is locked")
+        return self._connection.execute(sql, parameters)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)

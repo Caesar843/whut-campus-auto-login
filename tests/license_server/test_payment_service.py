@@ -1,9 +1,11 @@
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock
 
 import pytest
 
+from license_server import payment_service
 from license_server.db import connect
 from license_server.payment import ANNUAL_V1, OrderStatus, PaymentEvidence, PaymentEvidenceSource
 from license_server.payment_gateway import (
@@ -17,6 +19,12 @@ from license_server.payment_gateway import (
 from license_server.payment_notification_repository import (
     IncomingPaymentNotification,
     insert_received_notification,
+)
+from license_server.payment_reconciliation_repository import (
+    claim_order,
+    ensure_ready,
+    get,
+    terminate_claim,
 )
 from license_server.payment_service import (
     PaymentServiceError,
@@ -42,8 +50,113 @@ def test_confirm_paid_order_creates_paid_license_grant_and_paid_order(tmp_path):
             "SELECT status, open_slot, provider_transaction_id FROM payment_orders WHERE order_id = ?",
             (order.order_id,),
         ).fetchone()
+        assert connection.execute("SELECT COUNT(*) FROM payment_reconciliations").fetchone()[0] == 0
 
     assert tuple(paid_order) == ("PAID", None, f"mock_txn_{order.order_id}")
+
+
+@pytest.mark.parametrize("reconcile_status", ("READY", "CLAIMED"))
+def test_confirm_paid_order_converges_ready_or_claimed_reconciliation(
+    tmp_path, reconcile_status
+):
+    database_path = tmp_path / "license.sqlite3"
+    order = _mock_order(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ensure_ready(database_path, order.order_id, now, now)
+    if reconcile_status == "CLAIMED":
+        claim = claim_order(
+            database_path,
+            order_id=order.order_id,
+            worker_id="reconciliation-worker",
+            now=now,
+            lease_seconds=60,
+        ).claim
+        assert claim is not None
+    before = get(database_path, order.order_id)
+
+    result = confirm_paid_order(
+        database_path,
+        _evidence(order.order_id),
+        now=now,
+    )
+
+    assert result.idempotent is False
+    record = get(database_path, order.order_id)
+    assert record.reconcile_status == "TERMINAL"
+    assert record.terminal_reason == "PAYMENT_CONFIRMED"
+    assert record.next_attempt_at is None
+    assert record.claim_token is None
+    assert record.claimed_by is None
+    assert record.claimed_at is None
+    assert record.lease_expires_at is None
+    assert record.state_version == before.state_version + 1
+    with connect(database_path) as connection:
+        assert tuple(connection.execute("SELECT status, open_slot FROM payment_orders").fetchone()) == (
+            "PAID",
+            None,
+        )
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM licenses WHERE license_type='paid'").fetchone()[0] == 1
+
+
+def test_confirm_paid_order_preserves_existing_terminal_reconciliation(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    order = _mock_order(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ensure_ready(database_path, order.order_id, now, now)
+    claim = claim_order(
+        database_path,
+        order_id=order.order_id,
+        worker_id="reconciliation-worker",
+        now=now,
+        lease_seconds=60,
+    ).claim
+    assert claim is not None
+    terminate_claim(
+        database_path,
+        claim_token=claim.claim_token,
+        expected_state_version=claim.state_version,
+        terminal_at=now,
+        terminal_reason="MANUAL_REVIEW_REQUIRED",
+    )
+    before = get(database_path, order.order_id)
+
+    confirm_paid_order(database_path, _evidence(order.order_id), now=now)
+
+    assert get(database_path, order.order_id) == before
+    with connect(database_path) as connection:
+        assert connection.execute("SELECT status FROM payment_orders").fetchone()[0] == "PAID"
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+
+
+def test_reconciliation_convergence_failure_rolls_back_payment_confirmation(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "license.sqlite3"
+    order = _mock_order(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    ensure_ready(database_path, order.order_id, now, now)
+    before = get(database_path, order.order_id)
+    real_connect = payment_service.connect
+    monkeypatch.setattr(
+        payment_service,
+        "connect",
+        lambda path: _FailAfterReconciliationUpdateConnection(real_connect(path)),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        confirm_paid_order(database_path, _evidence(order.order_id), now=now)
+
+    assert get(database_path, order.order_id) == before
+    with connect(database_path) as connection:
+        assert tuple(connection.execute("SELECT status, open_slot FROM payment_orders").fetchone()) == (
+            "WAITING_PAYMENT",
+            "open",
+        )
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM licenses WHERE license_type='paid'").fetchone()[0] == 0
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_repeated_confirm_is_idempotent_and_does_not_extend_twice(tmp_path):
@@ -839,3 +952,17 @@ def _create_wechat_order(database_path, gateway, *, now=None):
         expected_mchid="1900000109",
         now=now,
     )
+
+
+class _FailAfterReconciliationUpdateConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql, parameters=()):
+        cursor = self._connection.execute(sql, parameters)
+        if "UPDATE payment_reconciliations" in " ".join(sql.split()):
+            raise sqlite3.OperationalError("database is locked")
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)

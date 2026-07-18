@@ -20,6 +20,11 @@ from license_server.payment_notification_worker import (
     PaymentNotificationWorker,
     WorkerProcessOutcome,
 )
+from license_server.payment_reconciliation_repository import (
+    claim_order,
+    ensure_ready,
+    get,
+)
 from license_server.payment_service import PaymentServiceError
 from license_server.signer import datetime_text
 
@@ -74,6 +79,46 @@ def test_worker_confirms_created_or_waiting_order_atomically(tmp_path, status):
     assert grant["new_expire_at"] == license_row["expires_at"]
     assert license_row["starts_at"] == datetime_text(NOW)
     assert license_row["expires_at"] == datetime_text(NOW + timedelta(days=365))
+
+
+@pytest.mark.parametrize("reconcile_status", ("READY", "CLAIMED"))
+def test_callback_worker_converges_ready_or_claimed_reconciliation(
+    tmp_path, reconcile_status
+):
+    database_path = _database(tmp_path)
+    order_id = _insert_order(database_path)
+    ensure_ready(database_path, order_id, NOW, NOW)
+    if reconcile_status == "CLAIMED":
+        claim = claim_order(
+            database_path,
+            order_id=order_id,
+            worker_id="reconciliation-worker",
+            now=NOW,
+            lease_seconds=60,
+        ).claim
+        assert claim is not None
+    before = get(database_path, order_id)
+    _insert_notification(database_path, order_id=order_id)
+
+    result = _worker(database_path).process_next(now=NOW)
+
+    assert result.outcome is WorkerProcessOutcome.PROCESSED
+    record = get(database_path, order_id)
+    assert record.reconcile_status == "TERMINAL"
+    assert record.terminal_reason == "PAYMENT_CONFIRMED"
+    assert record.next_attempt_at is None
+    assert record.claim_token is None
+    assert record.claimed_by is None
+    assert record.claimed_at is None
+    assert record.lease_expires_at is None
+    assert record.state_version == before.state_version + 1
+    with connect(database_path) as connection:
+        assert tuple(connection.execute("SELECT status, open_slot FROM payment_orders").fetchone()) == (
+            "PAID",
+            None,
+        )
+        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM licenses WHERE license_type='paid'").fetchone()[0] == 1
 
 
 def test_worker_renews_from_existing_paid_expiry_not_notification_time(tmp_path):

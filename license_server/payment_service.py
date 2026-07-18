@@ -33,6 +33,7 @@ from license_server.payment_reconciliation_repository import (
     ensure_ready,
     reconciliation_claim_is_current_in_transaction,
     terminate_claim_in_transaction,
+    terminate_reconciliation_for_paid_order_in_transaction,
 )
 from license_server.signer import datetime_text
 from license_server.wechat_payment import WechatPaymentError
@@ -425,24 +426,8 @@ def confirm_paid_order_from_query_and_terminate_reconciliation(
             now=operation_time,
             allow_expired=True,
             mark_abnormal_on_error=False,
+            reconciliation_query_completed=True,
         )
-        update = terminate_claim_in_transaction(
-            connection,
-            claim_token=claim_token,
-            expected_state_version=expected_state_version,
-            terminal_at=operation_time,
-            terminal_reason=(
-                "ORDER_ALREADY_PAID" if confirmation.idempotent else "PAYMENT_CONFIRMED"
-            ),
-            trusted_trade_state="SUCCESS",
-            last_error_code=None,
-            query_completed=True,
-        )
-        if update.outcome is not UpdateOutcome.UPDATED:
-            raise PaymentServiceError(
-                "payment_reconciliation_invalid_state",
-                status_code=409,
-            )
         return (
             TrustedOrderUpdateOutcome.ALREADY_PAID
             if confirmation.idempotent
@@ -919,6 +904,7 @@ def _confirm_paid_order_in_transaction(
     now: datetime,
     allow_expired: bool = False,
     mark_abnormal_on_error: bool = True,
+    reconciliation_query_completed: bool = False,
 ) -> PaymentConfirmationResult:
     order = _order_by_id(connection, evidence.out_trade_no)
     if order is None:
@@ -944,6 +930,13 @@ def _confirm_paid_order_in_transaction(
         ).fetchone()
         if existing_license is None or str(order["status"]) != OrderStatus.PAID.value:
             raise PaymentServiceError("payment_grant_inconsistent", status_code=409)
+        terminate_reconciliation_for_paid_order_in_transaction(
+            connection,
+            order_id=evidence.out_trade_no,
+            terminal_at=now,
+            terminal_reason="ORDER_ALREADY_PAID",
+            query_completed=reconciliation_query_completed,
+        )
         return PaymentConfirmationResult(
             order_id=evidence.out_trade_no,
             status=OrderStatus.PAID.value,
@@ -1041,6 +1034,13 @@ def _confirm_paid_order_in_transaction(
             """,
             (datetime_text(now), notification_id),
         )
+    terminate_reconciliation_for_paid_order_in_transaction(
+        connection,
+        order_id=evidence.out_trade_no,
+        terminal_at=now,
+        terminal_reason="PAYMENT_CONFIRMED",
+        query_completed=reconciliation_query_completed,
+    )
     return PaymentConfirmationResult(
         order_id=evidence.out_trade_no,
         status=OrderStatus.PAID.value,

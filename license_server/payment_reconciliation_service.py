@@ -15,9 +15,11 @@ from license_server.payment_gateway import (
 )
 from license_server.payment_reconciliation_repository import (
     ReconciliationClaim,
+    RetryResolutionOutcome,
     UpdateOutcome,
     begin_close_attempt,
-    reschedule_claim,
+    get as get_reconciliation,
+    resolve_retry_claim,
     terminate_claim,
 )
 from license_server.payment_service import (
@@ -131,18 +133,12 @@ class PaymentReconciliationService:
                 return self._retry_query(
                     claim,
                     error="QUERY_GATEWAY_RETRYABLE",
-                    allow_exhaustion=allow_close_attempt,
                 )
-            return self._terminate_and_mark_abnormal(
-                claim,
-                reason="QUERY_GATEWAY_REJECTED",
-                error="QUERY_GATEWAY_NON_RETRYABLE",
-            )
+            raise
         except (ConnectionError, TimeoutError):
             return self._retry_query(
                 claim,
                 error="QUERY_GATEWAY_RETRYABLE",
-                allow_exhaustion=allow_close_attempt,
             )
         if query.out_trade_no != claim.order_id:
             return self._terminate_and_mark_abnormal(
@@ -172,7 +168,6 @@ class PaymentReconciliationService:
                 return self._retry_query(
                     claim,
                     trade_state="UNKNOWN",
-                    allow_exhaustion=False,
                 )
             return self._terminate_and_mark_abnormal(
                 claim,
@@ -184,7 +179,6 @@ class PaymentReconciliationService:
             return self._retry_query(
                 claim,
                 error="QUERY_RESULT_UNCLEAR",
-                allow_exhaustion=False,
             )
         return self._terminate(
             claim,
@@ -219,7 +213,7 @@ class PaymentReconciliationService:
                 error="PAYMENT_QUERY_MISMATCH",
             )
         if outcome is TrustedOrderUpdateOutcome.LOST_CLAIM:
-            return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
+            return self._lost_claim_result(claim.order_id)
         if outcome in {
             TrustedOrderUpdateOutcome.CONFLICT,
             TrustedOrderUpdateOutcome.NOT_ELIGIBLE,
@@ -254,7 +248,7 @@ class PaymentReconciliationService:
             clock=self.clock,
         )
         if outcome is TrustedOrderUpdateOutcome.LOST_CLAIM:
-            return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
+            return self._lost_claim_result(claim.order_id)
         if outcome is TrustedOrderUpdateOutcome.ALREADY_PAID:
             return ReconciliationResult(ReconciliationOutcome.ALREADY_PAID)
         return ReconciliationResult(ReconciliationOutcome.TERMINAL_ABNORMAL)
@@ -299,7 +293,7 @@ class PaymentReconciliationService:
             close_completed=False,
             clock=self.clock,
         )
-        return self._finish_closed(local)
+        return self._finish_closed(local, claim.order_id)
 
     def _notpay(
         self,
@@ -329,7 +323,7 @@ class PaymentReconciliationService:
             clock=self.clock,
         )
         if close_claim.outcome is UpdateOutcome.LOST_CLAIM:
-            return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
+            return self._lost_claim_result(claim.order_id)
         assert close_claim.claim is not None
         try:
             closed = self.gateway.close_order(claim.order_id)
@@ -362,14 +356,15 @@ class PaymentReconciliationService:
             close_completed=True,
             clock=self.clock,
         )
-        return self._finish_closed(local)
+        return self._finish_closed(local, claim.order_id)
 
     def _finish_closed(
         self,
         local: TrustedOrderUpdateOutcome,
+        order_id: str,
     ) -> ReconciliationResult:
         if local is TrustedOrderUpdateOutcome.LOST_CLAIM:
-            return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
+            return self._lost_claim_result(order_id)
         if local is TrustedOrderUpdateOutcome.ALREADY_PAID:
             return ReconciliationResult(ReconciliationOutcome.ALREADY_PAID)
         if local is TrustedOrderUpdateOutcome.ALREADY_CLOSED:
@@ -384,22 +379,8 @@ class PaymentReconciliationService:
         *,
         trade_state: str | None = None,
         error: str | None = None,
-        allow_exhaustion: bool = True,
     ) -> ReconciliationResult:
         order = load_reconciliation_order(self.database_path, claim.order_id)
-        if order is not None and order.status == "PAID":
-            return self._terminate_paid_race(claim)
-        if (
-            allow_exhaustion
-            and trade_state not in {"NOTPAY", "USERPAYING"}
-            and claim.query_attempt_count >= self.policy.max_query_attempts
-        ):
-            return self._terminate(
-                claim,
-                reason="QUERY_RETRY_EXHAUSTED",
-                trade_state=trade_state,
-                error=error,
-            )
         operation_time = self._now()
         next_attempt_at = operation_time + timedelta(
             seconds=_retry_delay(
@@ -426,14 +407,11 @@ class PaymentReconciliationService:
         )
         if trade_state is not None:
             values["trusted_trade_state"] = trade_state
-        update = reschedule_claim(
+        update = resolve_retry_claim(
+            order_id=claim.order_id,
             **values,
         )
-        return ReconciliationResult(
-            ReconciliationOutcome.RESCHEDULED
-            if update.outcome is UpdateOutcome.UPDATED
-            else ReconciliationOutcome.LOST_CLAIM
-        )
+        return self._finish_retry(update.outcome)
 
     def _retry_close(
         self,
@@ -441,9 +419,6 @@ class PaymentReconciliationService:
         *,
         error: str = "CLOSE_RESULT_UNKNOWN",
     ) -> ReconciliationResult:
-        order = load_reconciliation_order(self.database_path, claim.order_id)
-        if order is not None and order.status == "PAID":
-            return self._terminate_paid_race(claim)
         if claim.close_attempt_count >= self.policy.max_close_attempts:
             attempt_count = min(
                 claim.query_attempt_count,
@@ -456,8 +431,9 @@ class PaymentReconciliationService:
             retry_base_seconds = self.policy.close_retry_base_seconds
             retry_max_seconds = self.policy.close_retry_max_seconds
         operation_time = self._now()
-        update = reschedule_claim(
+        update = resolve_retry_claim(
             self.database_path,
+            order_id=claim.order_id,
             claim_token=claim.claim_token,
             expected_state_version=claim.state_version,
             completed_at=operation_time,
@@ -474,10 +450,20 @@ class PaymentReconciliationService:
             close_completed=True,
             clock=self.clock,
         )
+        return self._finish_retry(update.outcome)
+
+    @staticmethod
+    def _finish_retry(outcome: RetryResolutionOutcome) -> ReconciliationResult:
+        mapped = {
+            RetryResolutionOutcome.RESCHEDULED: ReconciliationOutcome.RESCHEDULED,
+            RetryResolutionOutcome.ALREADY_PAID: ReconciliationOutcome.ALREADY_PAID,
+            RetryResolutionOutcome.ALREADY_CLOSED: ReconciliationOutcome.ALREADY_CLOSED,
+            RetryResolutionOutcome.ALREADY_ABNORMAL: ReconciliationOutcome.TERMINAL_ABNORMAL,
+            RetryResolutionOutcome.LOST_CLAIM: ReconciliationOutcome.LOST_CLAIM,
+            RetryResolutionOutcome.NOT_ELIGIBLE: ReconciliationOutcome.LOST_CLAIM,
+        }
         return ReconciliationResult(
-            ReconciliationOutcome.RESCHEDULED
-            if update.outcome is UpdateOutcome.UPDATED
-            else ReconciliationOutcome.LOST_CLAIM
+            mapped[outcome]
         )
 
     def _terminate_paid_race(
@@ -519,11 +505,23 @@ class PaymentReconciliationService:
         if trade_state is not None:
             values["trusted_trade_state"] = trade_state
         update = terminate_claim(**values)
-        return ReconciliationResult(
-            ReconciliationOutcome.TERMINAL_ABNORMAL
-            if update.outcome is UpdateOutcome.UPDATED
-            else ReconciliationOutcome.LOST_CLAIM
-        )
+        if update.outcome is UpdateOutcome.UPDATED:
+            return ReconciliationResult(ReconciliationOutcome.TERMINAL_ABNORMAL)
+        return self._lost_claim_result(claim.order_id)
+
+    def _lost_claim_result(self, order_id: str) -> ReconciliationResult:
+        order = load_reconciliation_order(self.database_path, order_id)
+        if order is not None:
+            if order.status == "PAID":
+                return ReconciliationResult(ReconciliationOutcome.ALREADY_PAID)
+            if order.status == "CLOSED":
+                return ReconciliationResult(ReconciliationOutcome.ALREADY_CLOSED)
+            if order.status == "ABNORMAL":
+                return ReconciliationResult(ReconciliationOutcome.TERMINAL_ABNORMAL)
+        task = get_reconciliation(self.database_path, order_id)
+        if task is not None and task.reconcile_status == "TERMINAL":
+            return ReconciliationResult(ReconciliationOutcome.TERMINAL_ABNORMAL)
+        return ReconciliationResult(ReconciliationOutcome.LOST_CLAIM)
 
     def _now(self) -> datetime:
         return _utc(self.clock())
