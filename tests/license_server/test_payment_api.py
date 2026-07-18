@@ -25,6 +25,7 @@ from license_server.payment_reconciliation_service import (
     ReconciliationOutcome,
     ReconciliationResult,
 )
+from license_server.payment_reconciliation_worker import PaymentReconciliationWorker
 from license_server.signer import datetime_text
 from tests.license_server.test_license_server import _client, _register_payload
 
@@ -826,6 +827,102 @@ def test_concurrent_refresh_calls_gateway_once_and_preserves_active_claim(tmp_pa
     assert state[0] == "READY"
     assert state[2] == 1
     assert state[-1] == 2
+
+
+def test_refresh_claim_clock_starts_after_write_lock_and_blocks_worker_reclaim(
+    tmp_path,
+    monkeypatch,
+):
+    gateway = BlockingGateway()
+    client, token = _registered_mock_client(tmp_path, gateway=gateway)
+    order = _create_order(client, token)
+    database_path = tmp_path / "license.sqlite3"
+    path = f"/api/v1/payment/orders/{order['order_id']}/refresh"
+    t0 = datetime.now(timezone.utc).replace(microsecond=0)
+    t1 = t0 + timedelta(seconds=30)
+    t2 = t1 + timedelta(seconds=1)
+    competitor_time = t0 + timedelta(seconds=75)
+    ensure_ready(database_path, order["order_id"], t0, t0)
+
+    route_clock_read = Event()
+    route_times = iter((t0, t1, t2))
+
+    class RouteDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            value = next(route_times)
+            route_clock_read.set()
+            return value
+
+    ensure_entered = Event()
+    real_ensure_ready = payment_routes.ensure_ready
+
+    def tracked_ensure_ready(*args, **kwargs):
+        ensure_entered.set()
+        return real_ensure_ready(*args, **kwargs)
+
+    service_times = []
+
+    def reconcile(service, claim, *, now):
+        service_times.append(now)
+        service.gateway.query_order(claim.order_id)
+        return ReconciliationResult(ReconciliationOutcome.RESCHEDULED)
+
+    monkeypatch.setattr(payment_routes, "datetime", RouteDateTime)
+    monkeypatch.setattr(payment_routes, "ensure_ready", tracked_ensure_ready)
+    monkeypatch.setattr(PaymentReconciliationService, "reconcile_claim", reconcile)
+
+    blocker = sqlite3.connect(database_path)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker_released = False
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_future = executor.submit(
+            client.post,
+            path,
+            headers=_auth(token),
+            json={},
+        )
+        try:
+            assert route_clock_read.wait(timeout=5)
+            assert ensure_entered.wait(timeout=5)
+            assert not first_future.done()
+            blocker.commit()
+            blocker_released = True
+            assert gateway.query_started.wait(timeout=5)
+
+            claimed_state = _reconciliation_state(tmp_path, order["order_id"])
+            assert claimed_state[5] == datetime_text(t1)
+            assert claimed_state[6] == datetime_text(t1 + timedelta(seconds=60))
+            assert service_times == [t2]
+            assert service_times[0] >= t1
+
+            competitor_gateway = CountingGateway()
+
+            class CompetitorService:
+                def reconcile_claim(self, claim, *, now):
+                    competitor_gateway.query_order(claim.order_id)
+                    return ReconciliationResult(ReconciliationOutcome.RESCHEDULED)
+
+            competitor = PaymentReconciliationWorker(
+                database_path=database_path,
+                reconciliation_service=CompetitorService(),
+                worker_id="competing-worker",
+                clock=lambda: competitor_time,
+            ).run_once(now=competitor_time)
+            after_competitor = _reconciliation_state(tmp_path, order["order_id"])
+
+            assert competitor.claimed_count == 0
+            assert after_competitor[3] == claimed_state[3]
+            assert after_competitor[-1] == claimed_state[-1]
+            assert gateway.query_count + competitor_gateway.query_count == 1
+        finally:
+            if not blocker_released:
+                blocker.rollback()
+            blocker.close()
+            gateway.release_query.set()
+        first = first_future.result(timeout=5)
+
+    assert first.status_code == 200
 
 
 def test_callback_paid_race_is_never_overwritten_by_refresh(tmp_path):

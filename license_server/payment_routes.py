@@ -5,6 +5,7 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -54,6 +55,10 @@ _REFRESH_POLICY = PaymentReconciliationPolicy(
 )
 
 
+def _server_utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
 class PaymentOrderCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -79,8 +84,10 @@ def create_payment_router(
     expected_appid: str | None,
     expected_mchid: str | None,
     payment_order_ttl_minutes: int,
+    clock: Callable[[], datetime] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1/payment")
+    utc_now = clock or _server_utc_now
     reconciliation_service = _reconciliation_service(
         database_path=database_path,
         payment_provider=payment_provider,
@@ -158,7 +165,7 @@ def create_payment_router(
                 if immediate is not None:
                     return immediate
 
-                now = datetime.now(timezone.utc).replace(microsecond=0)
+                now = utc_now()
                 ensured = ensure_ready(database_path, order_id, now, now)
                 if ensured.outcome is EnsureReadyOutcome.NOT_FOUND:
                     raise _refresh_unavailable()
@@ -175,6 +182,7 @@ def create_payment_router(
                     worker_id=_REFRESH_WORKER_ID,
                     now=now,
                     lease_seconds=_REFRESH_CLAIM_LEASE_SECONDS,
+                    clock=utc_now,
                 )
                 if claimed.outcome is ClaimOrderOutcome.NOT_DUE:
                     record = get_reconciliation(database_path, order_id)
@@ -222,7 +230,10 @@ def create_payment_router(
                 if claimed.claim is None:
                     raise _refresh_unavailable()
 
-                result = reconciliation_service.reconcile_claim(claimed.claim, now=now)
+                result = reconciliation_service.reconcile_claim(
+                    claimed.claim,
+                    now=utc_now(),
+                )
                 current = _read_order_for_device(
                     database_path,
                     order_id=order_id,
