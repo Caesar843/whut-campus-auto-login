@@ -111,7 +111,12 @@ class PaymentReconciliationService:
         now: datetime,
     ) -> ReconciliationResult:
         _utc(now)
-        return self._query_once(claim, allow_close_attempt=True)
+        return self._query_once(
+            claim,
+            allow_close_attempt=(
+                claim.close_attempt_count < self.policy.max_close_attempts
+            ),
+        )
 
     def _query_once(
         self,
@@ -329,13 +334,11 @@ class PaymentReconciliationService:
         try:
             closed = self.gateway.close_order(claim.order_id)
         except WechatPaymentError as exc:
+            if not exc.retryable:
+                raise
             return self._retry_close(
                 close_claim.claim,
-                error=(
-                    "CLOSE_GATEWAY_RETRYABLE"
-                    if exc.retryable
-                    else "CLOSE_GATEWAY_NON_RETRYABLE"
-                ),
+                error="CLOSE_GATEWAY_RETRYABLE",
             )
         except (ConnectionError, TimeoutError):
             return self._retry_close(
@@ -442,14 +445,16 @@ class PaymentReconciliationService:
         if order is not None and order.status == "PAID":
             return self._terminate_paid_race(claim)
         if claim.close_attempt_count >= self.policy.max_close_attempts:
-            return self._terminate(
-                claim,
-                reason="CLOSE_RETRY_EXHAUSTED",
-                trade_state="NOTPAY",
-                error=error,
-                query_completed=True,
-                close_completed=True,
+            attempt_count = min(
+                claim.query_attempt_count,
+                self.policy.max_query_attempts,
             )
+            retry_base_seconds = self.policy.query_retry_base_seconds
+            retry_max_seconds = self.policy.query_retry_max_seconds
+        else:
+            attempt_count = claim.close_attempt_count
+            retry_base_seconds = self.policy.close_retry_base_seconds
+            retry_max_seconds = self.policy.close_retry_max_seconds
         operation_time = self._now()
         update = reschedule_claim(
             self.database_path,
@@ -458,9 +463,9 @@ class PaymentReconciliationService:
             completed_at=operation_time,
             next_attempt_at=operation_time + timedelta(
                 seconds=_retry_delay(
-                    claim.close_attempt_count,
-                    self.policy.close_retry_base_seconds,
-                    self.policy.close_retry_max_seconds,
+                    attempt_count,
+                    retry_base_seconds,
+                    retry_max_seconds,
                 )
             ),
             trusted_trade_state="NOTPAY",
