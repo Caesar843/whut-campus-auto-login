@@ -434,9 +434,9 @@ def _payment_order_ttl_minutes_from_env(values: Mapping[str, str]) -> int:
     try:
         ttl_minutes = int(raw_value)
     except ValueError as exc:
-        raise RuntimeError("PAYMENT_ORDER_TTL_MINUTES must be an integer.") from exc
-    if ttl_minutes < 1:
-        raise RuntimeError("PAYMENT_ORDER_TTL_MINUTES must be at least 1.")
+        raise RuntimeError("PAYMENT_ORDER_TTL_MINUTES must be exactly 15.") from exc
+    if ttl_minutes != DEFAULT_PAYMENT_ORDER_TTL_MINUTES:
+        raise RuntimeError("PAYMENT_ORDER_TTL_MINUTES must be exactly 15.")
     return ttl_minutes
 
 

@@ -188,7 +188,7 @@ def create_payment_router(
                     record = get_reconciliation(database_path, order_id)
                     retry_after = _retry_after(
                         record.next_attempt_at if record is not None else None,
-                        now,
+                        utc_now(),
                     )
                     raise HTTPException(
                         status_code=429,
@@ -199,7 +199,7 @@ def create_payment_router(
                     record = get_reconciliation(database_path, order_id)
                     retry_after = _retry_after(
                         record.lease_expires_at if record is not None else None,
-                        now,
+                        utc_now(),
                     )
                     current = _read_order_for_device(
                         database_path,

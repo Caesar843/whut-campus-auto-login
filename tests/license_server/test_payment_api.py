@@ -54,6 +54,22 @@ def test_create_order_uses_bearer_token_and_returns_mock_code_url(tmp_path):
     assert "id" not in payload
 
 
+def test_create_order_uses_frozen_fifteen_minute_ttl(tmp_path):
+    client, token = _registered_mock_client(tmp_path)
+
+    response = client.post(
+        "/api/v1/payment/orders",
+        headers=_auth(token),
+        json={"product_code": "annual_v1"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    created_at = datetime.fromisoformat(payload["created_at"].replace("Z", "+00:00"))
+    expires_at = datetime.fromisoformat(payload["expires_at"].replace("Z", "+00:00"))
+    assert expires_at - created_at == timedelta(seconds=900)
+
+
 def test_create_order_rejects_client_controlled_amount(tmp_path):
     client, token = _registered_mock_client(tmp_path)
 
@@ -506,6 +522,143 @@ def test_refresh_in_progress_returns_202_without_stealing_claim(tmp_path):
     assert response.status_code == 202
     assert response.json()["refresh_result"] == "REFRESH_IN_PROGRESS"
     assert response.json()["retry_after_seconds"] >= 1
+    assert gateway.query_count == 0
+    assert after == before
+
+
+def test_refresh_not_due_retry_after_uses_clock_after_write_lock(
+    tmp_path,
+    monkeypatch,
+):
+    gateway = CountingGateway()
+    client, token = _registered_mock_client(tmp_path, gateway=gateway)
+    order = _create_order(client, token)
+    database_path = tmp_path / "license.sqlite3"
+    path = f"/api/v1/payment/orders/{order['order_id']}/refresh"
+    t0 = datetime.now(timezone.utc).replace(microsecond=0)
+    t1 = t0 + timedelta(seconds=30)
+    response_now = t1 + timedelta(seconds=5)
+    target = t1 + timedelta(seconds=20)
+    ensure_ready(database_path, order["order_id"], t0, target)
+    before = _reconciliation_state(tmp_path, order["order_id"])
+
+    route_clock_read = Event()
+    route_times = iter((t0, t1, response_now))
+
+    class RouteDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            value = next(route_times)
+            route_clock_read.set()
+            return value
+
+    ensure_entered = Event()
+    real_ensure_ready = payment_routes.ensure_ready
+
+    def tracked_ensure_ready(*args, **kwargs):
+        ensure_entered.set()
+        return real_ensure_ready(*args, **kwargs)
+
+    monkeypatch.setattr(payment_routes, "datetime", RouteDateTime)
+    monkeypatch.setattr(payment_routes, "ensure_ready", tracked_ensure_ready)
+
+    blocker = sqlite3.connect(database_path)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker_released = False
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(client.post, path, headers=_auth(token), json={})
+        try:
+            assert route_clock_read.wait(timeout=5)
+            assert ensure_entered.wait(timeout=5)
+            assert not future.done()
+            blocker.commit()
+            blocker_released = True
+            response = future.result(timeout=5)
+        finally:
+            if not blocker_released:
+                blocker.rollback()
+            blocker.close()
+
+    after = _reconciliation_state(tmp_path, order["order_id"])
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "PAYMENT_REFRESH_RATE_LIMITED"
+    assert int(response.headers["Retry-After"]) == 15
+    assert int(response.headers["Retry-After"]) != int((target - t0).total_seconds())
+    assert gateway.query_count == 0
+    assert after == before
+
+
+def test_refresh_in_progress_retry_after_uses_clock_after_write_lock(
+    tmp_path,
+    monkeypatch,
+):
+    gateway = CountingGateway()
+    client, token = _registered_mock_client(tmp_path, gateway=gateway)
+    order = _create_order(client, token)
+    database_path = tmp_path / "license.sqlite3"
+    path = f"/api/v1/payment/orders/{order['order_id']}/refresh"
+    t0 = datetime.now(timezone.utc).replace(microsecond=0)
+    t1 = t0 + timedelta(seconds=30)
+    response_now = t1 + timedelta(seconds=5)
+    ensure_ready(database_path, order["order_id"], t0, t0)
+    claimed = claim_order(
+        database_path,
+        order_id=order["order_id"],
+        worker_id="existing-worker",
+        now=t0,
+        lease_seconds=50,
+    )
+    assert claimed.claim is not None
+    before = _reconciliation_state(tmp_path, order["order_id"])
+
+    route_clock_read = Event()
+    route_times = iter((t0, t1, response_now))
+
+    class RouteDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            value = next(route_times)
+            route_clock_read.set()
+            return value
+
+    ensure_entered = Event()
+    real_ensure_ready = payment_routes.ensure_ready
+
+    def tracked_ensure_ready(*args, **kwargs):
+        ensure_entered.set()
+        return real_ensure_ready(*args, **kwargs)
+
+    monkeypatch.setattr(payment_routes, "datetime", RouteDateTime)
+    monkeypatch.setattr(payment_routes, "ensure_ready", tracked_ensure_ready)
+
+    blocker = sqlite3.connect(database_path)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker_released = False
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(client.post, path, headers=_auth(token), json={})
+        try:
+            assert route_clock_read.wait(timeout=5)
+            assert ensure_entered.wait(timeout=5)
+            assert not future.done()
+            blocker.commit()
+            blocker_released = True
+            response = future.result(timeout=5)
+        finally:
+            if not blocker_released:
+                blocker.rollback()
+            blocker.close()
+
+    after = _reconciliation_state(tmp_path, order["order_id"])
+    lease_expires_at = claimed.claim.lease_expires_at
+
+    assert response.status_code == 202
+    assert response.json()["refresh_result"] == "REFRESH_IN_PROGRESS"
+    assert response.json()["retry_after_seconds"] == 15
+    assert response.json()["retry_after_seconds"] != int(
+        (lease_expires_at - t0).total_seconds()
+    )
+    assert "Retry-After" not in response.headers
     assert gateway.query_count == 0
     assert after == before
 

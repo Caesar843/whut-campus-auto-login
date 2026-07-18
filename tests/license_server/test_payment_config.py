@@ -535,6 +535,45 @@ def test_payment_channels_are_wechat_native_only(tmp_path, channels):
         load_config(env)
 
 
+def test_payment_order_ttl_defaults_to_fifteen_minutes(tmp_path):
+    config = load_config(_production_env(tmp_path, PAYMENT_PROVIDER="disabled"))
+
+    assert config.payment_order_ttl_minutes == 15
+
+
+def test_payment_order_ttl_accepts_exact_fifteen_and_keeps_catalog(tmp_path):
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="disabled",
+        PAYMENT_ORDER_TTL_MINUTES="15",
+        PAYMENT_PRICE_FEN="990",
+        PAYMENT_CURRENCY="CNY",
+        PAYMENT_CHANNELS="wechat_pay",
+    )
+
+    config = load_config(env)
+
+    assert config.payment_order_ttl_minutes == 15
+    assert config.payment_price_fen == 990
+    assert config.payment_currency == "CNY"
+    assert config.payment_channels == ("wechat_pay",)
+
+
+@pytest.mark.parametrize("value", ("", "0", "1", "14", "16", "60", "-1", "abc", "15.0"))
+def test_payment_order_ttl_rejects_every_non_fifteen_value(tmp_path, value):
+    env = _production_env(tmp_path, PAYMENT_PROVIDER="disabled")
+    env["PAYMENT_ORDER_TTL_MINUTES"] = value
+    env["WECHAT_PAY_API_V3_KEY"] = "SECRET_VALUE_THAT_MUST_NOT_LEAK"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_config(env)
+
+    message = str(exc_info.value)
+    assert "PAYMENT_ORDER_TTL_MINUTES" in message
+    assert "15" in message
+    assert "SECRET_VALUE_THAT_MUST_NOT_LEAK" not in message
+
+
 def test_valid_wechat_native_config_is_loaded_without_secret_repr(tmp_path):
     env = _wechat_env(tmp_path)
     config = load_config(env)
