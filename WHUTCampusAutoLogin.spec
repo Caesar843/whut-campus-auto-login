@@ -1,17 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import runpy
 from pathlib import Path
 
 
 ROOT = Path(SPECPATH)
 GENERATED_MODULE_DIR = ROOT / "build" / "generated"
 EMBEDDED_CONFIG_MODULE = GENERATED_MODULE_DIR / "_license_client_embedded_build_config.py"
+BUILD_SESSION_ENVIRONMENT_NAME = "WHUT_BUILD_SESSION_ID"
 
 if not EMBEDDED_CONFIG_MODULE.exists():
     raise RuntimeError(
         "Missing embedded license build config. Run scripts/build_windows.ps1 "
-        "with -BuildEnvironment and -LicensePublicKey."
+        "with -BuildEnvironment, -LicensePublicKey, and the release URL when required."
     )
+
+build_session_id = os.environ.get(BUILD_SESSION_ENVIRONMENT_NAME, "")
+if not build_session_id:
+    raise RuntimeError("Missing current build session. Run scripts/build_windows.ps1.")
+try:
+    embedded_config = runpy.run_path(str(EMBEDDED_CONFIG_MODULE))
+except Exception as exc:
+    raise RuntimeError("Embedded license build config is invalid.") from exc
+if embedded_config.get("BUILD_SESSION_ID") != build_session_id:
+    raise RuntimeError("Embedded license build config does not match the current build session.")
 
 a = Analysis(
     [str(ROOT / "desktop_app" / "tray_app.py")],

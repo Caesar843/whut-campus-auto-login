@@ -13,13 +13,16 @@ python -m pip install -r requirements-build.txt
 
 ## Build
 
-Run from the repository root:
+Run a production build from the repository root:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 `
+  -BuildEnvironment production `
+  -LicenseServerUrl "https://license.whutlogin.cn" `
+  -LicensePublicKey "<public-key>"
 ```
 
-The script can also be launched from the `scripts` directory. It locates the repository root, removes the previous `build/` temporary directory, and builds from `WHUTCampusAutoLogin.spec`.
+`preproduction` and `production` builds require an embedded HTTPS license server URL and Ed25519 verification public key. A development build uses `-BuildEnvironment development`, may omit `-LicenseServerUrl`, and then keeps the runtime `LICENSE_SERVER_URL` or local loopback default. The script can also be launched from the `scripts` directory. It locates the repository root, removes any previous generated license config before validation, binds the new config to the current build session, and removes it again after success or failure. Run the script rather than invoking `WHUTCampusAutoLogin.spec` directly; the spec rejects missing or stale build sessions.
 
 Output:
 
