@@ -43,6 +43,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 `
 
 P6-A1c must supply an approved HTTPS license URL and approved Ed25519 verification public key. Never place a signing private key, campus-network credential, payment key, token, or other secret in the command or repository.
 
+Before a production build, run
+[`PRODUCTION_LICENSE_KEY_PREFLIGHT.md`](PRODUCTION_LICENSE_KEY_PREFLIGHT.md) on
+the production server and freeze the successful `public_key_sha256` value. The
+public key supplied to `scripts/build_windows.ps1` must reproduce that
+fingerprint. A preflight `PASS` does not replace the later public HTTPS and
+running-service token checks.
+
 ## Expected output and resources
 
 - Packaging remains `onedir`: `dist\WHUTCampusAutoLogin\WHUTCampusAutoLogin.exe` plus its dependency directory.
