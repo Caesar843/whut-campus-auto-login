@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import binascii
 import ipaddress
 import math
 import os
@@ -13,13 +11,13 @@ from urllib.parse import unquote, urlsplit
 
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
     load_pem_private_key,
     load_pem_public_key,
 )
 
 from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
+from license_server.ed25519_keys import Ed25519KeyFormatError, load_private_key_b64
 from license_server.payment import ANNUAL_V1
 
 if TYPE_CHECKING:
@@ -183,12 +181,9 @@ def is_production_environment(env: Mapping[str, str] | None = None) -> bool:
 
 def validate_private_key_b64(private_key_b64: str, *, source: str = "LICENSE_PRIVATE_KEY") -> None:
     try:
-        key_bytes = base64.b64decode(private_key_b64, validate=True)
-        Ed25519PrivateKey.from_private_bytes(key_bytes)
-    except (ValueError, binascii.Error) as exc:
-        raise RuntimeError(
-            f"{source} must be a base64-encoded 32-byte Ed25519 private key."
-        ) from exc
+        load_private_key_b64(private_key_b64, source=source)
+    except Ed25519KeyFormatError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _environment_from_env(values: Mapping[str, str]) -> str:
