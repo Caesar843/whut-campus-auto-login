@@ -13,9 +13,14 @@ $scriptDir = Split-Path -Parent $PSCommandPath
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir '..')).Path
 $specPath = Join-Path $repoRoot 'WHUTCampusAutoLogin.spec'
 $entryPath = Join-Path $repoRoot 'desktop_app\tray_app.py'
+$baselinePath = Join-Path $repoRoot 'packaging\windows\build_baseline.json'
+$environmentVerifierPath = Join-Path $repoRoot 'scripts\verify_windows_build_environment.py'
+$versionGeneratorPath = Join-Path $repoRoot 'scripts\generate_windows_version_info.py'
+$appIconPath = Join-Path $repoRoot 'assets\windows\whut_campus_auto_login.ico'
 $buildDir = Join-Path $repoRoot 'build'
 $generatedDir = Join-Path $buildDir 'generated'
 $generatedConfigModule = Join-Path $generatedDir '_license_client_embedded_build_config.py'
+$generatedVersionInfo = Join-Path $generatedDir 'windows_version_info.txt'
 $generatedConfigPyc = Join-Path $generatedDir '_license_client_embedded_build_config.pyc'
 $generatedConfigCache = Join-Path $generatedDir '__pycache__'
 $buildSessionEnvironmentName = 'WHUT_BUILD_SESSION_ID'
@@ -48,20 +53,68 @@ if (-not (Test-Path -LiteralPath $specPath)) {
 if (-not (Test-Path -LiteralPath $entryPath)) {
     throw "Missing desktop entry: $entryPath"
 }
+if (-not (Test-Path -LiteralPath $baselinePath)) {
+    throw "Missing Windows build baseline."
+}
+if (-not (Test-Path -LiteralPath $environmentVerifierPath)) {
+    throw "Missing Windows build environment verifier."
+}
+if (-not (Test-Path -LiteralPath $versionGeneratorPath)) {
+    throw "Missing Windows version metadata generator."
+}
+if (-not (Test-Path -LiteralPath $appIconPath)) {
+    throw "Missing official Windows application icon."
+}
+
+try {
+    $baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
+}
+catch {
+    throw "Windows build baseline is invalid."
+}
+$expectedPythonVersion = [string]$baseline.python_version
+$expectedPyInstallerVersion = [string]$baseline.pyinstaller_version
+$packagingMode = [string]$baseline.packaging_mode
+if (-not $expectedPythonVersion -or -not $expectedPyInstallerVersion -or $packagingMode -ne 'onedir') {
+    throw "Windows build baseline is invalid."
+}
 
 $python = Get-Command python -ErrorAction Stop
 
 Push-Location $repoRoot
 try {
-    & $python.Source --version | Write-Output
+    $pythonVersionOutput = (& $python.Source --version 2>&1 | Select-Object -Last 1)
     if ($LASTEXITCODE -ne 0) {
         throw "Python failed with exit code $LASTEXITCODE"
     }
+    $pythonVersion = ([string]$pythonVersionOutput -replace '^Python\s+', '').Trim()
+    if ($pythonVersion -ne $expectedPythonVersion) {
+        throw "Python $pythonVersion does not match required version $expectedPythonVersion."
+    }
 
-    & $python.Source -m PyInstaller --version | Out-Null
+    $pyInstallerVersion = [string](& $python.Source -m PyInstaller --version | Select-Object -Last 1)
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller is not installed. Run: python -m pip install -r requirements-build.txt"
     }
+    $pyInstallerVersion = $pyInstallerVersion.Trim()
+    if ($pyInstallerVersion -ne $expectedPyInstallerVersion) {
+        throw "PyInstaller $pyInstallerVersion does not match required version $expectedPyInstallerVersion."
+    }
+
+    & $python.Source $environmentVerifierPath | Write-Output
+    if ($LASTEXITCODE -ne 0) {
+        throw "Windows build environment validation failed."
+    }
+
+    $appVersion = [string](& $python.Source -c 'from app_version import APP_VERSION; print(APP_VERSION)' | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or -not $appVersion.Trim()) {
+        throw "Failed to read application version."
+    }
+    $appVersion = $appVersion.Trim()
+    Write-Output ("AppVersion: {0}" -f $appVersion)
+    Write-Output ("PythonVersion: {0}" -f $pythonVersion)
+    Write-Output ("PyInstallerVersion: {0}" -f $pyInstallerVersion)
+    Write-Output ("PackagingMode: {0}" -f $packagingMode)
 
     $buildEnvironmentValue = $BuildEnvironment.Trim().ToLowerInvariant()
     if (-not $buildEnvironmentValue) {
@@ -101,6 +154,11 @@ try {
         throw "Failed to prepare embedded license build config."
     }
     [Environment]::SetEnvironmentVariable($buildSessionEnvironmentName, $buildSessionId, 'Process')
+
+    & $python.Source $versionGeneratorPath '--output' $generatedVersionInfo
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $generatedVersionInfo)) {
+        throw "Failed to generate Windows version metadata."
+    }
 
     $distAppDir = Join-Path $repoRoot 'dist\WHUTCampusAutoLogin'
     if ($Clean -and (Test-Path -LiteralPath $distAppDir)) {

@@ -525,7 +525,9 @@ def test_pyinstaller_config_freezes_embedded_config_module_not_external_txt():
     assert EMBEDDED_CONFIG_MODULE_NAME in spec
     assert "license_public_key.txt" not in spec
     assert "build_environment.txt" not in spec
-    assert "datas=[]" in spec.replace(" ", "")
+    assert "whut_campus_auto_login.ico" in spec
+    assert "windows_version_info.txt" in spec
+    assert "whut_campus_auto_login_icon_source.png" not in spec
     assert "license_public_key.txt" not in build_script
     assert "build_environment.txt" not in build_script
     assert "BuildEnvironment" in build_script

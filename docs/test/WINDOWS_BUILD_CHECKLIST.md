@@ -1,49 +1,53 @@
 # Windows build checklist
 
-## Environment
+## Release baseline
 
-- Windows 10/11.
-- Python 3.11 or newer available as `python`.
-- Client dependencies installed.
-- PyInstaller installed only for build work:
+- Windows 10/11 x64.
+- Python 3.11.9.
+- PyInstaller 6.21.0.
+- Packaging mode: `onedir`.
+- APP_VERSION 0.1.0.
+- Dependencies installed from `requirements-windows-build.lock.txt` in a dedicated virtual environment.
+
+## Automated checks
 
 ```powershell
-python -m pip install -r requirements-build.txt
+$env:PYTHONDONTWRITEBYTECODE='1'
+$env:QT_QPA_PLATFORM='offscreen'
+python .\scripts\verify_windows_build_environment.py
+python -m pip check
+python -m pytest -p no:cacheprovider --ignore=tests\client\test_payment_flow.py tests\campus_login tests\client tests\license_client tests\test_windows_build_config_lifecycle.py tests\test_windows_build_environment.py tests\test_windows_release_baseline.py
 ```
 
-## Build
+The environment verifier must pass before any release build. Run `scripts/build_windows.ps1`; `WHUTCampusAutoLogin.spec` 不能直接运行 because it rejects a missing or stale build session.
 
-Run a production build from the repository root:
+The Windows build lock excludes server-only dependencies. The scoped command excludes `tests\client\test_payment_flow.py` because it imports a license-server test helper. Run the complete repository suite separately in a development environment that also installs `requirements-server.txt`.
+
+## Controlled release command
+
+The following command documents the interface only. It is intentionally not usable for a real release because the URL is reserved and the public key is a placeholder:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 `
+  -Clean `
   -BuildEnvironment production `
-  -LicenseServerUrl "https://license.whutlogin.cn" `
-  -LicensePublicKey "<public-key>"
+  -LicenseServerUrl "https://example.invalid" `
+  -LicensePublicKey "<production-public-key>"
 ```
 
-`preproduction` and `production` builds require an embedded HTTPS license server URL and Ed25519 verification public key. A development build uses `-BuildEnvironment development`, may omit `-LicenseServerUrl`, and then keeps the runtime `LICENSE_SERVER_URL` or local loopback default. The script can also be launched from the `scripts` directory. It locates the repository root, removes any previous generated license config before validation, binds the new config to the current build session, and removes it again after success or failure. Run the script rather than invoking `WHUTCampusAutoLogin.spec` directly; the spec rejects missing or stale build sessions.
+P6-A1c must replace both placeholder values with approved production inputs. Do not place a private key or payment secret in this command.
 
-Output:
+## Manual checks after an approved P6-A1c build
 
-```text
-dist\WHUTCampusAutoLogin\WHUTCampusAutoLogin.exe
-```
+1. Confirm the output remains `dist\WHUTCampusAutoLogin\WHUTCampusAutoLogin.exe` inside an onedir folder.
+2. Confirm the EXE properties show version 0.1.0 and the approved Chinese product metadata.
+3. Confirm the EXE, taskbar, main window, and tray use the same official icon.
+4. Start the EXE from outside the repository and test normal and `--startup-tray` startup.
+5. Confirm credentials remain in Windows Credential Manager and runtime data remains under `%APPDATA%\WHUTCampusAutoLogin`.
 
-## Manual checks
+## Not covered by P6-A1b
 
-1. Start `dist\WHUTCampusAutoLogin\WHUTCampusAutoLogin.exe` from outside the repository root and confirm the main window opens.
-2. Start `dist\WHUTCampusAutoLogin\WHUTCampusAutoLogin.exe --startup-tray` and confirm the process stays alive without a console window.
-3. Enable startup from the app and confirm the Startup shortcut points to the packaged EXE with `--startup-tray`.
-4. Confirm user config remains in `%APPDATA%\WHUTCampusAutoLogin` and the password remains in Windows Credential Manager.
-5. Confirm runtime logs remain under the existing user data log directory.
-
-## Still not covered
-
-- Windows installer.
-- Code signing.
-- Automatic updates.
-- Formal release process.
-- Antivirus allowlist or false-positive handling.
-- Full clean-machine compatibility result.
-- Formal app icon.
+- A real production EXE or production-input acceptance.
+- Windows installer, Authenticode signing, SmartScreen handling, or automatic updates.
+- Artifact hashes or guaranteed byte-identical output.
+- P6-A1c, P6-A2, or P6-A3.
