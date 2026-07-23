@@ -1,0 +1,6 @@
+{
+  "python_version": "3.11.9",
+  "pyinstaller_version": "6.21.0",
+  "packaging_mode": "onedir",
+  "lock_file": "requirements-windows-build.lock.txt"
+}

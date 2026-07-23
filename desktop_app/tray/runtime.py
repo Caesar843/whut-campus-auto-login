@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+import logging
 import sys
 import time
-from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QThread, QTimer, Signal, Slot
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon, QWid
 
 from desktop_app.log_window import RuntimeLogWindow
 from desktop_app.main_window import create_main_window
+from desktop_app.resources import resource_path
 from desktop_app.runtime_logs import (
     RuntimeLogStore,
     get_default_log_store,
@@ -26,6 +27,8 @@ from desktop_app.tray.controller import (
 
 
 APP_NAME = "武汉理工校园网助手"
+APP_ICON_RESOURCE = "assets/windows/whut_campus_auto_login.ico"
+LOGGER = logging.getLogger(__name__)
 STARTUP_TRAY_ARG = "--startup-tray"
 STARTUP_INITIAL_DELAY_MS = 5_000
 STARTUP_RETRY_INTERVAL_MS = 12_000
@@ -269,7 +272,9 @@ class TrayRuntime(QObject):
             app,
             on_resume=self._resume_scheduler.handle_resume_event,
         )
-        self._tray = QSystemTrayIcon(_load_icon(app), self)
+        self._app_icon = _load_icon(app)
+        app.setWindowIcon(self._app_icon)
+        self._tray = QSystemTrayIcon(self._app_icon, self)
         self._menu = QMenu()
         self._status_action: Optional[QAction] = None
         self._busy_actions = []
@@ -284,6 +289,7 @@ class TrayRuntime(QObject):
     def show_main_window(self) -> QWidget:
         if self._main_window is None:
             self._main_window = self._main_window_factory()
+            self._main_window.setWindowIcon(self._app_icon)
         self._main_window.show()
         self._main_window.raise_()
         self._main_window.activateWindow()
@@ -498,13 +504,13 @@ def _qt_argv(argv: Optional[Sequence[str]]) -> list[str]:
 
 
 def _load_icon(app: QApplication) -> QIcon:
-    resources_dir = Path(__file__).resolve().parents[1] / "resources"
-    for name in ("app.ico", "icon.ico", "app.png", "icon.png"):
-        icon_path = resources_dir / name
-        if icon_path.exists():
-            icon = QIcon(str(icon_path))
-            if not icon.isNull():
-                return icon
+    try:
+        icon = QIcon(str(resource_path(APP_ICON_RESOURCE)))
+        if not icon.isNull():
+            return icon
+        LOGGER.warning("Official application icon could not be loaded.")
+    except FileNotFoundError:
+        LOGGER.warning("Official application icon resource is missing.")
     return app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
 
 

@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
+from app_version import APP_VERSION
 from campus_login.local_config import APP_DIR_NAME, default_config_path
 from license_client.public_key import (
     EmbeddedConfig,
@@ -18,7 +19,6 @@ PAID_LICENSE_DAYS = 365
 PRICE_AMOUNT = "9.9"
 PRICE_CURRENCY = "CNY"
 DEFAULT_LICENSE_SERVER_URL = "http://127.0.0.1:8787"
-APP_VERSION = "0.1.0"
 LICENSE_TOKEN_FILE_NAME = "license_token.json"
 
 

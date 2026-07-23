@@ -8,6 +8,8 @@ from pathlib import Path
 ROOT = Path(SPECPATH)
 GENERATED_MODULE_DIR = ROOT / "build" / "generated"
 EMBEDDED_CONFIG_MODULE = GENERATED_MODULE_DIR / "_license_client_embedded_build_config.py"
+WINDOWS_VERSION_INFO_PATH = GENERATED_MODULE_DIR / "windows_version_info.txt"
+APP_ICON_PATH = ROOT / "assets" / "windows" / "whut_campus_auto_login.ico"
 BUILD_SESSION_ENVIRONMENT_NAME = "WHUT_BUILD_SESSION_ID"
 
 if not EMBEDDED_CONFIG_MODULE.exists():
@@ -25,12 +27,16 @@ except Exception as exc:
     raise RuntimeError("Embedded license build config is invalid.") from exc
 if embedded_config.get("BUILD_SESSION_ID") != build_session_id:
     raise RuntimeError("Embedded license build config does not match the current build session.")
+if not APP_ICON_PATH.exists():
+    raise RuntimeError("Missing official Windows application icon.")
+if not WINDOWS_VERSION_INFO_PATH.exists():
+    raise RuntimeError("Missing generated Windows version metadata. Run scripts/build_windows.ps1.")
 
 a = Analysis(
     [str(ROOT / "desktop_app" / "tray_app.py")],
     pathex=[str(ROOT), str(GENERATED_MODULE_DIR)],
     binaries=[],
-    datas=[],
+    datas=[(str(APP_ICON_PATH), "assets/windows")],
     hiddenimports=["_license_client_embedded_build_config"],
     hookspath=[],
     hooksconfig={},
@@ -54,6 +60,8 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="WHUTCampusAutoLogin",
+    icon=str(APP_ICON_PATH),
+    version=str(WINDOWS_VERSION_INFO_PATH),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
