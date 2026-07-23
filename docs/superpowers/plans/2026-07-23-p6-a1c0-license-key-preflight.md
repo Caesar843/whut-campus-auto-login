@@ -4,7 +4,7 @@
 
 **Goal:** Add a repeatable, fail-closed, server-side preflight that proves the configured production Ed25519 private key and public key match, emits a stable SHA-256 public-key fingerprint, and never exposes or moves the private key.
 
-**Architecture:** Extract one side-effect-free Ed25519 key-format helper used by the production server and the preflight so there is only one interpretation of the private-key format. Implement the restricted environment-file parser and preflight logic in a focused `license_server` module, then expose it through a thin CLI script. Keep all checks offline, read-only, deterministic in output, and covered with runtime-generated temporary keys.
+**Architecture:** Extract one side-effect-free Ed25519 key-format helper used by the production server and the preflight so there is only one interpretation of the private-key format. Implement the restricted environment-file parser and preflight logic in a focused `license_server` module, using one descriptor-based safe reader for both the environment file and optional private-key file, then expose it through a thin CLI script. Keep all checks offline, read-only, deterministic in output, and covered with runtime-generated temporary keys.
 
 **Tech Stack:** Python 3.11, `cryptography` Ed25519 primitives, `argparse`, `pathlib`, `stat`, `hashlib`, `hmac`, `secrets`, `pytest`.
 
@@ -15,12 +15,14 @@
 - The script must perform no network access, no database access, no service restart, no deployment, and no executable build.
 - The production private key must never be printed to stdout, stderr, exceptions, test diagnostics, snapshots, or logs.
 - The preflight must accept only an explicit absolute `--env-file` path and only the restricted literal `KEY=value` subset defined by the approved design.
-- The preflight may consume only `LICENSE_SERVER_ENV`, `LICENSE_PRIVATE_KEY`, and `LICENSE_PUBLIC_KEY`; all other keys are ignored and never printed.
+- The preflight may consume only `LICENSE_SERVER_ENV`, `LICENSE_PRIVATE_KEY`, `LICENSE_PRIVATE_KEY_FILE`, and `LICENSE_PUBLIC_KEY`; all other keys are ignored and never printed.
+- Private-key source selection must match `license_server.config._private_key_from_env()`: non-empty inline value first, file fallback only for an empty inline value, and exit `3` when both are missing.
+- Both input files must be opened read-only and read from the same validated file descriptor; POSIX uses `O_NOFOLLOW` when available and Windows uses a conservative identity-checked fallback.
 - `LICENSE_SERVER_ENV` must normalize to `production` using the same lower-case/trim behavior as `license_server.config`.
 - The configured public key must be compared with the private-key-derived raw public key using `hmac.compare_digest`.
 - The SHA-256 fingerprint must be computed over the raw 32-byte Ed25519 public key and rendered as 64 lowercase hexadecimal characters.
 - Expected validation failures must not emit tracebacks.
-- Exit codes are fixed: `0` pass, `1` unexpected controlled failure, `2` environment-file/path/syntax/permission/environment failure, `3` key-format failure, `4` key mismatch, `5` sign/verify failure.
+- Exit codes are fixed: `0` pass, `1` unexpected controlled failure, `2` environment-file/path/syntax/permission/environment failure, `3` configured private-key source or key-format failure, `4` key mismatch, `5` sign/verify failure.
 - Successful default output must include `running_service_keypair=not_verified`; this stage must never claim the running process has reloaded the file.
 - POSIX permission and symlink checks must run on Linux; corresponding tests may skip on Windows only when the platform cannot enforce equivalent semantics.
 - Use TDD and keep commits focused. Run targeted tests after each task and the full suite before requesting review.
@@ -286,6 +288,7 @@ git commit -m "refactor(license): share Ed25519 key parsing"
 - Consumes: all Task 1 helper functions.
 - Produces: `PreflightError(category: str, exit_code: int)` with redacted category-only messages.
 - Produces: `PreflightReport` fields matching successful output.
+- Produces: a focused internal secure text-file reader shared by the environment and private-key file paths.
 - Produces: `parse_restricted_env_file(path: Path) -> dict[str, str]`.
 - Produces: `verify_configured_keypair(env_file: Path) -> PreflightReport`.
 - Produces: `main(argv: list[str] | None = None) -> int` in the CLI script.
@@ -334,6 +337,10 @@ def test_non_production_environment_returns_exit_code_2(tmp_path, environment):
 
 Also add tests for invalid private/public Base64, wrong decoded lengths, missing key fields, and raw-byte fingerprinting.
 
+Compatibility coverage must also include inline-only, file-only, inline
+priority, empty-inline fallback, private-key file safety and redaction, and
+descriptor-based reads for both input files.
+
 - [ ] **Step 2: Run targeted tests and confirm module import failure**
 
 Run:
@@ -351,6 +358,7 @@ Create `license_server/license_key_preflight.py` with:
 ```python
 from __future__ import annotations
 
+import errno
 import hmac
 import os
 import re
@@ -375,7 +383,12 @@ EXIT_ENVIRONMENT = 2
 EXIT_KEY_FORMAT = 3
 EXIT_KEY_MISMATCH = 4
 EXIT_SIGN_VERIFY = 5
-_ALLOWED_KEYS = {"LICENSE_SERVER_ENV", "LICENSE_PRIVATE_KEY", "LICENSE_PUBLIC_KEY"}
+_ALLOWED_KEYS = {
+    "LICENSE_SERVER_ENV",
+    "LICENSE_PRIVATE_KEY",
+    "LICENSE_PRIVATE_KEY_FILE",
+    "LICENSE_PUBLIC_KEY",
+}
 _KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CHALLENGE_PREFIX = b"whut-campus-auto-login:production-license-key-preflight:v1\x00"
 
@@ -394,29 +407,102 @@ class PreflightReport:
     public_key_base64: str
 
 
-def parse_restricted_env_file(path: Path) -> dict[str, str]:
+def _read_secure_text_file(
+    path: Path,
+    *,
+    category_prefix: str,
+    exit_code: int,
+) -> str:
     candidate = Path(path)
     if not candidate.is_absolute():
-        raise PreflightError("env_file_path_not_absolute", EXIT_ENVIRONMENT)
+        raise PreflightError(f"{category_prefix}_path_not_absolute", exit_code)
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    before_open = None
+    if not nofollow:
+        try:
+            before_open = candidate.lstat()
+        except OSError as exc:
+            raise PreflightError(
+                f"{category_prefix}_unreadable",
+                exit_code,
+            ) from exc
+        if stat.S_ISLNK(before_open.st_mode):
+            raise PreflightError(
+                f"{category_prefix}_symlink_rejected",
+                exit_code,
+            )
+        if not stat.S_ISREG(before_open.st_mode):
+            raise PreflightError(
+                f"{category_prefix}_not_regular",
+                exit_code,
+            )
+
     try:
-        metadata = candidate.lstat()
+        file_descriptor = os.open(candidate, flags)
     except OSError as exc:
-        raise PreflightError("env_file_unreadable", EXIT_ENVIRONMENT) from exc
-    if stat.S_ISLNK(metadata.st_mode):
-        raise PreflightError("env_file_symlink_rejected", EXIT_ENVIRONMENT)
-    if not stat.S_ISREG(metadata.st_mode):
-        raise PreflightError("env_file_not_regular", EXIT_ENVIRONMENT)
-    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise PreflightError("env_file_permissions_too_open", EXIT_ENVIRONMENT)
+        category = (
+            f"{category_prefix}_symlink_rejected"
+            if nofollow and exc.errno == errno.ELOOP
+            else f"{category_prefix}_unreadable"
+        )
+        raise PreflightError(category, exit_code) from exc
+
     try:
-        raw = candidate.read_bytes()
-        if b"\x00" in raw:
-            raise PreflightError("env_file_contains_nul", EXIT_ENVIRONMENT)
-        text = raw.decode("utf-8")
+        metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PreflightError(
+                f"{category_prefix}_not_regular",
+                exit_code,
+            )
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise PreflightError(
+                f"{category_prefix}_permissions_too_open",
+                exit_code,
+            )
+        if before_open is not None:
+            current = candidate.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not os.path.samestat(before_open, metadata)
+                or not os.path.samestat(current, metadata)
+            ):
+                raise PreflightError(
+                    f"{category_prefix}_changed_during_open",
+                    exit_code,
+                )
+        chunks = []
+        while chunk := os.read(file_descriptor, 65536):
+            chunks.append(chunk)
     except PreflightError:
         raise
-    except (OSError, UnicodeDecodeError) as exc:
-        raise PreflightError("env_file_unreadable", EXIT_ENVIRONMENT) from exc
+    except OSError as exc:
+        raise PreflightError(
+            f"{category_prefix}_unreadable",
+            exit_code,
+        ) from exc
+    finally:
+        os.close(file_descriptor)
+
+    raw = b"".join(chunks)
+    if b"\x00" in raw:
+        raise PreflightError(f"{category_prefix}_contains_nul", exit_code)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PreflightError(
+            f"{category_prefix}_unreadable",
+            exit_code,
+        ) from exc
+
+
+def parse_restricted_env_file(path: Path) -> dict[str, str]:
+    text = _read_secure_text_file(
+        path,
+        category_prefix="env_file",
+        exit_code=EXIT_ENVIRONMENT,
+    )
 
     parsed: dict[str, str] = {}
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
@@ -447,13 +533,22 @@ def verify_configured_keypair(env_file: Path) -> PreflightReport:
     if environment != "production":
         raise PreflightError("production_environment_required", EXIT_ENVIRONMENT)
     private_value = values.get("LICENSE_PRIVATE_KEY", "").strip()
+    private_key_file = values.get("LICENSE_PRIVATE_KEY_FILE", "").strip()
     public_value = values.get("LICENSE_PUBLIC_KEY", "").strip()
+    private_source = "LICENSE_PRIVATE_KEY"
+    if not private_value and private_key_file:
+        private_value = _read_secure_text_file(
+            Path(private_key_file),
+            category_prefix="configured_private_key_file",
+            exit_code=EXIT_KEY_FORMAT,
+        ).strip()
+        private_source = "LICENSE_PRIVATE_KEY_FILE"
     if not private_value:
         raise PreflightError("configured_private_key_missing", EXIT_KEY_FORMAT)
     if not public_value:
         raise PreflightError("configured_public_key_missing", EXIT_KEY_FORMAT)
     try:
-        private_key = load_private_key_b64(private_value, source="LICENSE_PRIVATE_KEY")
+        private_key = load_private_key_b64(private_value, source=private_source)
         public_key = load_public_key_b64(public_value, source="LICENSE_PUBLIC_KEY")
     except Ed25519KeyFormatError as exc:
         category = (
@@ -563,6 +658,10 @@ Expand `tests/ops/test_verify_production_license_keypair.py` to cover all of the
 - failure prints category to stderr and `result=FAIL` to stdout with no traceback;
 - monkeypatched `socket.socket`, `urllib.request.urlopen`, and `sqlite3.connect` raise if called, while valid verification still passes;
 - environment-file bytes, mode, size, and `st_mtime_ns` are unchanged after verification;
+- private-key source selection matches inline-first/file-fallback server semantics;
+- private-key file relative, missing, symlink, non-regular, POSIX permission, invalid Base64/length, NUL, and UTF-8 failures return exit `3`;
+- private-key file bytes, mode, size, and `st_mtime_ns` are unchanged after verification;
+- environment and private-key file reads use `os.open`/`fstat`/`os.read` on the same descriptor;
 - an unrelated key containing a sentinel secret is ignored and never printed.
 
 Use `pytest.mark.skipif(os.name == "nt", reason="POSIX permission semantics required")` only on permission/symlink cases that Windows cannot enforce.
@@ -618,7 +717,7 @@ git commit -m "feat(release): add production license key preflight"
 
 Create `docs/release/PRODUCTION_LICENSE_KEY_PREFLIGHT.md` with these sections and exact operational meaning:
 
-1. Purpose: proves only the configured environment-file key pair.
+1. Purpose: proves only the configured environment-file key pair, supporting either inline `LICENSE_PRIVATE_KEY` or `LICENSE_PRIVATE_KEY_FILE` with production source priority.
 2. Preconditions: approved commit synced; no environment-file changes; server Python virtual environment available; operator has read permission through `sudo`.
 3. Command:
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hmac
 import os
 import re
@@ -27,6 +28,7 @@ EXIT_SIGN_VERIFY = 5
 _ALLOWED_KEYS = {
     "LICENSE_SERVER_ENV",
     "LICENSE_PRIVATE_KEY",
+    "LICENSE_PRIVATE_KEY_FILE",
     "LICENSE_PUBLIC_KEY",
 }
 _KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -49,29 +51,102 @@ class PreflightReport:
     public_key_base64: str
 
 
-def parse_restricted_env_file(path: Path) -> dict[str, str]:
+def _read_secure_text_file(
+    path: Path,
+    *,
+    category_prefix: str,
+    exit_code: int,
+) -> str:
     candidate = Path(path)
     if not candidate.is_absolute():
-        raise PreflightError("env_file_path_not_absolute", EXIT_ENVIRONMENT)
+        raise PreflightError(f"{category_prefix}_path_not_absolute", exit_code)
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    before_open = None
+    if not nofollow:
+        try:
+            before_open = candidate.lstat()
+        except OSError as exc:
+            raise PreflightError(
+                f"{category_prefix}_unreadable",
+                exit_code,
+            ) from exc
+        if stat.S_ISLNK(before_open.st_mode):
+            raise PreflightError(
+                f"{category_prefix}_symlink_rejected",
+                exit_code,
+            )
+        if not stat.S_ISREG(before_open.st_mode):
+            raise PreflightError(
+                f"{category_prefix}_not_regular",
+                exit_code,
+            )
+
     try:
-        metadata = candidate.lstat()
+        file_descriptor = os.open(candidate, flags)
     except OSError as exc:
-        raise PreflightError("env_file_unreadable", EXIT_ENVIRONMENT) from exc
-    if stat.S_ISLNK(metadata.st_mode):
-        raise PreflightError("env_file_symlink_rejected", EXIT_ENVIRONMENT)
-    if not stat.S_ISREG(metadata.st_mode):
-        raise PreflightError("env_file_not_regular", EXIT_ENVIRONMENT)
-    if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise PreflightError("env_file_permissions_too_open", EXIT_ENVIRONMENT)
+        category = (
+            f"{category_prefix}_symlink_rejected"
+            if nofollow and exc.errno == errno.ELOOP
+            else f"{category_prefix}_unreadable"
+        )
+        raise PreflightError(category, exit_code) from exc
+
     try:
-        raw = candidate.read_bytes()
-        if b"\x00" in raw:
-            raise PreflightError("env_file_contains_nul", EXIT_ENVIRONMENT)
-        text = raw.decode("utf-8")
+        metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PreflightError(
+                f"{category_prefix}_not_regular",
+                exit_code,
+            )
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise PreflightError(
+                f"{category_prefix}_permissions_too_open",
+                exit_code,
+            )
+        if before_open is not None:
+            current = candidate.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not os.path.samestat(before_open, metadata)
+                or not os.path.samestat(current, metadata)
+            ):
+                raise PreflightError(
+                    f"{category_prefix}_changed_during_open",
+                    exit_code,
+                )
+        chunks = []
+        while chunk := os.read(file_descriptor, 65536):
+            chunks.append(chunk)
     except PreflightError:
         raise
-    except (OSError, UnicodeDecodeError) as exc:
-        raise PreflightError("env_file_unreadable", EXIT_ENVIRONMENT) from exc
+    except OSError as exc:
+        raise PreflightError(
+            f"{category_prefix}_unreadable",
+            exit_code,
+        ) from exc
+    finally:
+        os.close(file_descriptor)
+
+    raw = b"".join(chunks)
+    if b"\x00" in raw:
+        raise PreflightError(f"{category_prefix}_contains_nul", exit_code)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PreflightError(
+            f"{category_prefix}_unreadable",
+            exit_code,
+        ) from exc
+
+
+def parse_restricted_env_file(path: Path) -> dict[str, str]:
+    text = _read_secure_text_file(
+        path,
+        category_prefix="env_file",
+        exit_code=EXIT_ENVIRONMENT,
+    )
 
     parsed: dict[str, str] = {}
     for raw_line in text.splitlines():
@@ -117,7 +192,16 @@ def verify_configured_keypair(env_file: Path) -> PreflightReport:
             EXIT_ENVIRONMENT,
         )
     private_value = values.get("LICENSE_PRIVATE_KEY", "").strip()
+    private_key_file = values.get("LICENSE_PRIVATE_KEY_FILE", "").strip()
     public_value = values.get("LICENSE_PUBLIC_KEY", "").strip()
+    private_source = "LICENSE_PRIVATE_KEY"
+    if not private_value and private_key_file:
+        private_value = _read_secure_text_file(
+            Path(private_key_file),
+            category_prefix="configured_private_key_file",
+            exit_code=EXIT_KEY_FORMAT,
+        ).strip()
+        private_source = "LICENSE_PRIVATE_KEY_FILE"
     if not private_value:
         raise PreflightError("configured_private_key_missing", EXIT_KEY_FORMAT)
     if not public_value:
@@ -125,7 +209,7 @@ def verify_configured_keypair(env_file: Path) -> PreflightReport:
     try:
         private_key = load_private_key_b64(
             private_value,
-            source="LICENSE_PRIVATE_KEY",
+            source=private_source,
         )
     except Ed25519KeyFormatError as exc:
         raise PreflightError(

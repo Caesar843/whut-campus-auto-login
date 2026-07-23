@@ -81,6 +81,12 @@ It must fail closed when:
 - the file is group-readable, group-writable, other-readable, or other-writable;
 - the file cannot be read safely.
 
+On POSIX, the implementation must open the path with `os.open()` using
+`O_RDONLY`, `O_CLOEXEC` when available, and `O_NOFOLLOW` when available. It
+must validate the opened object with `os.fstat()` and read from that same file
+descriptor. A conservative Windows fallback must reject symlinks and path
+replacement without returning to a path-based read.
+
 Owner identity may be reported for operator review, but the implementation must not hard-code a specific numeric UID unless the existing deployment contract already does so.
 
 ### Supported file syntax
@@ -120,25 +126,41 @@ The script may consume only:
 
 - `LICENSE_SERVER_ENV`
 - `LICENSE_PRIVATE_KEY`
+- `LICENSE_PRIVATE_KEY_FILE`
 - `LICENSE_PUBLIC_KEY`
 
 All other keys must be ignored without being printed. The script must not dump the parsed environment map.
 
 `LICENSE_SERVER_ENV` must equal `production` exactly after the same normalization used by the production application, or through a stricter equivalent check if the application uses no normalization.
 
+### Private-key source
+
+The preflight must match `license_server.config._private_key_from_env()`:
+
+1. a non-empty `LICENSE_PRIVATE_KEY` value takes priority;
+2. only when the inline value is empty may `LICENSE_PRIVATE_KEY_FILE` be read;
+3. when neither source yields a value, the preflight returns exit code `3`.
+
+The private-key file path must be absolute, exist, identify a regular
+non-symlink file, and have no POSIX group/other permission bits. It must be read
+through the same descriptor-based helper as the environment file, decoded as
+strict UTF-8, reject NUL, and contain one Base64 Ed25519 private-key value.
+Neither its path nor contents may enter output or exception text.
+
 ## Cryptographic verification flow
 
 1. Parse the approved environment file using the restricted parser.
 2. Confirm `LICENSE_SERVER_ENV=production`.
-3. Confirm both signing-key fields are present and non-empty.
-4. Parse the private key with the same code path or format rules used by the production license server.
-5. Parse the configured public key with the same code path or format rules used by the production license server or client verifier.
-6. Derive the raw 32-byte Ed25519 public key from the parsed private key.
-7. Compare the derived raw public key with the configured raw public key using a constant-time byte comparison.
-8. Sign a fixed-domain, process-local challenge containing fresh random bytes.
-9. Verify the resulting signature with the configured public key.
-10. Compute SHA-256 over the raw 32-byte public key and render it as 64 lowercase hexadecimal characters.
-11. Emit the safe result fields and exit with the defined status.
+3. Resolve the private key using the production inline-first, file-fallback semantics.
+4. Confirm that a private-key value and the configured public key are present and non-empty.
+5. Parse the private key with the same code path or format rules used by the production license server.
+6. Parse the configured public key with the same code path or format rules used by the production license server or client verifier.
+7. Derive the raw 32-byte Ed25519 public key from the parsed private key.
+8. Compare the derived raw public key with the configured raw public key using a constant-time byte comparison.
+9. Sign a fixed-domain, process-local challenge containing fresh random bytes.
+10. Verify the resulting signature with the configured public key.
+11. Compute SHA-256 over the raw 32-byte public key and render it as 64 lowercase hexadecimal characters.
+12. Emit the safe result fields and exit with the defined status.
 
 The challenge, signature, private key, and private-key-derived intermediate values must never be printed.
 
@@ -146,6 +168,7 @@ The challenge, signature, private key, and private-key-derived intermediate valu
 
 The implementation must first identify the current production functions responsible for:
 
+- selecting `LICENSE_PRIVATE_KEY` or `LICENSE_PRIVATE_KEY_FILE`;
 - decoding the configured private key;
 - decoding the configured public key;
 - constructing Ed25519 key objects;
@@ -192,7 +215,7 @@ Unexpected failures may include a short exception class or controlled message, b
 - `0`: all configured-key checks passed;
 - `1`: unexpected controlled failure;
 - `2`: environment-file path, syntax, permission, or production-environment failure;
-- `3`: private-key or public-key format failure;
+- `3`: configured private-key source or private-key/public-key format failure;
 - `4`: configured public key does not match the public key derived from the configured private key;
 - `5`: sign/verify self-test failure.
 
@@ -204,7 +227,7 @@ The implementation must preserve all of the following:
 
 - no network access;
 - no database access;
-- no writes to the environment file or adjacent paths;
+- no writes to the environment file, private-key file, or adjacent paths;
 - no service restart or deployment action;
 - no key generation or key replacement;
 - no private-key output on stdout, stderr, exception text, or test diagnostics;
@@ -241,6 +264,12 @@ Required coverage:
 18. the script does not modify the environment file;
 19. public-key fingerprint is SHA-256 of the raw 32-byte public key, not the Base64 text;
 20. exit codes and stdout/stderr routing match the documented contract.
+21. inline private-key-only configuration passes;
+22. private-key-file-only configuration passes;
+23. inline private key takes priority and an empty inline value falls back to the file;
+24. private-key file path, type, symlink, POSIX permission, UTF-8, NUL, Base64, and length failures fail closed;
+25. private-key file contents never enter output, exceptions, repr, or test diagnostics;
+26. neither input file is modified and both are read from the opened descriptor.
 
 POSIX-specific permission and symlink tests may be skipped on Windows when the platform cannot enforce equivalent semantics. They must execute in Linux CI or on the production-like server test environment before merge or deployment acceptance.
 

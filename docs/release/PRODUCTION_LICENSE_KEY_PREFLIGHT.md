@@ -5,7 +5,9 @@
 This read-only preflight proves only that the configured production environment
 file contains a valid matching Ed25519 private key and public key, and that the
 configured public key verifies a challenge signed by the configured private key.
-The private key must remain on the server.
+The private key may come from non-empty `LICENSE_PRIVATE_KEY` or, only when that
+value is empty, from `LICENSE_PRIVATE_KEY_FILE`. This matches the license
+server's source priority. The private key must remain on the server.
 
 ## Preconditions
 
@@ -14,6 +16,9 @@ The private key must remain on the server.
   file during this procedure.
 - Confirm the server Python virtual environment is available.
 - Use `sudo` only to obtain read access to the environment file.
+- When `LICENSE_PRIVATE_KEY_FILE` is used, keep its path absolute, its file mode
+  owner-only on POSIX, and the file itself a regular non-symlink UTF-8 file
+  containing only the Base64 Ed25519 private-key value.
 - Do not restart services, rotate keys, edit configuration, deploy, or build an
   executable during this preflight.
 
@@ -71,7 +76,7 @@ command, transcript, PR, issue, CI variable, or repository.
 | `0` | All configured-key checks passed. |
 | `1` | Unexpected but controlled failure. |
 | `2` | Environment-file path, syntax, permission, or production-environment failure. |
-| `3` | Configured private-key or public-key format failure. |
+| `3` | Configured private-key source or private-key/public-key format failure. |
 | `4` | Configured public key does not match the private-key-derived public key. |
 | `5` | Challenge signing or verification failed. |
 
@@ -83,6 +88,7 @@ Stop without attempting an in-session correction if any of these occurs:
 - unexpected output or a traceback;
 - any appearance of the private key;
 - an environment-file content, size, permission, or modification-time change;
+- a private-key-file content, size, permission, or modification-time change;
 - a configured key-pair mismatch.
 
 Do not replace keys, edit the environment file, restart the service, or deploy
@@ -100,6 +106,7 @@ Retain only:
 Never retain:
 
 - the environment file or a dump of it;
+- the private-key file, its path, or a dump of it;
 - the private key or any private-key digest;
 - the random challenge or signature;
 - payment or administrator secrets;
