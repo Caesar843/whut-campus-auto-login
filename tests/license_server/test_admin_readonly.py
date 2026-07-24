@@ -38,6 +38,32 @@ ADMIN_HEADERS = {
 }
 
 
+def _iter_effective_routes(routes):
+    for route in routes:
+        effective_route_contexts = getattr(
+            route,
+            "effective_route_contexts",
+            None,
+        )
+        if callable(effective_route_contexts):
+            yield from effective_route_contexts()
+        else:
+            yield route
+
+
+def test_iter_effective_routes_expands_nested_route_contexts():
+    class NestedRoutes:
+        def effective_route_contexts(self):
+            yield "nested-route"
+
+    flat_route = object()
+
+    assert list(_iter_effective_routes((flat_route, NestedRoutes()))) == [
+        flat_route,
+        "nested-route",
+    ]
+
+
 def test_admin_is_disabled_by_default_and_public_api_still_works(tmp_path):
     client, _public_key = _client(tmp_path)
 
@@ -352,7 +378,7 @@ def test_admin_router_only_exposes_note_post_and_queries_do_not_modify_database(
 
     write_routes = {
         (route.path, method)
-        for route in client.app.routes
+        for route in _iter_effective_routes(client.app.routes)
         if getattr(route, "path", "").startswith("/internal/admin")
         for method in getattr(route, "methods", set())
         if method not in {"GET", "HEAD"}
