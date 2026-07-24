@@ -1,0 +1,67 @@
+name: P6-A1c0 Linux Preflight
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/p6-a1c0-linux-preflight.yml"
+      - "requirements-server.txt"
+      - "license_server/ed25519_keys.py"
+      - "license_server/license_key_preflight.py"
+      - "scripts/ops/verify_production_license_keypair.py"
+      - "tests/license_server/test_ed25519_keys.py"
+      - "tests/ops/test_verify_production_license_keypair.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: requirements-server.txt
+
+      - name: Show runner and Python versions
+        run: |
+          uname -a
+          python --version
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-server.txt pytest
+
+      - name: Run Linux preflight tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest \
+            tests/license_server/test_ed25519_keys.py \
+            tests/ops/test_verify_production_license_keypair.py \
+            -q \
+            -p no:cacheprovider \
+            -rA | tee /tmp/p6-a1c0-pytest.log
+
+          pytest_status=${PIPESTATUS[0]}
+          if [ "$pytest_status" -ne 0 ]; then
+            exit "$pytest_status"
+          fi
+
+          if grep -Eq '(^|, )[1-9][0-9]* skipped' /tmp/p6-a1c0-pytest.log; then
+            echo "Linux preflight gate rejected skipped tests."
+            exit 1
+          fi
