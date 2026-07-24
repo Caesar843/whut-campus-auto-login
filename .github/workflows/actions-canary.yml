@@ -1,0 +1,15 @@
+name: Actions Canary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Canary
+        run: echo "actions-canary-pass"
