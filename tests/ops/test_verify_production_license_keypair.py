@@ -911,6 +911,168 @@ def test_cli_failure_output_never_echoes_supplied_secret(tmp_path, capsys):
     assert "Traceback" not in captured.out + captured.err
 
 
+SENTINEL_KEYS = [
+    'LOG_TEMPLATE="$HOST"',
+    "SHELL_NOTE='internal'",
+    "OTHER_COMMAND=`hostname`",
+    "DOC_MARKER=<<EOF",
+    'CONTINUED_VALUE=abc\\',
+    "DOLLAR_VALUE=$UNUSED",
+]
+
+QUOTED_SENTINEL_VALUES = ['"$HOST"', "'internal'", "`hostname`", "<<EOF", "$UNUSED"]
+
+
+def test_unrelated_keys_with_special_values_are_ignored(tmp_path):
+    env_file, private_b64, public_b64, public_raw = _write_valid_env(tmp_path)
+    for line in SENTINEL_KEYS:
+        with env_file.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+
+    report = verify_configured_keypair(env_file)
+
+    assert report.environment == "production"
+    assert report.public_key_sha256 == hashlib.sha256(public_raw).hexdigest()
+    assert report.public_key_base64 == public_b64
+    for sentinel in QUOTED_SENTINEL_VALUES:
+        assert sentinel not in str(report)
+        assert sentinel not in repr(report)
+
+
+def test_duplicate_unrelated_keys_are_ignored(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    with env_file.open("a", encoding="utf-8") as stream:
+        stream.write('UNRELATED=first\nUNRELATED="$SECOND"\n')
+
+    assert verify_configured_keypair(env_file).environment == "production"
+
+
+def test_allowed_key_rejects_double_quotes(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _replace_key(env_file, "LICENSE_PUBLIC_KEY", '"value"')
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert exc_info.value.category == "env_file_unsupported_quoting"
+
+
+def test_allowed_key_rejects_single_quotes(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _replace_key(env_file, "LICENSE_PUBLIC_KEY", "'value'")
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert exc_info.value.category == "env_file_unsupported_quoting"
+
+
+def test_allowed_key_rejects_variable_expansion(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _replace_key(env_file, "LICENSE_PUBLIC_KEY", "$VARIABLE")
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert exc_info.value.category == "env_file_unsupported_syntax"
+
+
+def test_allowed_key_rejects_backtick_command(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _replace_key(env_file, "LICENSE_PUBLIC_KEY", "`command`")
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert exc_info.value.category == "env_file_unsupported_syntax"
+
+
+def test_allowed_key_rejects_heredoc_marker(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _replace_key(env_file, "LICENSE_PUBLIC_KEY", "<<EOF")
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert exc_info.value.category == "env_file_unsupported_syntax"
+
+
+def test_allowed_key_rejects_trailing_backslash(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _replace_key(env_file, "LICENSE_PUBLIC_KEY", "trailing\\")
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert exc_info.value.category == "env_file_unsupported_syntax"
+
+
+def test_duplicate_allowed_key_is_rejected(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    with env_file.open("a", encoding="utf-8") as stream:
+        stream.write("LICENSE_PUBLIC_KEY=duplicate\n")
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert exc_info.value.category == "env_file_duplicate_key"
+
+
+def test_export_line_is_rejected(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _replace_key(env_file, "LICENSE_SERVER_ENV", "export production")
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert exc_info.value.exit_code == EXIT_ENVIRONMENT
+
+
+def test_missing_equals_line_is_rejected(tmp_path):
+    env_file = _write_env(tmp_path, ["NO_EQUALS_LINE"])
+    with pytest.raises(PreflightError) as exc_info:
+        parse_restricted_env_file(env_file)
+    assert exc_info.value.category == "env_file_unsupported_syntax"
+
+
+def test_line_with_leading_space_key_is_rejected(tmp_path):
+    env_file = _write_env(tmp_path, [" BAD_KEY=value"])
+    with pytest.raises(PreflightError) as exc_info:
+        parse_restricted_env_file(env_file)
+    assert exc_info.value.category == "env_file_invalid_key"
+
+
+def test_line_with_hyphen_key_is_rejected(tmp_path):
+    env_file = _write_env(tmp_path, ["BAD-KEY=value"])
+    with pytest.raises(PreflightError) as exc_info:
+        parse_restricted_env_file(env_file)
+    assert exc_info.value.category == "env_file_invalid_key"
+
+
+def test_name_similar_to_allowed_key_is_ignored(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    with env_file.open("a", encoding="utf-8") as stream:
+        stream.write(
+            'LICENSE_PUBLIC_KEY_BACKUP="$IGNORED"\n'
+            "LICENSE_PRIVATE_KEY_NOTE='ignored'\n"
+        )
+
+    assert verify_configured_keypair(env_file).environment == "production"
+
+
+def test_cli_success_with_unrelated_special_values(tmp_path, capsys):
+    env_file, private_b64, public_b64, public_raw = _write_valid_env(tmp_path)
+    for line in SENTINEL_KEYS:
+        with env_file.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+
+    cli = _load_cli()
+    exit_code = cli.main(["--env-file", str(env_file)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert captured.out.splitlines() == [
+        "environment_file=pass",
+        "environment=production",
+        "configured_private_key=pass",
+        "configured_public_key=pass",
+        "configured_keypair_match=pass",
+        "configured_sign_verify=pass",
+        f"public_key_sha256={hashlib.sha256(public_raw).hexdigest()}",
+        "running_service_keypair=not_verified",
+        "result=PASS",
+    ]
+    assert private_b64 not in captured.out
+    assert public_b64 not in captured.out
+    for sentinel in QUOTED_SENTINEL_VALUES:
+        assert sentinel not in captured.out + captured.err
+
+
 def test_cli_unexpected_failure_prints_only_exception_type(
     tmp_path,
     capsys,

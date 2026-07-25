@@ -170,11 +170,6 @@ def parse_restricted_env_file(path: Path) -> dict[str, str]:
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if raw_line.rstrip().endswith("\\"):
-            raise PreflightError(
-                "env_file_unsupported_syntax",
-                EXIT_ENVIRONMENT,
-            )
         if stripped.startswith("export ") or "=" not in raw_line:
             raise PreflightError(
                 "env_file_unsupported_syntax",
@@ -184,8 +179,15 @@ def parse_restricted_env_file(path: Path) -> dict[str, str]:
         key = key_text.strip()
         if key_text != key or not _KEY_PATTERN.fullmatch(key):
             raise PreflightError("env_file_invalid_key", EXIT_ENVIRONMENT)
+        if key not in _ALLOWED_KEYS:
+            continue
         if key in parsed:
             raise PreflightError("env_file_duplicate_key", EXIT_ENVIRONMENT)
+        if raw_line.rstrip().endswith("\\"):
+            raise PreflightError(
+                "env_file_unsupported_syntax",
+                EXIT_ENVIRONMENT,
+            )
         if "$" in value or "`" in value or "<<" in value:
             raise PreflightError(
                 "env_file_unsupported_syntax",
