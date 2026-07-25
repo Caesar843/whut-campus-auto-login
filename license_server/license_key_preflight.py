@@ -63,7 +63,12 @@ def _read_secure_text_file(
         raise PreflightError(f"{category_prefix}_path_not_absolute", exit_code)
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    nonblock = (
+        os.O_NONBLOCK
+        if os.name == "posix" and hasattr(os, "O_NONBLOCK")
+        else 0
+    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     before_open = None
     if not nofollow:
         try:

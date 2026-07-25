@@ -5,6 +5,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -32,6 +33,9 @@ from license_server.license_key_preflight import (
 
 
 CLI_PATH = Path("scripts/ops/verify_production_license_keypair.py")
+# Absolute repo root, derived from this test file's location (tests/ops/).
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_CLI_SCRIPT = _REPO_ROOT / "scripts/ops" / "verify_production_license_keypair.py"
 
 
 def _keypair_b64() -> tuple[str, str, bytes]:
@@ -1094,3 +1098,75 @@ def test_cli_unexpected_failure_prints_only_exception_type(
     assert captured.err == "error=unexpected_failure:RuntimeError\n"
     assert secret_message not in captured.out + captured.err
     assert "Traceback" not in captured.out + captured.err
+
+
+# ---------------------------------------------------------------------------
+# POSIX FIFO regression tests  (subprocess-isolated, timeout=5)
+# ---------------------------------------------------------------------------
+# On POSIX, os.open(path, os.O_RDONLY) on a FIFO (named pipe) blocks
+# indefinitely until a writer opens the same FIFO.  _read_secure_text_file()
+# must add O_NONBLOCK to the open flags so that the fstat+S_ISREG check
+# following the open can reject the FIFO quickly.
+#
+# These tests run in an isolated subprocess so that a hang kills only
+# the child process, never the pytest runner.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO/named-pipe only on POSIX")
+def test_fifo_used_as_env_file_exits_without_hanging(tmp_path: Path) -> None:
+    """Regression: env-file FIFO must not hang os.open()."""
+    fifo = tmp_path / "license-server.env"
+    os.mkfifo(fifo)
+    fifo.chmod(0o600)
+
+    proc = subprocess.run(
+        [sys.executable, str(_CLI_SCRIPT), "--env-file", str(fifo)],
+        capture_output=True,
+        timeout=5,
+        cwd=_REPO_ROOT,
+    )
+    assert proc.returncode == EXIT_ENVIRONMENT
+    assert "env_file_not_regular" in (proc.stdout + proc.stderr).decode()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO/named-pipe only on POSIX")
+def test_fifo_used_as_private_key_file_exits_without_hanging(tmp_path: Path) -> None:
+    """Regression: private-key-file FIFO must not hang os.open()."""
+    private_fifo = tmp_path / "private-key-fifo"
+    os.mkfifo(private_fifo)
+    private_fifo.chmod(0o600)
+
+    env_file, private_b64, public_b64, _public_raw = _write_valid_env(tmp_path)
+    _set_private_key_sources(
+        env_file, inline=None, private_key_file=str(private_fifo)
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(_CLI_SCRIPT), "--env-file", str(env_file)],
+        capture_output=True,
+        timeout=5,
+        cwd=_REPO_ROOT,
+    )
+    assert proc.returncode == EXIT_KEY_FORMAT
+    assert "configured_private_key_file_not_regular" in (
+        proc.stdout + proc.stderr
+    ).decode()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO/named-pipe only on POSIX")
+def test_regular_file_not_affected_by_fifo_regression_change(tmp_path: Path) -> None:
+    """Positive control: a normal env+key pair still passes with O_NONBLOCK."""
+    env_file, private_b64, public_b64, _public_raw = _write_valid_env(tmp_path)
+
+    proc = subprocess.run(
+        [sys.executable, str(_CLI_SCRIPT), "--env-file", str(env_file)],
+        capture_output=True,
+        timeout=5,
+        cwd=_REPO_ROOT,
+    )
+    assert proc.returncode == 0
+    stdout = proc.stdout.decode()
+    assert "result=PASS" in stdout
+    assert private_b64 not in stdout
+    assert public_b64 not in stdout
