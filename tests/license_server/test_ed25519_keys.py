@@ -38,12 +38,66 @@ def _keypair_b64() -> tuple[str, str, bytes]:
     )
 
 
+def _noncanonical_pad_bits_b64(value: str) -> str:
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    assert value.endswith("=")
+    pad_bits_index = len(value) - 2
+    canonical_index = alphabet.index(value[pad_bits_index])
+    noncanonical_index = canonical_index | 0b01
+    assert noncanonical_index != canonical_index
+    return value[:pad_bits_index] + alphabet[noncanonical_index] + value[pad_bits_index + 1 :]
+
+
 def test_loaders_and_derivation_share_raw_key_format():
     private_b64, public_b64, public_raw = _keypair_b64()
     private_key = load_private_key_b64(private_b64)
     public_key = load_public_key_b64(public_b64)
     assert derive_public_key_raw_bytes(private_key) == public_raw
     assert public_key_raw_bytes(public_key) == public_raw
+
+
+def test_private_key_loader_accepts_canonical_base64():
+    private_b64, _public_b64, _public_raw = _keypair_b64()
+
+    assert derive_public_key_raw_bytes(load_private_key_b64(private_b64))
+
+
+def test_public_key_loader_accepts_canonical_base64():
+    _private_b64, public_b64, public_raw = _keypair_b64()
+
+    assert public_key_raw_bytes(load_public_key_b64(public_b64)) == public_raw
+
+
+def test_private_key_loader_rejects_noncanonical_pad_bits_without_echo():
+    private_b64, _public_b64, _public_raw = _keypair_b64()
+    noncanonical = _noncanonical_pad_bits_b64(private_b64)
+    assert noncanonical != private_b64
+    assert base64.b64decode(noncanonical, validate=True) == base64.b64decode(
+        private_b64,
+        validate=True,
+    )
+
+    with pytest.raises(Ed25519KeyFormatError) as exc_info:
+        load_private_key_b64(noncanonical)
+
+    assert noncanonical not in str(exc_info.value)
+    assert noncanonical not in repr(exc_info.value)
+
+
+def test_public_key_loader_rejects_noncanonical_pad_bits_without_echo():
+    _private_b64, public_b64, _public_raw = _keypair_b64()
+    noncanonical = _noncanonical_pad_bits_b64(public_b64)
+    assert noncanonical != public_b64
+    assert base64.b64decode(noncanonical, validate=True) == base64.b64decode(
+        public_b64,
+        validate=True,
+    )
+
+    with pytest.raises(Ed25519KeyFormatError) as exc_info:
+        load_public_key_b64(noncanonical)
+
+    assert noncanonical not in str(exc_info.value)
+    assert noncanonical not in repr(exc_info.value)
 
 
 def test_public_key_fingerprint_hashes_raw_bytes_not_base64_text():

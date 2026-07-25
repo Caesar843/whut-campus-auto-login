@@ -15,15 +15,33 @@ class Ed25519KeyFormatError(ValueError):
     pass
 
 
+def _decode_canonical_key_b64(value: str, *, source: str, key_type: str) -> bytes:
+    try:
+        text = str(value or "")
+        text.encode("ascii")
+        raw = base64.b64decode(text, validate=True)
+        if base64.b64encode(raw).decode("ascii") != text:
+            raise ValueError("non-canonical base64")
+        return raw
+    except (UnicodeEncodeError, ValueError, binascii.Error) as exc:
+        raise Ed25519KeyFormatError(
+            f"{source} must be a base64-encoded 32-byte Ed25519 {key_type} key."
+        ) from exc
+
+
 def load_private_key_b64(
     value: str,
     *,
     source: str = "LICENSE_PRIVATE_KEY",
 ) -> Ed25519PrivateKey:
     try:
-        raw = base64.b64decode(str(value or "").strip(), validate=True)
+        raw = _decode_canonical_key_b64(
+            value,
+            source=source,
+            key_type="private",
+        )
         return Ed25519PrivateKey.from_private_bytes(raw)
-    except (ValueError, binascii.Error) as exc:
+    except ValueError as exc:
         raise Ed25519KeyFormatError(
             f"{source} must be a base64-encoded 32-byte Ed25519 private key."
         ) from exc
@@ -35,9 +53,13 @@ def load_public_key_b64(
     source: str = "LICENSE_PUBLIC_KEY",
 ) -> Ed25519PublicKey:
     try:
-        raw = base64.b64decode(str(value or "").strip(), validate=True)
+        raw = _decode_canonical_key_b64(
+            value,
+            source=source,
+            key_type="public",
+        )
         return Ed25519PublicKey.from_public_bytes(raw)
-    except (ValueError, binascii.Error) as exc:
+    except ValueError as exc:
         raise Ed25519KeyFormatError(
             f"{source} must be a base64-encoded 32-byte Ed25519 public key."
         ) from exc

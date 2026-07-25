@@ -24,6 +24,7 @@ from license_server.license_key_preflight import (
     EXIT_KEY_FORMAT,
     EXIT_KEY_MISMATCH,
     EXIT_SIGN_VERIFY,
+    MAX_SECURE_TEXT_FILE_BYTES,
     PreflightError,
     parse_restricted_env_file,
     verify_configured_keypair,
@@ -117,6 +118,15 @@ def _replace_key(env_file: Path, key: str, value: str) -> None:
         + "\n",
         encoding="utf-8",
     )
+
+
+def _pad_text_file_to_size(path: Path, size: int) -> None:
+    current = path.read_bytes()
+    remaining = size - len(current)
+    assert remaining >= 2
+    padding = ("#" + ("x" * (remaining - 2)) + "\n").encode("utf-8")
+    path.write_bytes(current + padding)
+    assert path.stat().st_size == size
 
 
 def _load_cli():
@@ -375,6 +385,122 @@ def test_environment_file_is_read_from_open_descriptor(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "read_bytes", forbidden)
 
     assert verify_configured_keypair(env_file).environment == "production"
+
+
+def test_environment_file_at_size_limit_is_not_rejected_for_size(tmp_path):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _pad_text_file_to_size(env_file, MAX_SECURE_TEXT_FILE_BYTES)
+
+    assert verify_configured_keypair(env_file).environment == "production"
+
+
+def test_environment_file_over_size_limit_fails_safely(tmp_path, capsys):
+    env_file, *_ = _write_valid_env(tmp_path)
+    sentinel = "OVERSIZED-ENV-FILE-SENTINEL"
+    _pad_text_file_to_size(
+        env_file,
+        MAX_SECURE_TEXT_FILE_BYTES + 1 - len(sentinel),
+    )
+    env_file.write_bytes(env_file.read_bytes() + sentinel.encode("utf-8"))
+    assert env_file.stat().st_size == MAX_SECURE_TEXT_FILE_BYTES + 1
+
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert (exc_info.value.category, exc_info.value.exit_code) == (
+        "env_file_too_large",
+        EXIT_ENVIRONMENT,
+    )
+    assert sentinel not in str(exc_info.value)
+    assert sentinel not in repr(exc_info.value)
+
+    cli = _load_cli()
+    assert cli.main(["--env-file", str(env_file)]) == EXIT_ENVIRONMENT
+    captured = capsys.readouterr()
+    assert captured.out == "result=FAIL\n"
+    assert captured.err == "error=env_file_too_large\n"
+    assert sentinel not in captured.out + captured.err
+
+
+def test_private_key_file_over_size_limit_fails_safely(tmp_path, capsys):
+    env_file, *_ = _write_valid_env(tmp_path)
+    sentinel = "OVERSIZED-PRIVATE-KEY-FILE-SENTINEL"
+    private_key_file = _write_private_key_file(
+        tmp_path,
+        ("x" * (MAX_SECURE_TEXT_FILE_BYTES + 1 - len(sentinel))) + sentinel,
+    )
+    _set_private_key_sources(
+        env_file,
+        inline=None,
+        private_key_file=private_key_file,
+    )
+
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+    assert (exc_info.value.category, exc_info.value.exit_code) == (
+        "configured_private_key_file_too_large",
+        EXIT_KEY_FORMAT,
+    )
+    assert sentinel not in str(exc_info.value)
+    assert sentinel not in repr(exc_info.value)
+
+    cli = _load_cli()
+    assert cli.main(["--env-file", str(env_file)]) == EXIT_KEY_FORMAT
+    captured = capsys.readouterr()
+    assert captured.out == "result=FAIL\n"
+    assert captured.err == "error=configured_private_key_file_too_large\n"
+    assert sentinel not in captured.out + captured.err
+
+
+def test_file_descriptor_is_closed_after_size_limit_failure(
+    tmp_path,
+    monkeypatch,
+):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _pad_text_file_to_size(env_file, MAX_SECURE_TEXT_FILE_BYTES + 1)
+    assert env_file.stat().st_size == MAX_SECURE_TEXT_FILE_BYTES + 1
+    closed_fds: list[int] = []
+    original_close = preflight.os.close
+
+    def close_and_record(file_descriptor):
+        closed_fds.append(file_descriptor)
+        original_close(file_descriptor)
+
+    monkeypatch.setattr(preflight.os, "close", close_and_record)
+
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+
+    assert exc_info.value.category == "env_file_too_large"
+    assert len(closed_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(closed_fds[0])
+
+
+def test_file_that_grows_during_read_is_rejected(tmp_path, monkeypatch):
+    env_file, *_ = _write_valid_env(tmp_path)
+    _pad_text_file_to_size(env_file, 500)
+    assert env_file.stat().st_size == 500
+
+    read_call_count = 0
+    original_read = preflight.os.read
+
+    def growing_read(fd, n):
+        nonlocal read_call_count
+        read_call_count += 1
+        if read_call_count == 1:
+            return original_read(fd, n)
+        return b"x" * min(n, MAX_SECURE_TEXT_FILE_BYTES)
+
+    monkeypatch.setattr(preflight.os, "read", growing_read)
+
+    with pytest.raises(PreflightError) as exc_info:
+        verify_configured_keypair(env_file)
+
+    assert exc_info.value.category == "env_file_too_large"
+    assert read_call_count == 2, (
+        f"os.read called {read_call_count} times (expected 2). "
+        "The function continued reading after exceeding the 64 KiB size limit."
+    )
 
 
 def test_mismatched_public_key_returns_exit_code_4(tmp_path):

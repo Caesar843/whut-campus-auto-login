@@ -25,6 +25,7 @@ EXIT_ENVIRONMENT = 2
 EXIT_KEY_FORMAT = 3
 EXIT_KEY_MISMATCH = 4
 EXIT_SIGN_VERIFY = 5
+MAX_SECURE_TEXT_FILE_BYTES = 64 * 1024
 _ALLOWED_KEYS = {
     "LICENSE_SERVER_ENV",
     "LICENSE_PRIVATE_KEY",
@@ -100,6 +101,11 @@ def _read_secure_text_file(
                 f"{category_prefix}_not_regular",
                 exit_code,
             )
+        if metadata.st_size > MAX_SECURE_TEXT_FILE_BYTES:
+            raise PreflightError(
+                f"{category_prefix}_too_large",
+                exit_code,
+            )
         if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
             raise PreflightError(
                 f"{category_prefix}_permissions_too_open",
@@ -117,7 +123,18 @@ def _read_secure_text_file(
                     exit_code,
                 )
         chunks = []
-        while chunk := os.read(file_descriptor, 65536):
+        total_bytes = 0
+        while True:
+            remaining = MAX_SECURE_TEXT_FILE_BYTES - total_bytes
+            chunk = os.read(file_descriptor, min(65536, remaining + 1))
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_SECURE_TEXT_FILE_BYTES:
+                raise PreflightError(
+                    f"{category_prefix}_too_large",
+                    exit_code,
+                )
             chunks.append(chunk)
     except PreflightError:
         raise
