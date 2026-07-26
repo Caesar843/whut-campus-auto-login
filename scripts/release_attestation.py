@@ -9,21 +9,29 @@ import hmac
 import importlib.metadata
 import json
 import os
+import re
 import shutil
+import stat
 import tempfile
+import unicodedata
 import zipfile
 from datetime import UTC, datetime
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import CodeType
 from typing import Any, Callable, Iterable, Mapping
 
 from license_client.public_key import validate_release_server_url
+from app_version import APP_VERSION, windows_version_tuple
 
 
 SCHEMA_VERSION = "p6-a1c-2"
 PRODUCT_ID = "whut-campus-auto-login"
 EMBEDDED_CONFIG_MODULE = "_license_client_embedded_build_config"
 LICENSE_FILENAMES = {"license", "license.txt", "license.md", "copying", "notice", "authors"}
+MAX_LICENSE_FILE_BYTES = 1024 * 1024
+MAX_LICENSE_ARCHIVE_BYTES = 64 * 1024 * 1024
+_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
+_WINDOWS_REPARSE_POINT = 0x0400
 MANIFEST_FIELDS = {
     "product_id",
     "app_version",
@@ -50,6 +58,85 @@ class AttestationError(RuntimeError):
     """A controlled failure whose message contains no input values."""
 
 
+def _path_key(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def _is_reparse_point(path: Path) -> bool:
+    details = os.lstat(path)
+    return stat.S_ISLNK(details.st_mode) or bool(getattr(details, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT)
+
+
+def _assert_not_reparse_point(path: Path) -> None:
+    try:
+        if _is_reparse_point(path):
+            raise AttestationError("artifact path contains a reparse point")
+    except AttestationError:
+        raise
+    except OSError as exc:
+        raise AttestationError("artifact path is not accessible") from exc
+
+
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def _assert_no_reparse_ancestors(path: Path) -> None:
+    current = _absolute_path(path)
+    while not os.path.lexists(current):
+        if current.parent == current:
+            raise AttestationError("artifact path is not accessible")
+        current = current.parent
+    while True:
+        _assert_not_reparse_point(current)
+        if current.parent == current:
+            return
+        current = current.parent
+
+
+def validate_artifact_paths(onedir: Path, staging_dir: Path) -> tuple[Path, Path]:
+    root = _absolute_path(onedir)
+    staging = _absolute_path(staging_dir)
+    _assert_no_reparse_ancestors(root)
+    _assert_no_reparse_ancestors(staging.parent)
+    if os.path.lexists(staging):
+        _assert_not_reparse_point(staging)
+    try:
+        root = root.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise AttestationError("onedir input is not accessible") from exc
+    if not root.is_dir():
+        raise AttestationError("onedir input is not a directory")
+    if staging == root or staging.is_relative_to(root) or root.is_relative_to(staging):
+        raise AttestationError("staging directory must be separate from onedir")
+    return root, staging
+
+
+def validate_attestation_inputs(
+    *,
+    source_commit: str,
+    app_version: str,
+    build_environment: str,
+    python_version: str,
+    pyinstaller_version: str,
+) -> None:
+    if _COMMIT_PATTERN.fullmatch(source_commit) is None:
+        raise AttestationError("source commit must be a full lowercase SHA-1")
+    try:
+        windows_version_tuple(app_version)
+    except ValueError as exc:
+        raise AttestationError("app version is invalid") from exc
+    if app_version != APP_VERSION or build_environment != "production":
+        raise AttestationError("attestation inputs do not match the production baseline")
+    try:
+        baseline_path = Path(__file__).resolve().parents[1] / "packaging" / "windows" / "build_baseline.json"
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise AttestationError("build baseline is unavailable") from exc
+    if python_version != baseline.get("python_version") or pyinstaller_version != baseline.get("pyinstaller_version"):
+        raise AttestationError("attestation inputs do not match the build baseline")
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
@@ -63,9 +150,10 @@ def sha256_file(path: Path) -> str:
 
 
 def relative_artifact_path(root: Path, path: Path) -> str:
+    _assert_not_reparse_point(root)
+    if os.path.lexists(path):
+        _assert_not_reparse_point(path)
     root = root.resolve(strict=True)
-    if path.is_symlink():
-        raise AttestationError("artifact contains a symbolic link")
     try:
         relative = path.resolve(strict=True).relative_to(root)
     except (FileNotFoundError, ValueError) as exc:
@@ -76,23 +164,43 @@ def relative_artifact_path(root: Path, path: Path) -> str:
 
 
 def artifact_file_records(root: Path) -> list[dict[str, Any]]:
-    root = root.resolve(strict=True)
+    root = _absolute_path(root)
+    _assert_no_reparse_ancestors(root)
+    try:
+        root = root.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise AttestationError("onedir input is not accessible") from exc
     if not root.is_dir():
         raise AttestationError("onedir input is not a directory")
     records = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-        if path.is_symlink():
-            raise AttestationError("artifact contains a symbolic link")
-        if not path.is_file():
-            continue
-        records.append(
-            {
-                "relative_path": relative_artifact_path(root, path),
+    directories = [root]
+    while directories:
+        directory = directories.pop()
+        _assert_not_reparse_point(directory)
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise AttestationError("artifact directory cannot be inspected") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            _assert_not_reparse_point(path)
+            if entry.is_dir(follow_symlinks=False):
+                directories.append(path)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise AttestationError("artifact contains a non-regular file")
+            records.append(
+                {
+                    "relative_path": relative_artifact_path(root, path),
                 "size_bytes": path.stat().st_size,
                 "sha256": sha256_file(path),
-            }
-        )
-    return sorted(records, key=lambda item: item["relative_path"])
+                }
+            )
+    records.sort(key=lambda item: item["relative_path"])
+    keys = [_path_key(record["relative_path"]) for record in records]
+    if len(keys) != len(set(keys)):
+        raise AttestationError("artifact contains a Windows path collision")
+    return records
 
 
 def build_manifest(root: Path, metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -141,10 +249,35 @@ def _sha256_zip_member(archive: zipfile.ZipFile, name: str) -> str:
     return digest.hexdigest()
 
 
+def _validate_zip_member_names(names: Iterable[str]) -> list[str]:
+    checked = []
+    for name in names:
+        candidate = PurePosixPath(name)
+        if (
+            not name
+            or "\\" in name
+            or candidate.is_absolute()
+            or str(candidate) != name
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+            or PureWindowsPath(name).is_absolute()
+            or PureWindowsPath(name).drive
+            or any(part.rstrip(". ") != part or PureWindowsPath(part).is_reserved() for part in candidate.parts)
+        ):
+            raise AttestationError("ZIP member path is invalid")
+        checked.append(name)
+    if len(checked) != len(set(checked)) or len({_path_key(name) for name in checked}) != len(checked):
+        raise AttestationError("ZIP members contain duplicate or Windows-colliding paths")
+    return checked
+
+
 def verify_zip_against_manifest(zip_path: Path, manifest: Mapping[str, Any]) -> None:
-    expected = {record["relative_path"]: record for record in manifest.get("files", [])}
+    expected_records = list(manifest.get("files", []))
+    expected_names = _validate_zip_member_names(str(record["relative_path"]) for record in expected_records)
+    expected = {record["relative_path"]: record for record in expected_records}
+    if len(expected) != len(expected_records):
+        raise AttestationError("ZIP members do not match manifest")
     with zipfile.ZipFile(zip_path) as archive:
-        names = archive.namelist()
+        names = _validate_zip_member_names(archive.namelist())
         if names != sorted(names) or set(names) != set(expected):
             raise AttestationError("ZIP members do not match manifest")
         for name, record in expected.items():
@@ -155,15 +288,23 @@ def verify_zip_against_manifest(zip_path: Path, manifest: Mapping[str, Any]) -> 
 
 def build_spdx_sbom(components: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     packages = []
+    used_ids: set[str] = set()
     for component in sorted(components, key=lambda item: (str(item["name"]).casefold(), str(item["version"]))):
         scope = str(component.get("scope", "uncertain"))
         if scope not in {"bundled", "build-test", "uncertain"}:
             raise AttestationError("SBOM component scope is invalid")
         name, version = str(component["name"]), str(component["version"])
         license_value = str(component.get("license") or "NOASSERTION")
+        base_id = f"SPDXRef-Package-{_safe_name(name)}-{_safe_name(version)}"
+        spdx_id = base_id
+        suffix = 2
+        while spdx_id in used_ids:
+            spdx_id = f"{base_id}-{suffix}"
+            suffix += 1
+        used_ids.add(spdx_id)
         packages.append(
             {
-                "SPDXID": f"SPDXRef-Package-{_safe_name(name)}-{_safe_name(version)}",
+                "SPDXID": spdx_id,
                 "name": name,
                 "versionInfo": version,
                 "downloadLocation": "NOASSERTION",
@@ -196,27 +337,38 @@ def _safe_name(value: str) -> str:
 def collect_local_licenses(distributions: Iterable[Any], output_dir: Path) -> list[dict[str, str]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     records = []
+    total_bytes = 0
+    used_names = {_path_key(path.name) for path in output_dir.iterdir()}
     for distribution in sorted(distributions, key=lambda item: (str(item.name).casefold(), str(item.version))):
         metadata = distribution.metadata
         name, version = str(distribution.name), str(distribution.version)
         license_value = str(metadata.get("License-Expression") or metadata.get("License") or "NOASSERTION")
-        candidates = [
-            Path(candidate)
-            for candidate in (distribution.files or [])
-            if Path(candidate).name.casefold() in LICENSE_FILENAMES
-        ]
+        candidates = []
+        for item in distribution.files or []:
+            candidate = Path(item)
+            if candidate.name.casefold() not in LICENSE_FILENAMES:
+                continue
+            if candidate.is_absolute() or PureWindowsPath(str(candidate)).is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+                raise AttestationError("license metadata path is invalid")
+            candidates.append(candidate)
         copied = []
         for candidate in sorted(candidates, key=lambda item: item.as_posix()):
             source = Path(distribution.locate_file(candidate))
             if not source.is_file() or source.is_symlink():
                 continue
+            with source.open("rb") as stream:
+                data = stream.read(MAX_LICENSE_FILE_BYTES + 1)
+            if len(data) > MAX_LICENSE_FILE_BYTES or total_bytes + len(data) > MAX_LICENSE_ARCHIVE_BYTES:
+                raise AttestationError("license archive exceeds size limit")
             base_name = f"{_safe_name(name)}-{_safe_name(version)}-{_safe_name(source.name)}"
             destination = output_dir / base_name
             index = 2
-            while destination.exists():
+            while _path_key(destination.name) in used_names:
                 destination = output_dir / f"{base_name}-{index}"
                 index += 1
-            destination.write_bytes(source.read_bytes())
+            destination.write_bytes(data)
+            used_names.add(_path_key(destination.name))
+            total_bytes += len(data)
             copied.append(destination.name)
         records.append(
             {
@@ -248,10 +400,11 @@ def verify_embedded_build_config(
     if embedded_url != approved:
         raise AttestationError("embedded production URL does not match approved input")
     try:
-        raw_key = base64.b64decode(str(config.get("LICENSE_PUBLIC_KEY_B64", "")), validate=True)
+        encoded_key = str(config.get("LICENSE_PUBLIC_KEY_B64", ""))
+        raw_key = base64.b64decode(encoded_key, validate=True)
     except (ValueError, base64.binascii.Error) as exc:
         raise AttestationError("embedded public key is invalid") from exc
-    if len(raw_key) != 32:
+    if len(raw_key) != 32 or base64.b64encode(raw_key).decode("ascii") != encoded_key:
         raise AttestationError("embedded public key has invalid length")
     fingerprint = hashlib.sha256(raw_key).hexdigest()
     if not _is_sha256(expected_public_key_sha256) or not hmac.compare_digest(fingerprint, expected_public_key_sha256.lower()):
@@ -328,11 +481,31 @@ def read_pyinstaller_module_names(exe_path: Path) -> set[str]:
 
 
 _CONTENT_MARKERS = {
-    "private_key_marker": (b"-----BEGIN PRIVATE KEY-----", b"-----BEGIN OPENSSH PRIVATE KEY-----", b"Ed25519PrivateKey"),
+    "private_key_marker": (
+        b"-----BEGIN PRIVATE KEY-----",
+        b"-----BEGIN OPENSSH PRIVATE KEY-----",
+        b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        b"-----BEGIN RSA PRIVATE KEY-----",
+        b"-----BEGIN EC PRIVATE KEY-----",
+        b"Ed25519PrivateKey",
+    ),
     "credential_marker": (b"LICENSE_PRIVATE_KEY", b"CAMPUS_PASSWORD", b"Credential Manager"),
     "absolute_path": (b"C:\\Users\\", b"/home/", b"/Users/"),
     "environment_dump": (b"PATH=", b"USERPROFILE=", b"HOME="),
 }
+
+
+def _contains_marker(path: Path, markers: Iterable[bytes]) -> bool:
+    marker_values = tuple(markers)
+    tail = b""
+    limit = max(map(len, marker_values)) - 1
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            data = tail + chunk
+            if any(marker in data for marker in marker_values):
+                return True
+            tail = data[-limit:] if limit else b""
+    return False
 
 
 def scan_forbidden_content(root: Path) -> list[dict[str, Any]]:
@@ -354,9 +527,8 @@ def scan_forbidden_content(root: Path) -> list[dict[str, Any]]:
             categories.append("disallowed_source_tree")
         if "token" in filename or "credential" in filename:
             categories.append("token_or_credential_file")
-        data = (root / Path(relative_path)).read_bytes()
         for category, markers in _CONTENT_MARKERS.items():
-            if any(marker in data for marker in markers):
+            if _contains_marker(root / Path(relative_path), markers):
                 categories.append(category)
         findings.extend({"category": category, "count": 1, "relative_path": relative_path} for category in sorted(set(categories)))
     return sorted(findings, key=lambda item: (item["category"], item["relative_path"]))
@@ -365,14 +537,15 @@ def scan_forbidden_content(root: Path) -> list[dict[str, Any]]:
 def scan_zip_forbidden_content(zip_path: Path) -> list[dict[str, Any]]:
     findings = []
     with zipfile.ZipFile(zip_path) as archive:
-        for member in sorted(archive.namelist()):
+        for member in sorted(_validate_zip_member_names(archive.namelist())):
             if member.endswith("/"):
                 continue
             temporary = tempfile.TemporaryDirectory()
             try:
                 path = Path(temporary.name) / member
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(archive.read(member))
+                with archive.open(member) as source, path.open("wb") as destination:
+                    shutil.copyfileobj(source, destination, length=1024 * 1024)
                 findings.extend(scan_forbidden_content(Path(temporary.name)))
             finally:
                 temporary.cleanup()
@@ -398,8 +571,10 @@ def verify_sha256sums(sums_path: Path, root: Path, external_paths: Mapping[str, 
 
 
 def publish_atomically(staging_dir: Path, writer: Callable[[Path], None]) -> None:
-    staging_dir = staging_dir.resolve()
-    if staging_dir.exists():
+    staging_dir = _absolute_path(staging_dir)
+    _assert_no_reparse_ancestors(staging_dir.parent)
+    if os.path.lexists(staging_dir):
+        _assert_not_reparse_point(staging_dir)
         raise AttestationError("staging destination already exists")
     staging_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{staging_dir.name}.", dir=staging_dir.parent))
@@ -418,7 +593,7 @@ def components_from_local_metadata(distributions: Iterable[Any], archive_modules
     for distribution in distributions:
         top_level_text = distribution.read_text("top_level.txt")
         top_levels = {line.strip() for line in (top_level_text or "").splitlines() if line.strip()}
-        scope = "uncertain" if not top_levels else "bundled" if top_levels & archive_roots else "build-test"
+        scope = "uncertain" if top_levels & archive_roots else "build-test" if top_levels else "uncertain"
         components.append(
             {
                 "name": str(distribution.name),
@@ -442,8 +617,14 @@ def attest_release(
     python_version: str,
     pyinstaller_version: str,
 ) -> dict[str, Any]:
-    if build_environment != "production":
-        raise AttestationError("attestation requires production build environment")
+    validate_attestation_inputs(
+        source_commit=source_commit,
+        app_version=app_version,
+        build_environment=build_environment,
+        python_version=python_version,
+        pyinstaller_version=pyinstaller_version,
+    )
+    onedir, staging_dir = validate_artifact_paths(onedir, staging_dir)
     records = artifact_file_records(onedir)
     exe_records = [record for record in records if record["relative_path"].lower().endswith(".exe")]
     if len(exe_records) != 1:

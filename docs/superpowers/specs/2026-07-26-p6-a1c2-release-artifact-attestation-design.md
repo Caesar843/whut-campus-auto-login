@@ -19,7 +19,14 @@ and an expected public-key SHA-256 fingerprint.  The URL is process-only: it
 is compared and revalidated but never persisted or printed.  The full key is
 read only from the frozen artifact, decoded as a 32-byte Ed25519 public key,
 and never written or printed.  Evidence records only validation booleans and
-the fingerprint.
+the fingerprint.  The source commit must be a full lowercase hexadecimal ID,
+and the app, Python, and PyInstaller versions must match the committed Windows
+build baseline.
+
+The onedir and staging directories are distinct and non-nested.  Existing path
+components must not be symbolic links, Windows junctions, or other reparse
+points.  ZIP members are canonical relative names and reject duplicate or
+Windows case/Unicode-colliding paths before hash verification.
 
 The manifest is deterministic UTF-8 JSON with sorted file records.  A record
 contains a normalized relative POSIX path, byte length, and SHA-256.  Relative
@@ -52,7 +59,8 @@ The SBOM is SPDX 2.3 JSON.  It records packages as `bundled`, `build-test`, or
 metadata alone is not a bundle claim.  License collection uses only local
 `importlib.metadata` and conventional distribution files.  Missing licenses
 are recorded as missing with `NOASSERTION`; no network lookup or guessed text
-is permitted.
+is permitted.  A top-level module-name overlap remains `uncertain`; license
+metadata paths and copied license sizes are bounded.
 
 ## Failure and release process
 

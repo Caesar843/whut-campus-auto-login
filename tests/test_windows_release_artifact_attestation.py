@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -138,6 +139,27 @@ def test_zip_hashes_must_match_manifest(tmp_path):
         module.verify_zip_against_manifest(zip_path, manifest)
 
 
+@pytest.mark.parametrize("members", [("payload.bin", "payload.bin"), ("Payload.bin", "payload.bin")])
+def test_zip_verifier_rejects_duplicate_or_windows_casefold_members(tmp_path, members):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "payload.bin").write_bytes(b"payload")
+    manifest = module.build_manifest(root, {"product_id": "test"})
+    archive = tmp_path / "duplicate.zip"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(archive, "w") as zipped:
+            for record in manifest["files"]:
+                if record["relative_path"] == "payload.bin":
+                    for member in members:
+                        zipped.writestr(member, b"payload")
+                else:
+                    zipped.writestr(record["relative_path"], (root / record["relative_path"]).read_bytes())
+
+    with pytest.raises(module.AttestationError, match="ZIP"):
+        module.verify_zip_against_manifest(archive, manifest)
+
+
 def test_spdx_has_required_structure_and_scopes_are_not_overclaimed():
     module = _module()
 
@@ -156,15 +178,29 @@ def test_spdx_has_required_structure_and_scopes_are_not_overclaimed():
     assert by_name["unknown-pkg"]["licenseConcluded"] == "NOASSERTION"
 
 
+def test_spdx_assigns_unique_ids_after_safe_name_normalization():
+    module = _module()
+
+    sbom = module.build_spdx_sbom(
+        [
+            {"name": "a/b", "version": "1", "scope": "uncertain"},
+            {"name": "a:b", "version": "1", "scope": "uncertain"},
+        ]
+    )
+
+    assert len({package["SPDXID"] for package in sbom["packages"]}) == 2
+
+
 class _Distribution:
-    def __init__(self, name: str, version: str, metadata: dict[str, str], files: list[Path]):
+    def __init__(self, name: str, version: str, metadata: dict[str, str], files: list[Path], located_files=None):
         self.name = name
         self.version = version
         self.metadata = metadata
         self.files = files
+        self.located_files = located_files or {}
 
     def locate_file(self, file: Path) -> Path:
-        return file
+        return self.located_files.get(file, file)
 
 
 def test_license_collection_records_metadata_files_missing_and_collisions(tmp_path):
@@ -177,8 +213,8 @@ def test_license_collection_records_metadata_files_missing_and_collisions(tmp_pa
     second.write_text("second license", encoding="utf-8")
     output = tmp_path / "licenses"
     distributions = [
-        _Distribution("alpha", "1.0", {"License": "MIT"}, [first]),
-        _Distribution("beta", "2.0", {"License-Expression": "Apache-2.0"}, [second]),
+        _Distribution("alpha", "1.0", {"License": "MIT"}, [Path("LICENSE")], {Path("LICENSE"): first}),
+        _Distribution("beta", "2.0", {"License-Expression": "Apache-2.0"}, [Path("LICENSE")], {Path("LICENSE"): second}),
         _Distribution("gamma", "3.0", {}, []),
     ]
 
@@ -191,6 +227,24 @@ def test_license_collection_records_metadata_files_missing_and_collisions(tmp_pa
     assert records[2]["license_file_status"] == "missing"
     written = sorted(path.name for path in output.iterdir())
     assert written == ["alpha-1.0-LICENSE", "beta-2.0-LICENSE"]
+
+
+def test_license_collection_rejects_metadata_path_traversal_and_oversized_file(tmp_path):
+    module = _module()
+    source = tmp_path / "outside" / "LICENSE"
+    source.parent.mkdir()
+    source.write_bytes(b"x" * (module.MAX_LICENSE_FILE_BYTES + 1))
+    output = tmp_path / "licenses"
+
+    class UnsafeDistribution(_Distribution):
+        def locate_file(self, _file):
+            return source
+
+    with pytest.raises(module.AttestationError, match="license"):
+        module.collect_local_licenses([UnsafeDistribution("unsafe", "1", {}, [Path("../LICENSE")])], output)
+
+    with pytest.raises(module.AttestationError, match="license"):
+        module.collect_local_licenses([UnsafeDistribution("large", "1", {}, [Path("LICENSE")])], output)
 
 
 def test_embedded_config_requires_production_and_never_returns_key_or_session():
@@ -223,6 +277,7 @@ def test_embedded_config_requires_production_and_never_returns_key_or_session():
         (_embedded_config(LICENSE_SERVER_URL="http://127.0.0.1"), "http://127.0.0.1", TEST_FINGERPRINT, "HTTPS"),
         (_embedded_config(LICENSE_PUBLIC_KEY_B64="not-base64"), TEST_URL, TEST_FINGERPRINT, "public key"),
         (_embedded_config(LICENSE_PUBLIC_KEY_B64=base64.b64encode(b"x").decode("ascii")), TEST_URL, TEST_FINGERPRINT, "public key"),
+        (_embedded_config(LICENSE_PUBLIC_KEY_B64=TEST_PUBLIC_KEY[:-2] + "R="), TEST_URL, TEST_FINGERPRINT, "public key"),
         (_embedded_config(), TEST_URL, "0" * 64, "fingerprint"),
     ],
 )
@@ -380,7 +435,7 @@ def test_component_scope_uses_archive_module_evidence_without_claiming_all_insta
 
     assert {item["name"]: item["scope"] for item in components} == {
         "build-only": "build-test",
-        "frozen": "bundled",
+        "frozen": "uncertain",
         "unknown": "uncertain",
     }
 
@@ -394,6 +449,49 @@ def test_zip_scanner_reports_forbidden_member_without_showing_marker(tmp_path):
     findings = module.scan_zip_forbidden_content(archive)
 
     assert findings == [{"category": "private_key_marker", "count": 1, "relative_path": "leak.txt"}]
+
+
+def test_zip_scanner_rejects_path_escape_and_encrypted_private_key_marker(tmp_path):
+    module = _module()
+    archive = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("../escape.txt", b"safe")
+
+    with pytest.raises(module.AttestationError, match="ZIP"):
+        module.scan_zip_forbidden_content(archive)
+
+    root = _onedir(tmp_path)
+    (root / "encrypted.pem").write_bytes(b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
+    assert any(item["category"] == "private_key_marker" for item in module.scan_forbidden_content(root))
+
+
+def test_artifact_paths_reject_nested_staging_and_reparse_points(tmp_path, monkeypatch):
+    module = _module()
+    root = _onedir(tmp_path)
+
+    with pytest.raises(module.AttestationError, match="staging"):
+        module.validate_artifact_paths(root, root / "evidence")
+
+    monkeypatch.setattr(module, "_is_reparse_point", lambda path: path == root)
+    with pytest.raises(module.AttestationError, match="reparse"):
+        module.artifact_file_records(root)
+
+
+def test_attestation_input_validation_requires_fixed_baseline_and_full_commit():
+    module = _module()
+    valid = {
+        "source_commit": "a" * 40,
+        "app_version": "0.1.0",
+        "build_environment": "production",
+        "python_version": "3.11.9",
+        "pyinstaller_version": "6.21.0",
+    }
+
+    assert module.validate_attestation_inputs(**valid) is None
+    for field, value in (("source_commit", "short"), ("app_version", "0.1.0-test"), ("python_version", "3.12.0"), ("pyinstaller_version", "6.20.0")):
+        invalid = {**valid, field: value}
+        with pytest.raises(module.AttestationError):
+            module.validate_attestation_inputs(**invalid)
 
 
 def test_atomic_staging_removes_partial_output_on_failure_and_keeps_input(tmp_path):
