@@ -22,6 +22,27 @@ server's source priority. The private key must remain on the server.
 - Do not restart services, rotate keys, edit configuration, deploy, or build an
   executable during this preflight.
 
+### Supported environment-file syntax
+
+This preflight intentionally parses a restricted literal `KEY=value` subset
+rather than emulating the full `systemd EnvironmentFile=` grammar. Blank lines
+and whole-line comments are allowed. Every other line must contain a `=` and a
+valid key name matching `[A-Za-z_][A-Za-z0-9_]*`; leading or trailing
+whitespace around the key name is rejected. The `export` prefix is not
+supported.
+
+For the four consumed keys — `LICENSE_SERVER_ENV`, `LICENSE_PRIVATE_KEY`,
+`LICENSE_PRIVATE_KEY_FILE`, and `LICENSE_PUBLIC_KEY` — values must be literal.
+They must not contain single quotes (`'`), double quotes (`"`), dollar signs
+(`$`), backticks (`` ` ``), here-doc markers (`<<`), or trailing-backslash
+line continuation. Duplicate definitions of these keys are rejected.
+
+Other structurally valid environment keys are silently ignored: their values
+are not interpreted, validated, stored, or output by the preflight.
+
+This parser is intentionally narrow. Do not rely on it as a general-purpose
+environment-file parser.
+
 ## Run the preflight
 
 ```bash
