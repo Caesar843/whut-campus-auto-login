@@ -17,7 +17,10 @@ from cryptography.hazmat.primitives.serialization import (
 )
 
 from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
-from license_server.ed25519_keys import Ed25519KeyFormatError, load_private_key_b64
+from license_server.ed25519_keys import (
+    Ed25519KeyFormatError,
+    validate_private_key_b64_text,
+)
 from license_server.payment import ANNUAL_V1
 
 if TYPE_CHECKING:
@@ -181,7 +184,7 @@ def is_production_environment(env: Mapping[str, str] | None = None) -> bool:
 
 def validate_private_key_b64(private_key_b64: str, *, source: str = "LICENSE_PRIVATE_KEY") -> None:
     try:
-        load_private_key_b64(private_key_b64, source=source)
+        validate_private_key_b64_text(private_key_b64, source=source)
     except Ed25519KeyFormatError as exc:
         raise RuntimeError(str(exc)) from exc
 

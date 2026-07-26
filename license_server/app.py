@@ -17,7 +17,6 @@ from license_server.config import (
     load_config,
     validate_mock_admin_token,
     validate_admin_access_token_sha256,
-    validate_private_key_b64,
 )
 from license_server.db import initialize_database
 from license_server.payment_gateway import MockPaymentGateway, PaymentGateway
@@ -26,6 +25,7 @@ from license_server.payment_notification_routes import (
 )
 from license_server.payment_routes import create_payment_router
 from license_server.routes import create_router
+from license_server.signer import LicenseSigningIdentity
 from license_server.wechat_payment import WeChatNativePaymentGateway
 
 
@@ -72,7 +72,10 @@ def create_app(
             admin_access_token_sha256 or config.admin_access_token_sha256
         )
     environment = environment or DEFAULT_ENVIRONMENT
-    validate_private_key_b64(str(private_key_b64), source="private_key_b64")
+    signing_identity = LicenseSigningIdentity(
+        str(private_key_b64),
+        source="private_key_b64",
+    )
     if environment == "production" and payment_provider == "mock":
         raise RuntimeError("PAYMENT_PROVIDER=mock is not allowed in production.")
     if payment_provider == "mock" and not str(payment_mock_admin_token or "").strip():
@@ -102,7 +105,7 @@ def create_app(
     app.include_router(
         create_router(
             database_path=Path(database_path),
-            private_key_b64=str(private_key_b64),
+            signing_identity=signing_identity,
             payment_amount=str(payment_amount),
             payment_currency=str(payment_currency),
             payment_channels=tuple(payment_channels),
@@ -112,7 +115,7 @@ def create_app(
     app.include_router(
         create_payment_router(
             database_path=Path(database_path),
-            private_key_b64=str(private_key_b64),
+            signing_identity=signing_identity,
             payment_provider=payment_provider,
             payment_mock_admin_token=payment_mock_admin_token,
             gateway=payment_gateway,
