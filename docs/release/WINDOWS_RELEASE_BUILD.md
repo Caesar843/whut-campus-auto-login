@@ -58,6 +58,22 @@ running-service token checks.
 - The branding source PNG is retained in the repository but is not included in the release bundle.
 - The one-time embedded license configuration is removed after success or failure; Windows version metadata is not a secret and may remain under ignored `build\generated`.
 
+## P6-A1c-2 artifact-attestation flow
+
+P6-A1c-2 adds a reviewable offline attestation tool; this repository change
+does not execute or accept a production build.  The tool is intentionally a
+separate command so `scripts\build_windows.ps1` remains the only build entry
+point and never receives attestation logic or release-publishing authority.
+
+Stage 1 is code review, tests, a Draft PR, and merge of the tool itself.
+Stage 2 is a later human-controlled activity from clean merged `main`: obtain
+approved process-only release inputs, build with the fixed baseline, run
+`scripts\release_artifact_attestation.py`, review the redacted manifest/SBOM/
+license archive/checksums, and only then decide separately about signing and
+release publication.  Do not commit the approved URL or full public key; the
+attestor records only URL-validation booleans and the approved public-key
+SHA-256 fingerprint.
+
 ## Current release boundary
 
 P6-A1b does not run or accept a real production build. Installation packaging, Authenticode signing, Defender/SmartScreen work, automatic updates, artifact hashes, and production URL/public-key acceptance remain outside this phase.
