@@ -1,0 +1,4 @@
+# Install as /etc/sudoers.d/whut-license-runtime-attestation-audit with mode 0440.
+# Replace only the fixed audit account name before installation.
+Cmnd_Alias WHUT_LICENSE_RUNTIME_ATTESTATION_AUDIT = /usr/local/sbin/whut-license-runtime-attestation-audit ""
+REPLACE_WITH_AUDIT_ACCOUNT ALL=(root) NOPASSWD: WHUT_LICENSE_RUNTIME_ATTESTATION_AUDIT

@@ -44,8 +44,22 @@ from license_server.signer import RUNTIME_ATTESTATION_SIGNING_DOMAIN  # noqa: E4
 
 
 DEPLOY_ROOT = Path("/opt/whut-campus-auto-login")
+PYTHON_ENTRY = DEPLOY_ROOT / ".venv/bin/python"
+SCRIPT_PATH = (
+    DEPLOY_ROOT
+    / "scripts/ops/verify_running_license_server_attestation.py"
+)
 PUBLIC_KEY_FILE = Path(
     "/etc/whut-campus-auto-login/license-public-key.b64"
+)
+ENVIRONMENT_FILE = Path(
+    "/etc/whut-campus-auto-login/license-server.env"
+)
+UNIT_FILE = Path(
+    "/etc/systemd/system/whut-license-server.service"
+)
+WRAPPER_FILE = Path(
+    "/usr/local/sbin/whut-license-runtime-attestation-audit"
 )
 SERVICE_NAME = "whut-license-server.service"
 SERVICE_USER = "whutlogin"
@@ -212,6 +226,7 @@ def _main_pid() -> int:
         capture_output=True,
         text=True,
         timeout=IO_TIMEOUT_SECONDS,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
     )
     value = result.stdout.strip()
     if not value.isascii() or not value.isdigit() or int(value) <= 0:
@@ -226,6 +241,7 @@ def _git_output(*arguments: str) -> str:
         capture_output=True,
         text=True,
         timeout=IO_TIMEOUT_SECONDS,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
     )
     return result.stdout.strip()
 
@@ -270,6 +286,7 @@ def live_audit() -> dict[str, Any]:
     require_supported_production_platform()
     if os.geteuid() != 0:
         raise AuditError("root_required")
+    _validate_deployment_security()
     public_key = _read_public_key()
     expected_uid = _service_uid()
     expected_pid = _main_pid()
@@ -327,8 +344,182 @@ def startup_gate() -> None:
     expected_commit = os.environ.get(SOURCE_COMMIT_ENV, "")
     if not _valid_commit(expected_commit):
         raise AuditError("source_commit_invalid")
+    _validate_deployment_security()
     if _repository_state() != expected_commit:
         raise AuditError("source_commit_mismatch")
+    _service_account_cannot_write()
+
+
+def _validate_deployment_security() -> None:
+    _validate_root_controlled_path(DEPLOY_ROOT, kind="directory")
+    _validate_root_controlled_path(DEPLOY_ROOT.parent, kind="directory")
+    _validate_root_controlled_path(DEPLOY_ROOT / ".git", kind="directory")
+    for path in _git_metadata_paths():
+        _validate_root_controlled_path(
+            path,
+            kind="directory" if path.is_dir() else "file",
+        )
+    for path in (
+        ENVIRONMENT_FILE,
+        PUBLIC_KEY_FILE,
+        SCRIPT_PATH,
+        UNIT_FILE,
+        WRAPPER_FILE,
+    ):
+        _validate_root_controlled_path(path, kind="file")
+        _validate_root_parent_chain(path.parent)
+    _validate_root_controlled_path(WRAPPER_FILE, kind="executable")
+    for executable in (PYTHON_ENTRY, SYSTEMCTL, GIT):
+        _validate_resolved_executable(executable)
+    if Path(__file__).resolve(strict=True) != SCRIPT_PATH:
+        raise AuditError("audit_script_path_invalid")
+    for path in _tracked_paths():
+        _validate_root_controlled_path(path, kind="file")
+        _validate_parents_to_deploy_root(path.parent)
+
+
+def _tracked_paths() -> tuple[Path, ...]:
+    result = subprocess.run(
+        [str(GIT), "-C", str(DEPLOY_ROOT), "ls-files", "-z", "--cached"],
+        check=True,
+        capture_output=True,
+        timeout=IO_TIMEOUT_SECONDS,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+    try:
+        names = result.stdout.decode("utf-8").split("\0")
+    except UnicodeDecodeError as exc:
+        raise AuditError("tracked_path_invalid") from exc
+    paths = []
+    for name in names:
+        if not name:
+            continue
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise AuditError("tracked_path_invalid")
+        path = DEPLOY_ROOT / relative
+        if path.is_symlink():
+            raise AuditError("tracked_path_insecure")
+        paths.append(path)
+    if not paths:
+        raise AuditError("tracked_files_missing")
+    return tuple(paths)
+
+
+def _git_metadata_paths() -> tuple[Path, ...]:
+    paths = []
+
+    def fail(error: OSError) -> None:
+        raise AuditError("git_metadata_unreadable") from error
+
+    for root, directories, files in os.walk(
+        DEPLOY_ROOT / ".git",
+        topdown=True,
+        onerror=fail,
+        followlinks=False,
+    ):
+        root_path = Path(root)
+        paths.append(root_path)
+        for name in directories:
+            path = root_path / name
+            if path.is_symlink():
+                raise AuditError("git_metadata_insecure")
+        paths.extend(root_path / name for name in files)
+    return tuple(paths)
+
+
+def _validate_parents_to_deploy_root(path: Path) -> None:
+    while True:
+        _validate_root_controlled_path(path, kind="directory")
+        if path == DEPLOY_ROOT:
+            return
+        if DEPLOY_ROOT not in path.parents:
+            raise AuditError("tracked_path_invalid")
+        path = path.parent
+
+
+def _validate_root_parent_chain(path: Path) -> None:
+    while True:
+        _validate_root_controlled_path(path, kind="directory")
+        if path == path.parent:
+            return
+        path = path.parent
+
+
+def _validate_root_controlled_path(path: Path, *, kind: str) -> None:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise AuditError("root_controlled_path_missing") from exc
+    expected_type = (
+        stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+    )
+    if (
+        not expected_type(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or (kind == "executable" and not metadata.st_mode & 0o100)
+    ):
+        raise AuditError("root_controlled_path_insecure")
+
+
+def _validate_resolved_executable(path: Path) -> None:
+    try:
+        metadata = os.lstat(path)
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise AuditError("executable_path_invalid") from exc
+    if (
+        metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode))
+    ):
+        raise AuditError("executable_path_insecure")
+    _validate_root_parent_chain(path.parent)
+    _validate_root_controlled_path(resolved, kind="executable")
+    _validate_root_parent_chain(resolved.parent)
+
+
+def _service_account_cannot_write() -> None:
+    import pwd
+
+    account = pwd.getpwnam(SERVICE_USER)
+    checked = {
+        DEPLOY_ROOT,
+        DEPLOY_ROOT / ".git",
+        *(_tracked_paths()),
+    }
+    checked.update(path.parent for path in tuple(checked))
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(read_fd)
+            os.setgroups([])
+            os.setgid(account.pw_gid)
+            os.setuid(account.pw_uid)
+            writable = any(
+                os.access(
+                    path,
+                    os.W_OK,
+                    effective_ids=True,
+                )
+                for path in checked
+            )
+            os.write(write_fd, b"1" if writable else b"0")
+        except BaseException:
+            os.write(write_fd, b"E")
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    try:
+        result = os.read(read_fd, 1)
+    finally:
+        os.close(read_fd)
+    _, status = os.waitpid(pid, 0)
+    if status != 0 or result != b"0":
+        raise AuditError("service_source_write_boundary_failed")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -365,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
         AuditError,
         OSError,
         RuntimeError,
+        RuntimeAttestationError,
         ValueError,
         subprocess.SubprocessError,
     ) as exc:

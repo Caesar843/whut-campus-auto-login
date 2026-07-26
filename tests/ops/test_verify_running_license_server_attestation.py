@@ -1,5 +1,7 @@
 import base64
+import stat
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -171,3 +173,61 @@ def test_cli_accepts_only_the_two_fixed_modes():
     ):
         with pytest.raises(SystemExit):
             ops._parser().parse_args(arguments)
+
+
+def test_startup_gate_checks_fixed_commit_tree_and_service_write_boundary(
+    monkeypatch,
+):
+    ops = _ops()
+    calls = []
+    monkeypatch.setattr(ops, "require_supported_production_platform", lambda: None)
+    monkeypatch.setattr(ops.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setenv(ops.SOURCE_COMMIT_ENV, "a" * 40)
+    monkeypatch.setattr(ops, "_repository_state", lambda: "a" * 40)
+    monkeypatch.setattr(
+        ops,
+        "_validate_deployment_security",
+        lambda: calls.append("security"),
+    )
+    monkeypatch.setattr(
+        ops,
+        "_service_account_cannot_write",
+        lambda: calls.append("write"),
+    )
+
+    ops.startup_gate()
+
+    assert calls == ["security", "write"]
+
+
+def test_root_controlled_path_rejects_symlink_nonroot_and_unsafe_mode(
+    monkeypatch,
+):
+    ops = _ops()
+    path = ops.Path("/fixed")
+
+    for mode, uid in (
+        (stat.S_IFLNK | 0o777, 0),
+        (stat.S_IFREG | 0o600, 1000),
+        (stat.S_IFREG | 0o620, 0),
+    ):
+        monkeypatch.setattr(
+            ops.os,
+            "lstat",
+            lambda _path, mode=mode, uid=uid: SimpleNamespace(
+                st_mode=mode,
+                st_uid=uid,
+            ),
+        )
+        with pytest.raises(ops.AuditError):
+            ops._validate_root_controlled_path(path, kind="file")
+
+    monkeypatch.setattr(
+        ops.os,
+        "lstat",
+        lambda _path: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_uid=0,
+        ),
+    )
+    ops._validate_root_controlled_path(path, kind="file")
