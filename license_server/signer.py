@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from license_server.ed25519_keys import load_private_key_b64
 
 
 def sign_license_payload(payload: Mapping[str, Any], *, private_key_b64: str) -> str:
-    private_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(private_key_b64))
+    private_key = load_private_key_b64(private_key_b64)
     payload_json = json.dumps(
         dict(payload),
         ensure_ascii=False,
@@ -31,7 +32,7 @@ def verify_license_token_payload(
     try:
         payload_segment, signature_segment = signed_license_token.split(".", 1)
         signature = _b64url_decode(signature_segment)
-        private_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(private_key_b64))
+        private_key = load_private_key_b64(private_key_b64)
         private_key.public_key().verify(signature, payload_segment.encode("ascii"))
         payload = json.loads(_b64url_decode(payload_segment).decode("utf-8"))
     except (
