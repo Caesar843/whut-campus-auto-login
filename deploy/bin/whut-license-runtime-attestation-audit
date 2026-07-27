@@ -7,8 +7,15 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
+/usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONNOUSERSITE=1 \
+    /usr/bin/python3 -I \
+    /usr/local/libexec/whut-license-startup-gate
+
 exec /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-    /opt/whut-campus-auto-login/.venv/bin/python \
+    PYTHONNOUSERSITE=1 \
+    /opt/whut-campus-auto-login/.venv/bin/python -I \
     /opt/whut-campus-auto-login/scripts/ops/verify_running_license_server_attestation.py \
     --live-audit

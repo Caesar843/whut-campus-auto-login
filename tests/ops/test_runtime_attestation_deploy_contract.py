@@ -5,13 +5,15 @@ UNIT = Path("deploy/systemd/whut-license-server.service.example")
 NGINX = Path("deploy/nginx/license.whutlogin.cn.conf.example")
 ENV_EXAMPLE = Path("license_server/.env.example")
 WRAPPER = Path("deploy/bin/whut-license-runtime-attestation-audit")
+GATE = Path("deploy/libexec/whut-license-startup-gate.py")
 SUDOERS = Path(
     "deploy/sudoers/whut-license-runtime-attestation-audit.example"
 )
 SOP = Path("docs/release/RUNNING_LICENSE_SERVER_ATTESTATION.md")
+DEPLOYMENT_GUIDE = Path("docs/license_deploy_tencent_cloud.md")
 
 
-def test_systemd_contract_is_single_process_and_fixed_path():
+def test_systemd_contract_uses_external_isolated_gate_and_fixed_app_dir():
     content = UNIT.read_text(encoding="utf-8")
 
     required = (
@@ -22,11 +24,11 @@ def test_systemd_contract_is_single_process_and_fixed_path():
         "RuntimeDirectoryPreserve=no",
         "UMask=0077",
         "Environment=WEB_CONCURRENCY=1",
-        "ExecStartPre=+/opt/whut-campus-auto-login/.venv/bin/python "
-        "/opt/whut-campus-auto-login/scripts/ops/"
-        "verify_running_license_server_attestation.py --startup-gate",
-        "ExecStart=/opt/whut-campus-auto-login/.venv/bin/uvicorn "
-        "license_server.app:app --host 127.0.0.1 --port 8787 --workers 1",
+        "ExecStartPre=+/usr/bin/python3 -I "
+        "/usr/local/libexec/whut-license-startup-gate",
+        "ExecStart=/opt/whut-campus-auto-login/.venv/bin/python -I -m uvicorn "
+        "--app-dir /opt/whut-campus-auto-login license_server.app:app "
+        "--host 127.0.0.1 --port 8787 --workers 1",
     )
     for directive in required:
         assert directive in content
@@ -60,12 +62,39 @@ def test_root_wrapper_is_no_argument_and_uses_only_fixed_targets():
     assert 'if [ "$#" -ne 0 ]; then' in content
     assert "/usr/bin/env -i" in content
     assert (
-        "/opt/whut-campus-auto-login/.venv/bin/python "
+        "/usr/bin/python3 -I "
+        "/usr/local/libexec/whut-license-startup-gate"
+    ) in normalized
+    assert (
+        "/opt/whut-campus-auto-login/.venv/bin/python -I "
         "/opt/whut-campus-auto-login/scripts/ops/"
         "verify_running_license_server_attestation.py --live-audit"
     ) in normalized
     for unsafe in ("$1", '"$@"', "--socket", "--service", "--public-key"):
         assert unsafe not in content
+    assert normalized.index("/usr/local/libexec/whut-license-startup-gate") < (
+        normalized.index("verify_running_license_server_attestation.py")
+    )
+
+
+def test_external_gate_source_is_outside_deployment_runtime_and_import_safe():
+    content = GATE.read_text(encoding="utf-8")
+
+    assert "from license_server" not in content
+    assert "import license_server" not in content
+    assert "from app_version" not in content
+    assert "sys.path.insert" not in content
+    assert "ast.parse" in content
+    assert "/usr/bin/git" in content
+    assert "shell=True" not in content
+
+
+def test_deployment_guide_does_not_grant_service_user_write_access_to_code():
+    content = DEPLOYMENT_GUIDE.read_text(encoding="utf-8")
+
+    assert "sudo chown -R root:root /opt/whut-campus-auto-login" in content
+    assert "sudo chown -R whutlogin:whutlogin /opt/whut-campus-auto-login" not in content
+    assert "/usr/local/libexec/whut-license-startup-gate" in content
 
 
 def test_sudoers_grants_only_the_installed_no_argument_wrapper():

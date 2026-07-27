@@ -13,8 +13,8 @@ RuntimeDirectory=whut-license-server
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=no
 UMask=0077
-ExecStartPre=+/opt/whut-campus-auto-login/.venv/bin/python /opt/whut-campus-auto-login/scripts/ops/verify_running_license_server_attestation.py --startup-gate
-ExecStart=/opt/whut-campus-auto-login/.venv/bin/uvicorn license_server.app:app --host 127.0.0.1 --port 8787 --workers 1
+ExecStartPre=+/usr/bin/python3 -I /usr/local/libexec/whut-license-startup-gate
+ExecStart=/opt/whut-campus-auto-login/.venv/bin/python -I -m uvicorn --app-dir /opt/whut-campus-auto-login license_server.app:app --host 127.0.0.1 --port 8787 --workers 1
 Restart=always
 RestartSec=5
 

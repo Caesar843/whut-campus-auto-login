@@ -740,7 +740,9 @@ def test_deploy_examples_exist_and_include_required_settings():
 
     assert "WorkingDirectory=/opt/whut-campus-auto-login" in service_content
     assert "EnvironmentFile=/etc/whut-campus-auto-login/license-server.env" in service_content
-    assert "/opt/whut-campus-auto-login/.venv/bin/uvicorn" in service_content
+    assert "/usr/local/libexec/whut-license-startup-gate" in service_content
+    assert "/opt/whut-campus-auto-login/.venv/bin/python -I -m uvicorn" in service_content
+    assert "--app-dir /opt/whut-campus-auto-login" in service_content
     assert "--host 127.0.0.1 --port 8787" in service_content
     assert "Restart=always" in service_content
 

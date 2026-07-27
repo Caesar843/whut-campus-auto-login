@@ -43,11 +43,42 @@ LICENSE_RUNTIME_SOURCE_COMMIT=<最终完整部署 commit>
 
 ## systemd 与 socket
 
+### Privileged entrypoint installation
+
+Install `deploy/libexec/whut-license-startup-gate.py` as the fixed external
+file `/usr/local/libexec/whut-license-startup-gate`, owned by `root:root`,
+mode `0755`, with root-owned non-writable ancestor directories. systemd runs
+only `/usr/bin/python3 -I /usr/local/libexec/whut-license-startup-gate` as its
+root `ExecStartPre` command. The gate uses only the standard library and fixed
+paths; it does not import repository modules, execute the deployment venv,
+run Uvicorn, or run Git hooks before it has verified the deployment tree.
+
+The gate checks the complete ancestor chain from `/` through
+`/opt/whut-campus-auto-login`, then recursively checks only the deployment
+tree (including source, `.git`, and `.venv`), plus the external gate, wrapper,
+unit, environment file, and public-key file. Every checked object must be
+root-owned, non-symlink where required, free of group/world write and POSIX
+ACLs, and unavailable for effective write access by `whutlogin`. It validates
+the venv Python realpath chain, parses `APP_VERSION` with `ast` without
+executing it, and calls only absolute `/usr/bin/git` with a sanitized
+environment, disabled hooks/fsmonitor, and optional locks disabled.
+
+The application command is fixed to:
+
+```text
+/opt/whut-campus-auto-login/.venv/bin/python -I -m uvicorn --app-dir /opt/whut-campus-auto-login license_server.app:app --host 127.0.0.1 --port 8787 --workers 1
+```
+
+`--app-dir` is not user-configurable. The root audit wrapper first calls the
+same external gate using `/usr/bin/python3 -I` in a cleared environment; only
+after a successful result may it execute the deployment venv live-audit with
+`-I`. No root wrapper path may bypass this gate.
+
 unit 固定 `User/Group=whutlogin`、`WEB_CONCURRENCY=1`、uvicorn
 `--workers 1`、`UMask=0077`、`RuntimeDirectory=whut-license-server`、
 `RuntimeDirectoryMode=0750`、`RuntimeDirectoryPreserve=no`。启动前，
-root 权限的 `--startup-gate` 只读检查 commit、clean 状态、所有权、
-权限、符号链接、固定文件和 `whutlogin` 不可写边界；任一失败即拒绝启动。
+仓库外的 root 权限 startup gate 只读检查 commit、clean 状态、所有权、
+权限、ACL、符号链接、固定文件和 `whutlogin` 不可写边界；任一失败即拒绝启动。
 
 socket 父路径必须是 systemd 新建的真实目录。若 socket 路径启动前已经
 存在，服务拒绝启动，不自动删除。正常退出仅在路径仍是本实例创建、所有者
