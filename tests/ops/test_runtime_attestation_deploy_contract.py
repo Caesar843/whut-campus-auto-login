@@ -11,6 +11,12 @@ SUDOERS = Path(
 )
 SOP = Path("docs/release/RUNNING_LICENSE_SERVER_ATTESTATION.md")
 DEPLOYMENT_GUIDE = Path("docs/license_deploy_tencent_cloud.md")
+LINUX_WORKFLOW = Path(
+    ".github/workflows/p6-a1c1b-runtime-attestation-linux.yml"
+)
+LINUX_EVIDENCE_TEST = Path(
+    "tests/ops/test_runtime_attestation_linux_privileged.py"
+)
 
 
 def test_systemd_contract_uses_external_isolated_gate_and_fixed_app_dir():
@@ -139,3 +145,44 @@ def test_attestation_runtime_has_no_database_dependency_or_http_route():
     assert "sqlite" not in runtime.lower()
     assert '@app.get("/internal/runtime-attestation' not in app
     assert '@app.post("/internal/runtime-attestation' not in app
+
+
+def test_runtime_attestation_has_dedicated_linux_evidence_workflow():
+    content = LINUX_WORKFLOW.read_text(encoding="utf-8")
+
+    required = (
+        "name: P6-A1c1b Runtime Attestation Linux",
+        "pull_request:",
+        "branches:",
+        "- main",
+        "workflow_dispatch:",
+        "permissions:",
+        "contents: read",
+        "runs-on: ubuntu-latest",
+        'python-version: "3.11.9"',
+        "cache: pip",
+        "sudo apt-get install -y acl",
+        "WHUT_RUN_PRIVILEGED_LINUX_EVIDENCE=1",
+        "tests/ops/test_runtime_attestation_linux_privileged.py",
+        "systemd_lifecycle=MANUAL_EVIDENCE_REQUIRED",
+        "python -m pytest tests/license_server -q",
+        "python -m pytest tests/license_client -q",
+        "python -m pytest tests/client -q",
+        "python -m pytest -q",
+        "python -m compileall -q license_server scripts",
+        "git diff --check",
+    )
+    for fragment in required:
+        assert fragment in content
+    assert "p6-a1c0-linux-preflight.yml" not in content
+
+
+def test_linux_evidence_suite_has_no_unconditional_skip_placeholder():
+    privileged = LINUX_EVIDENCE_TEST.read_text(encoding="utf-8")
+    startup_gate = Path(
+        "tests/ops/test_privileged_startup_gate.py"
+    ).read_text(encoding="utf-8")
+
+    assert "linux_privileged_evidence" in privileged
+    assert "WHUT_RUN_PRIVILEGED_LINUX_EVIDENCE" in privileged
+    assert 'pytest.skip("requires dedicated Ubuntu fixture' not in startup_gate

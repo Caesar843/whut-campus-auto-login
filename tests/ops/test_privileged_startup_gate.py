@@ -161,12 +161,3 @@ def test_trusted_gate_runs_checks_in_fixed_order(monkeypatch, capsys):
     assert gate.main([]) == 0
     assert calls == ["env", "version", "unit", "git", (Path("/gate"), Path("/deploy"))]
     assert capsys.readouterr().out == "result=PASS\n"
-
-
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="requires Linux POSIX ACL and effective-ID semantics",
-)
-def test_linux_gate_rejects_acl_and_service_write_paths(tmp_path):
-    gate = _gate()
-    pytest.skip("requires dedicated Ubuntu fixture with getfacl and whutlogin")
