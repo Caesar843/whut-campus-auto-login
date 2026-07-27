@@ -1,0 +1,173 @@
+name: P6-A1c1b Runtime Attestation Linux
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/p6-a1c1b-runtime-attestation-linux.yml"
+      - "requirements-server.txt"
+      - "requirements-client.txt"
+      - "pytest.ini"
+      - "app_version.py"
+      - "license_server/app.py"
+      - "license_server/config.py"
+      - "license_server/device_proof.py"
+      - "license_server/ed25519_keys.py"
+      - "license_server/payment_routes.py"
+      - "license_server/routes.py"
+      - "license_server/runtime_attestation.py"
+      - "license_server/signer.py"
+      - "scripts/ops/verify_running_license_server_attestation.py"
+      - "deploy/bin/whut-license-runtime-attestation-audit"
+      - "deploy/libexec/whut-license-startup-gate.py"
+      - "deploy/systemd/whut-license-server.service.example"
+      - "deploy/sudoers/whut-license-runtime-attestation-audit.example"
+      - "deploy/nginx/license.whutlogin.cn.conf.example"
+      - "tests/license_server/test_runtime_attestation.py"
+      - "tests/license_server/test_signer.py"
+      - "tests/license_server/test_device_proof.py"
+      - "tests/license_server/test_license_server.py"
+      - "tests/ops/test_privileged_startup_gate.py"
+      - "tests/ops/test_runtime_attestation_deploy_contract.py"
+      - "tests/ops/test_runtime_attestation_linux_privileged.py"
+      - "tests/ops/test_verify_running_license_server_attestation.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  linux-protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: |
+            requirements-server.txt
+            requirements-client.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            -r requirements-server.txt \
+            -r requirements-client.txt
+
+      - name: Run protocol and wire-format evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest \
+            tests/license_server/test_runtime_attestation.py \
+            tests/license_server/test_signer.py \
+            tests/license_server/test_device_proof.py \
+            tests/license_server/test_license_server.py \
+            tests/ops/test_verify_running_license_server_attestation.py \
+            tests/ops/test_runtime_attestation_deploy_contract.py \
+            -q -p no:cacheprovider -rA | tee /tmp/p6-a1c1b-protocol.log
+          if grep -Eq '(^|, )[1-9][0-9]* skipped' /tmp/p6-a1c1b-protocol.log; then
+            echo "P6-A1c-1B protocol evidence rejected skipped tests."
+            exit 1
+          fi
+
+  linux-privileged-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: requirements-server.txt
+
+      - name: Install system and Python dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl python3-venv
+          command -v getfacl
+          command -v setfacl
+          command -v systemd-analyze
+          command -v sudo
+          test -x /usr/sbin/runuser
+          test -x /usr/sbin/useradd
+          python -m pip install --disable-pip-version-check \
+            -r requirements-server.txt pytest
+
+      - name: Run zero-skip privileged Linux evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          python_path="$(command -v python)"
+          sudo env \
+            GITHUB_ACTIONS=true \
+            WHUT_RUN_PRIVILEGED_LINUX_EVIDENCE=1 \
+            "$python_path" -m pytest \
+            tests/ops/test_runtime_attestation_linux_privileged.py \
+            -q -p no:cacheprovider -rA | tee /tmp/p6-a1c1b-privileged.log
+          if grep -Eq '(^|, )[1-9][0-9]* skipped' /tmp/p6-a1c1b-privileged.log; then
+            echo "P6-A1c-1B privileged evidence rejected skipped tests."
+            exit 1
+          fi
+          echo "systemd_lifecycle=MANUAL_EVIDENCE_REQUIRED" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  ubuntu-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: |
+            requirements-server.txt
+            requirements-client.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            -r requirements-server.txt \
+            -r requirements-client.txt
+
+      - name: Run license server regression
+        run: python -m pytest tests/license_server -q
+
+      - name: Run license client regression
+        run: python -m pytest tests/license_client -q
+
+      - name: Run desktop client regression
+        run: python -m pytest tests/client -q
+
+      - name: Run full repository regression
+        run: python -m pytest -q
+
+      - name: Compile Python sources
+        run: python -m compileall -q license_server scripts
+
+      - name: Check patch whitespace
+        run: git diff --check
