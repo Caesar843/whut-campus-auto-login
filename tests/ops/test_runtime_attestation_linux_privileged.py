@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.machinery
 import importlib.util
 import os
 import shutil
@@ -10,6 +11,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -101,19 +103,31 @@ def trusted_deployment(privileged_linux_environment):
     if existing:
         pytest.fail(f"refusing to replace existing fixed paths: {existing}")
     try:
-        _run(
-            [
-                str(SYSTEM_GIT),
-                "-c",
-                f"safe.directory={REPO_ROOT}",
-                "clone",
-                "--no-hardlinks",
-                str(REPO_ROOT),
-                str(DEPLOY_ROOT),
-            ],
-            capture_output=True,
-            text=True,
-        )
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as git_config:
+            git_config.write(
+                f"[safe]\n"
+                f"\tdirectory = {REPO_ROOT}\n"
+                f"\tdirectory = {REPO_ROOT / '.git'}\n"
+            )
+            git_config.flush()
+            _run(
+                [
+                    str(SYSTEM_GIT),
+                    "clone",
+                    "--no-hardlinks",
+                    str(REPO_ROOT),
+                    str(DEPLOY_ROOT),
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    "GIT_CONFIG_GLOBAL": git_config.name,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "HOME": "/root",
+                    "LC_ALL": "C",
+                    "PATH": "/usr/bin:/bin",
+                },
+            )
         commit = _run(
             [str(SYSTEM_GIT), "-C", str(DEPLOY_ROOT), "rev-parse", "HEAD"],
             capture_output=True,
@@ -129,7 +143,7 @@ def trusted_deployment(privileged_linux_environment):
         WRAPPER_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         UNIT_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         shutil.copy2(
-            DEPLOY_ROOT / "deploy/libexec/whut-license-startup-gate.py",
+            REPO_ROOT / "deploy/libexec/whut-license-startup-gate.py",
             GATE_FILE,
         )
         shutil.copy2(
@@ -212,7 +226,12 @@ def _changed_bytes(path: Path, value: bytes):
 
 
 def _load_installed_gate():
-    spec = importlib.util.spec_from_file_location("installed_runtime_gate", GATE_FILE)
+    loader = importlib.machinery.SourceFileLoader(
+        "installed_runtime_gate",
+        str(GATE_FILE),
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -427,13 +446,16 @@ def _exchange(runtime, socket_path: Path, frame: bytes):
 async def _exchange_as_service_user(socket_path: Path, frame: bytes) -> bytes:
     encoded = base64.b64encode(frame).decode("ascii")
     code = (
-        "import base64,socket,sys;"
-        "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);"
-        "s.connect(sys.argv[1]);"
-        "s.sendall(base64.b64decode(sys.argv[2]));"
-        "s.shutdown(socket.SHUT_WR);"
-        "data=s.recv(4096);"
-        "sys.stdout.write(base64.b64encode(data).decode())"
+        "import base64,socket,sys\n"
+        "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+        "s.connect(sys.argv[1])\n"
+        "s.sendall(base64.b64decode(sys.argv[2]))\n"
+        "s.shutdown(socket.SHUT_WR)\n"
+        "try:\n"
+        "    data=s.recv(4096)\n"
+        "except ConnectionResetError:\n"
+        "    data=b''\n"
+        "sys.stdout.write(base64.b64encode(data).decode())\n"
     )
     process = await asyncio.create_subprocess_exec(
         str(RUNUSER),
@@ -456,45 +478,47 @@ async def _exchange_as_service_user(socket_path: Path, frame: bytes) -> bytes:
 
 def test_real_unix_peer_credentials_root_nonroot_and_replay(
     privileged_linux_environment,
-    tmp_path,
 ):
     import license_server.runtime_attestation as runtime
 
     async def scenario():
-        socket_dir = tmp_path / "socket-dir"
-        socket_dir.mkdir(mode=0o755)
-        os.chmod(socket_dir, 0o755)
-        socket_path = socket_dir / "attestation.sock"
-        server = runtime.RuntimeAttestationServer(
-            signing_identity=LicenseSigningIdentity(PRIVATE_KEY_B64),
-            source_commit="a" * 40,
-            socket_path=socket_path,
-            expected_peer_uid=0,
-            enforce_production_path=False,
-        )
-        await server.start()
-        frame = _request_frame(runtime, CHALLENGE)
-        try:
-            peer, body = await asyncio.to_thread(
-                _exchange, runtime, socket_path, frame
+        with tempfile.TemporaryDirectory(
+            prefix="whut-attestation-peer-",
+            dir="/tmp",
+        ) as directory:
+            socket_dir = Path(directory)
+            os.chmod(socket_dir, 0o755)
+            socket_path = socket_dir / "attestation.sock"
+            server = runtime.RuntimeAttestationServer(
+                signing_identity=LicenseSigningIdentity(PRIVATE_KEY_B64),
+                source_commit="a" * 40,
+                socket_path=socket_path,
+                expected_peer_uid=0,
+                enforce_production_path=False,
             )
-            assert peer[0] == os.getpid()
-            assert peer[1] == 0
-            response = runtime.parse_response(body)
-            assert response["challenge_b64url"] == CHALLENGE
-            assert response["signature_b64url"]
+            await server.start()
+            frame = _request_frame(runtime, CHALLENGE)
+            try:
+                peer, body = await asyncio.to_thread(
+                    _exchange, runtime, socket_path, frame
+                )
+                assert peer[0] == os.getpid()
+                assert peer[1] == 0
+                response = runtime.parse_response(body)
+                assert response["challenge_b64url"] == CHALLENGE
+                assert response["signature_b64url"]
 
-            _peer, replay = await asyncio.to_thread(
-                _exchange, runtime, socket_path, frame
-            )
-            assert replay == b""
+                _peer, replay = await asyncio.to_thread(
+                    _exchange, runtime, socket_path, frame
+                )
+                assert replay == b""
 
-            os.chmod(socket_path, 0o666)
-            denied = await _exchange_as_service_user(socket_path, frame)
-            assert denied == b""
-        finally:
-            await server.close()
-        assert not socket_path.exists()
+                os.chmod(socket_path, 0o666)
+                denied = await _exchange_as_service_user(socket_path, frame)
+                assert denied == b""
+            finally:
+                await server.close()
+            assert not socket_path.exists()
 
     asyncio.run(scenario())
 

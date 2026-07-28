@@ -150,8 +150,7 @@ def walk_trusted_tree(root: Path) -> tuple[Path, ...]:
         metadata = os.lstat(path)
         if stat.S_ISLNK(metadata.st_mode):
             if _is_venv_python_alias(path):
-                validate_venv_python_alias(path)
-                checked.append(path)
+                checked.extend(validate_venv_python_alias(path))
                 continue
             raise GateError("symlink_insecure")
         kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "file"
@@ -184,7 +183,7 @@ def validate_executable_chain(path: Path) -> tuple[Path, ...]:
     try:
         metadata = os.lstat(path)
         resolved = path.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise GateError("executable_chain_invalid") from exc
     if metadata.st_uid != 0 or (
         stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o022
@@ -204,6 +203,12 @@ def validate_executable_chain(path: Path) -> tuple[Path, ...]:
 
 def validate_no_posix_acls(paths: Iterable[Path]) -> None:
     for path in dict.fromkeys(paths):
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise GateError("acl_check_failed") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            continue
         try:
             value = os.getxattr(path, "system.posix_acl_access", follow_symlinks=False)
         except AttributeError as exc:

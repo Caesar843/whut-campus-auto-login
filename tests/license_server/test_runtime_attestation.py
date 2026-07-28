@@ -8,6 +8,8 @@ import sys
 from datetime import datetime, timezone
 
 import pytest
+from fastapi import APIRouter, FastAPI
+from starlette.routing import BaseRoute, Match
 
 from license_server.app import create_app
 from license_server.config import load_config
@@ -23,6 +25,18 @@ def _runtime():
     import license_server.runtime_attestation as runtime
 
     return runtime
+
+
+def _route_matches_http_path(route: BaseRoute, path: str) -> bool:
+    match, _child_scope = route.matches(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "root_path": "",
+        }
+    )
+    return match is not Match.NONE
 
 
 def test_request_requires_exact_canonical_shape():
@@ -195,16 +209,41 @@ def test_runtime_attestation_config_fails_closed(tmp_path):
         load_config(env)
 
 
+def test_http_route_probe_detects_included_router():
+    router = APIRouter()
+
+    @router.post("/internal/runtime-attestation/{suffix:path}")
+    def forbidden_route(suffix: str):
+        return {"suffix": suffix}
+
+    app = FastAPI()
+    app.include_router(router)
+
+    assert any(
+        _route_matches_http_path(
+            route,
+            "/internal/runtime-attestation/probe",
+        )
+        for route in app.routes
+    )
+
+
 def test_default_app_has_no_runtime_attestation_http_route(tmp_path):
     app = create_app(
         database_path=tmp_path / "license.sqlite3",
         private_key_b64=PRIVATE_KEY_B64,
     )
 
-    assert not any(
-        route.path.startswith("/internal/runtime-attestation")
-        for route in app.routes
+    forbidden_paths = (
+        "/internal/runtime-attestation",
+        "/internal/runtime-attestation/",
+        "/internal/runtime-attestation/probe",
+        "/internal/runtime-attestation-probe",
     )
+    for path in forbidden_paths:
+        assert not any(
+            _route_matches_http_path(route, path) for route in app.routes
+        ), path
     assert not hasattr(app.state, "runtime_attestation_server")
 
 

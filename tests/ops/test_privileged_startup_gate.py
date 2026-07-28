@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import stat
 import sys
@@ -56,11 +57,174 @@ def test_root_controlled_path_rejects_symlink(monkeypatch):
         gate.validate_path(Path("/fixed"), kind="file")
 
 
+@pytest.mark.parametrize(
+    "target_mode",
+    (
+        stat.S_IFDIR | 0o755,
+        stat.S_IFREG | 0o775,
+        stat.S_IFREG | 0o757,
+    ),
+)
+def test_resolved_interpreter_target_must_be_regular_and_not_writable(
+    monkeypatch,
+    target_mode,
+):
+    gate = _gate()
+    monkeypatch.setattr(
+        gate.os,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=target_mode, st_uid=0),
+    )
+
+    with pytest.raises(gate.GateError, match="path_insecure"):
+        gate.validate_path(Path("/usr/bin/python3.12"), kind="executable")
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_walk_rejects_symlink_outside_allowed_venv_alias_location(
+    tmp_path,
+    monkeypatch,
+):
+    gate = _gate()
+    target = tmp_path / "target"
+    target.write_text("safe\n", encoding="utf-8")
+    unexpected = tmp_path / "unexpected-link"
+    unexpected.symlink_to(target.name)
+
+    monkeypatch.setattr(
+        gate,
+        "validate_path",
+        lambda path, *, kind: Path(path),
+    )
+
+    with pytest.raises(gate.GateError, match="symlink_insecure"):
+        gate.walk_trusted_tree(tmp_path)
+
+
 def test_acl_write_grant_is_rejected():
     gate = _gate()
 
     with pytest.raises(gate.GateError, match="acl_write_grant"):
         gate.validate_acl_text("user:1001:rw-\n")
+
+
+def test_acl_check_skips_symlink_entry_without_querying_link_xattr(monkeypatch):
+    gate = _gate()
+    link = Path("/opt/whut-campus-auto-login/.venv/bin/python")
+    queried = []
+
+    monkeypatch.setattr(
+        gate.os,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0),
+    )
+
+    def unsupported_link_xattr(path, attribute, *, follow_symlinks):
+        queried.append((path, attribute, follow_symlinks))
+        raise OSError(errno.ENOTSUP, "link ACL xattr unsupported")
+
+    monkeypatch.setattr(gate.os, "getxattr", unsupported_link_xattr)
+
+    gate.validate_no_posix_acls([link])
+
+    assert queried == []
+
+
+@pytest.mark.parametrize("error_number", (errno.ENOTSUP, errno.EACCES, errno.EIO))
+def test_acl_check_fails_closed_for_regular_file_errors(monkeypatch, error_number):
+    gate = _gate()
+    target = Path("/usr/bin/python3.12")
+
+    monkeypatch.setattr(
+        gate.os,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0),
+    )
+
+    def failing_xattr(_path, _attribute, *, follow_symlinks):
+        assert follow_symlinks is False
+        raise OSError(error_number, "ACL query failed")
+
+    monkeypatch.setattr(gate.os, "getxattr", failing_xattr)
+
+    with pytest.raises(gate.GateError, match="acl_check_failed"):
+        gate.validate_no_posix_acls([target])
+
+
+def test_acl_check_rejects_acl_on_regular_target(monkeypatch):
+    gate = _gate()
+    target = Path("/usr/bin/python3.12")
+
+    monkeypatch.setattr(
+        gate.os,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0),
+    )
+    monkeypatch.setattr(
+        gate.os,
+        "getxattr",
+        lambda *_args, **_kwargs: b"non-empty-posix-acl",
+    )
+
+    with pytest.raises(gate.GateError, match="acl_present"):
+        gate.validate_no_posix_acls([target])
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_walk_keeps_validated_venv_alias_target_chain(tmp_path, monkeypatch):
+    gate = _gate()
+    target = tmp_path / "python-target"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    alias = tmp_path / "python"
+    alias.symlink_to(target.name)
+    external_target = Path("/usr/bin/python3.12")
+
+    monkeypatch.setattr(
+        gate,
+        "validate_path",
+        lambda path, *, kind: Path(path),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_is_venv_python_alias",
+        lambda path: path == alias,
+    )
+    monkeypatch.setattr(
+        gate,
+        "validate_venv_python_alias",
+        lambda path: (path, external_target),
+    )
+
+    checked = gate.walk_trusted_tree(tmp_path)
+
+    assert alias in checked
+    assert external_target in checked
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+@pytest.mark.parametrize("link_kind", ("dangling", "loop"))
+def test_executable_chain_rejects_unresolvable_symlink(
+    tmp_path,
+    link_kind,
+):
+    gate = _gate()
+    alias = tmp_path / "python"
+    if link_kind == "dangling":
+        alias.symlink_to("missing-python")
+    else:
+        alias.symlink_to(alias.name)
+
+    with pytest.raises(gate.GateError, match="executable_chain_invalid"):
+        gate.validate_executable_chain(alias)
 
 
 def test_safe_app_version_uses_ast_without_importing_module(tmp_path):
