@@ -126,7 +126,12 @@ def test_acl_check_skips_symlink_entry_without_querying_link_xattr(monkeypatch):
         queried.append((path, attribute, follow_symlinks))
         raise OSError(errno.ENOTSUP, "link ACL xattr unsupported")
 
-    monkeypatch.setattr(gate.os, "getxattr", unsupported_link_xattr)
+    monkeypatch.setattr(
+        gate.os,
+        "getxattr",
+        unsupported_link_xattr,
+        raising=False,
+    )
 
     gate.validate_no_posix_acls([link])
 
@@ -148,7 +153,12 @@ def test_acl_check_fails_closed_for_regular_file_errors(monkeypatch, error_numbe
         assert follow_symlinks is False
         raise OSError(error_number, "ACL query failed")
 
-    monkeypatch.setattr(gate.os, "getxattr", failing_xattr)
+    monkeypatch.setattr(
+        gate.os,
+        "getxattr",
+        failing_xattr,
+        raising=False,
+    )
 
     with pytest.raises(gate.GateError, match="acl_check_failed"):
         gate.validate_no_posix_acls([target])
@@ -167,6 +177,7 @@ def test_acl_check_rejects_acl_on_regular_target(monkeypatch):
         gate.os,
         "getxattr",
         lambda *_args, **_kwargs: b"non-empty-posix-acl",
+        raising=False,
     )
 
     with pytest.raises(gate.GateError, match="acl_present"):
