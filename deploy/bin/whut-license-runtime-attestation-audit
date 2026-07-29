@@ -7,11 +7,21 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
-/usr/bin/env -i \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-    PYTHONNOUSERSITE=1 \
-    /usr/bin/python3 -I \
-    /usr/local/libexec/whut-license-startup-gate
+if gate_output="$(
+    /usr/bin/env -i \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        PYTHONNOUSERSITE=1 \
+        /usr/bin/python3 -I \
+        /usr/local/libexec/whut-license-startup-gate
+)"; then
+    :
+else
+    gate_status=$?
+    if [ -n "$gate_output" ]; then
+        printf '%s\n' "$gate_output"
+    fi
+    exit "$gate_status"
+fi
 
 exec /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \

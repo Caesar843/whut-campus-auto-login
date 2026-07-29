@@ -147,7 +147,7 @@ def trusted_deployment(privileged_linux_environment):
             GATE_FILE,
         )
         shutil.copy2(
-            DEPLOY_ROOT / "deploy/bin/whut-license-runtime-attestation-audit",
+            REPO_ROOT / "deploy/bin/whut-license-runtime-attestation-audit",
             WRAPPER_FILE,
         )
         shutil.copy2(
@@ -413,6 +413,82 @@ def test_wrapper_rejects_arguments_and_environment_injection(
         },
     )
     assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_wrapper_discards_successful_gate_stdout_before_auditor_output(
+    trusted_deployment,
+):
+    audit_stdout = "".join(
+        f"{line}\n"
+        for line in (
+            "result=PASS",
+            "runtime_attestation=pass",
+            "socket_peer_identity=pass",
+            "process_identity=pass",
+            "source_tree=pass",
+            "signature=pass",
+            "process_started_at=2026-07-29T08:45:47Z",
+            "app_version=0.1.0",
+            "source_commit=" + trusted_deployment,
+            "public_key_sha256=" + ("a" * 64),
+        )
+    )
+    gate = b"import sys\nsys.stdout.write('result=PASS\\n')\n"
+    auditor = (
+        "import sys\n"
+        f"sys.stdout.write({audit_stdout!r})\n"
+    ).encode("utf-8")
+
+    with _changed_bytes(GATE_FILE, gate), _changed_bytes(
+        DEPLOY_ROOT / "scripts/ops/verify_running_license_server_attestation.py",
+        auditor,
+    ):
+        result = subprocess.run(
+            [str(WRAPPER_FILE)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == audit_stdout
+    assert result.stdout.count("result=PASS\n") == 1
+    assert result.stderr == ""
+
+
+def test_wrapper_preserves_failing_gate_diagnostics_and_exit_status(
+    trusted_deployment,
+    tmp_path,
+):
+    marker = tmp_path / "auditor-started"
+    gate_stdout = "result=FAIL\ngate_detail=blocked\n"
+    gate_stderr = "gate_error=blocked\n"
+    gate = (
+        "import sys\n"
+        f"sys.stdout.write({gate_stdout!r})\n"
+        f"sys.stderr.write({gate_stderr!r})\n"
+        "raise SystemExit(23)\n"
+    ).encode("utf-8")
+    auditor = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('started', encoding='utf-8')\n"
+    ).encode("utf-8")
+
+    with _changed_bytes(GATE_FILE, gate), _changed_bytes(
+        DEPLOY_ROOT / "scripts/ops/verify_running_license_server_attestation.py",
+        auditor,
+    ):
+        result = subprocess.run(
+            [str(WRAPPER_FILE)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.returncode == 23
+    assert result.stdout == gate_stdout
+    assert result.stderr == gate_stderr
     assert not marker.exists()
 
 

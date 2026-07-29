@@ -83,6 +83,15 @@ def test_root_wrapper_is_no_argument_and_uses_only_fixed_targets():
     )
 
 
+def test_root_wrapper_discards_successful_gate_stdout_but_preserves_failures():
+    content = WRAPPER.read_text(encoding="utf-8")
+
+    assert 'if gate_output="$(\n' in content
+    assert 'if [ -n "$gate_output" ]; then' in content
+    assert "printf '%s\\n' \"$gate_output\"" in content
+    assert 'exit "$gate_status"' in content
+
+
 def test_external_gate_source_is_outside_deployment_runtime_and_import_safe():
     content = GATE.read_text(encoding="utf-8")
 
