@@ -446,16 +446,21 @@ def _exchange(runtime, socket_path: Path, frame: bytes):
 async def _exchange_as_service_user(socket_path: Path, frame: bytes) -> bytes:
     encoded = base64.b64encode(frame).decode("ascii")
     code = (
-        "import base64,socket,sys\n"
+        "import base64,errno,socket,sys\n"
         "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
         "s.connect(sys.argv[1])\n"
-        "s.sendall(base64.b64decode(sys.argv[2]))\n"
-        "s.shutdown(socket.SHUT_WR)\n"
         "try:\n"
-        "    data=s.recv(4096)\n"
-        "except ConnectionResetError:\n"
-        "    data=b''\n"
-        "sys.stdout.write(base64.b64encode(data).decode())\n"
+        "    try:\n"
+        "        s.sendall(base64.b64decode(sys.argv[2]))\n"
+        "        s.shutdown(socket.SHUT_WR)\n"
+        "        data=s.recv(4096)\n"
+        "    except OSError as exc:\n"
+        "        if exc.errno not in {errno.EPIPE,errno.ECONNRESET,errno.ENOTCONN}:\n"
+        "            raise\n"
+        "        data=b''\n"
+        "finally:\n"
+        "    s.close()\n"
+        "sys.stdout.write(base64.b64encode(data).decode('ascii'))\n"
     )
     process = await asyncio.create_subprocess_exec(
         str(RUNUSER),
