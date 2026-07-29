@@ -35,16 +35,29 @@ def load_private_key_b64(
     source: str = "LICENSE_PRIVATE_KEY",
 ) -> Ed25519PrivateKey:
     try:
-        raw = _decode_canonical_key_b64(
-            value,
-            source=source,
-            key_type="private",
-        )
+        raw = validate_private_key_b64_text(value, source=source)
         return Ed25519PrivateKey.from_private_bytes(raw)
     except ValueError as exc:
         raise Ed25519KeyFormatError(
             f"{source} must be a base64-encoded 32-byte Ed25519 private key."
         ) from exc
+
+
+def validate_private_key_b64_text(
+    value: str,
+    *,
+    source: str = "LICENSE_PRIVATE_KEY",
+) -> bytes:
+    raw = _decode_canonical_key_b64(
+        value,
+        source=source,
+        key_type="private",
+    )
+    if len(raw) != 32:
+        raise Ed25519KeyFormatError(
+            f"{source} must be a base64-encoded 32-byte Ed25519 private key."
+        )
+    return raw
 
 
 def load_public_key_b64(

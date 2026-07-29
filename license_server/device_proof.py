@@ -7,7 +7,10 @@ from typing import Any, Mapping
 from fastapi import HTTPException
 
 from license_client.constants import PRODUCT_ID
-from license_server.signer import verify_license_token_payload
+from license_server.signer import (
+    LicenseSigningIdentity,
+    verify_license_token_payload,
+)
 
 
 @dataclass(frozen=True)
@@ -39,13 +42,13 @@ def verify_device_proof_token(
     connection,
     *,
     signed_license_token: str,
-    private_key_b64: str,
+    signing_identity: LicenseSigningIdentity,
     expected_product_id: str = PRODUCT_ID,
 ) -> DeviceProof:
     try:
         payload = verify_license_token_payload(
             signed_license_token,
-            private_key_b64=private_key_b64,
+            identity=signing_identity,
         )
         _validate_payload_shape(payload)
         device_hash = _required_claim(payload, "device_fingerprint_hash")

@@ -17,7 +17,6 @@ from license_server.config import (
     load_config,
     validate_mock_admin_token,
     validate_admin_access_token_sha256,
-    validate_private_key_b64,
 )
 from license_server.db import initialize_database
 from license_server.payment_gateway import MockPaymentGateway, PaymentGateway
@@ -26,6 +25,7 @@ from license_server.payment_notification_routes import (
 )
 from license_server.payment_routes import create_payment_router
 from license_server.routes import create_router
+from license_server.signer import LicenseSigningIdentity
 from license_server.wechat_payment import WeChatNativePaymentGateway
 
 
@@ -49,6 +49,8 @@ def create_app(
     admin_enabled: Optional[bool] = None,
     admin_operator_name: Optional[str] = None,
     admin_access_token_sha256: Optional[str] = None,
+    runtime_attestation_enabled: Optional[bool] = None,
+    runtime_source_commit: Optional[str] = None,
 ) -> FastAPI:
     if database_path is None or private_key_b64 is None:
         config = load_config()
@@ -71,8 +73,19 @@ def create_app(
         admin_access_token_sha256 = (
             admin_access_token_sha256 or config.admin_access_token_sha256
         )
+        runtime_attestation_enabled = (
+            config.runtime_attestation_enabled
+            if runtime_attestation_enabled is None
+            else runtime_attestation_enabled
+        )
+        runtime_source_commit = (
+            runtime_source_commit or config.runtime_source_commit
+        )
     environment = environment or DEFAULT_ENVIRONMENT
-    validate_private_key_b64(str(private_key_b64), source="private_key_b64")
+    signing_identity = LicenseSigningIdentity(
+        str(private_key_b64),
+        source="private_key_b64",
+    )
     if environment == "production" and payment_provider == "mock":
         raise RuntimeError("PAYMENT_PROVIDER=mock is not allowed in production.")
     if payment_provider == "mock" and not str(payment_mock_admin_token or "").strip():
@@ -95,14 +108,35 @@ def create_app(
     admin_enabled = bool(admin_enabled)
     if admin_enabled:
         validate_admin_access_token_sha256(admin_access_token_sha256)
+    runtime_attestation_server = None
+    if runtime_attestation_enabled:
+        if environment != "production":
+            raise RuntimeError(
+                "LICENSE_RUNTIME_ATTESTATION_ENABLED requires production."
+            )
+        from license_server.runtime_attestation import RuntimeAttestationServer
+
+        runtime_attestation_server = RuntimeAttestationServer(
+            signing_identity=signing_identity,
+            source_commit=str(runtime_source_commit or ""),
+        )
     initialize_database(Path(database_path))
-    app = FastAPI(title="WHUT Campus Auto Login License Server")
+    app = FastAPI(
+        title="WHUT Campus Auto Login License Server",
+        lifespan=(
+            runtime_attestation_server.lifespan
+            if runtime_attestation_server is not None
+            else None
+        ),
+    )
+    if runtime_attestation_server is not None:
+        app.state.runtime_attestation_server = runtime_attestation_server
     _add_admin_security_headers(app)
     _add_health_route(app)
     app.include_router(
         create_router(
             database_path=Path(database_path),
-            private_key_b64=str(private_key_b64),
+            signing_identity=signing_identity,
             payment_amount=str(payment_amount),
             payment_currency=str(payment_currency),
             payment_channels=tuple(payment_channels),
@@ -112,7 +146,7 @@ def create_app(
     app.include_router(
         create_payment_router(
             database_path=Path(database_path),
-            private_key_b64=str(private_key_b64),
+            signing_identity=signing_identity,
             payment_provider=payment_provider,
             payment_mock_admin_token=payment_mock_admin_token,
             gateway=payment_gateway,
@@ -171,7 +205,14 @@ def _must_fail_startup() -> bool:
     except RuntimeError:
         return True
     provider = os.environ.get("PAYMENT_PROVIDER", "").strip().lower()
-    return bool(provider and provider != "disabled")
+    runtime_attestation = os.environ.get(
+        "LICENSE_RUNTIME_ATTESTATION_ENABLED",
+        "",
+    ).strip().lower()
+    return bool(
+        (provider and provider != "disabled")
+        or runtime_attestation not in {"", "0", "false", "no", "off"}
+    )
 
 
 def _add_health_route(app: FastAPI) -> None:

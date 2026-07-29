@@ -29,8 +29,10 @@ sudo apt install -y python3 python3-venv python3-pip git nginx sqlite3
 建议权限：
 
 ```bash
-sudo chown -R whutlogin:whutlogin /opt/whut-campus-auto-login /var/lib/whut-campus-auto-login
-sudo chmod 0750 /opt/whut-campus-auto-login /var/lib/whut-campus-auto-login
+sudo chown -R root:root /opt/whut-campus-auto-login
+sudo chown -R whutlogin:whutlogin /var/lib/whut-campus-auto-login
+sudo chmod 0755 /opt/whut-campus-auto-login
+sudo chmod 0750 /var/lib/whut-campus-auto-login
 sudo chmod 0640 /var/lib/whut-campus-auto-login/license.sqlite3
 sudo chmod 0600 /etc/whut-campus-auto-login/license-server.env
 ```
@@ -106,6 +108,8 @@ curl http://127.0.0.1:8787/healthz
 
 ```bash
 sudo cp deploy/systemd/whut-license-server.service.example /etc/systemd/system/whut-license-server.service
+sudo install -o root -g root -m 0755 deploy/libexec/whut-license-startup-gate.py /usr/local/libexec/whut-license-startup-gate
+sudo install -o root -g root -m 0755 deploy/bin/whut-license-runtime-attestation-audit /usr/local/sbin/whut-license-runtime-attestation-audit
 sudo systemctl daemon-reload
 sudo systemctl enable whut-license-server
 sudo systemctl start whut-license-server
@@ -116,7 +120,8 @@ sudo systemctl status whut-license-server
 
 - `WorkingDirectory=/opt/whut-campus-auto-login`
 - `EnvironmentFile=/etc/whut-campus-auto-login/license-server.env`
-- `/opt/whut-campus-auto-login/.venv/bin/uvicorn`
+- `/usr/local/libexec/whut-license-startup-gate`
+- `/opt/whut-campus-auto-login/.venv/bin/python -I -m uvicorn --app-dir /opt/whut-campus-auto-login`
 - `127.0.0.1:8787`
 
 查看日志：

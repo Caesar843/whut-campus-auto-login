@@ -7,18 +7,22 @@ from fastapi.testclient import TestClient
 from license_server.app import create_app
 from license_server.db import connect
 from license_server.device_proof import bearer_token, verify_device_proof_token
-from license_server.signer import sign_license_payload, verify_license_token_payload
+from license_server.signer import (
+    LicenseSigningIdentity,
+    sign_license_payload,
+    verify_license_token_payload,
+)
 from tests.license_server.test_license_server import _private_key_b64, _register_payload
 
 
 def test_valid_token_proves_device(tmp_path):
-    private_key_b64, token = _registered_token(tmp_path)
+    identity, token = _registered_token(tmp_path)
 
     with connect(tmp_path / "license.sqlite3") as connection:
         proof = verify_device_proof_token(
             connection,
             signed_license_token=token,
-            private_key_b64=private_key_b64,
+            signing_identity=identity,
         )
 
     assert proof.device_fingerprint_hash == "device-a"
@@ -26,14 +30,14 @@ def test_valid_token_proves_device(tmp_path):
 
 
 def test_tampered_token_is_rejected(tmp_path):
-    private_key_b64, token = _registered_token(tmp_path)
+    identity, token = _registered_token(tmp_path)
 
     with connect(tmp_path / "license.sqlite3") as connection:
         with pytest.raises(HTTPException) as exc_info:
             verify_device_proof_token(
                 connection,
                 signed_license_token=_tamper(token),
-                private_key_b64=private_key_b64,
+                signing_identity=identity,
             )
 
     assert exc_info.value.status_code == 401
@@ -41,48 +45,48 @@ def test_tampered_token_is_rejected(tmp_path):
 
 
 def test_malformed_non_ascii_token_is_rejected(tmp_path):
-    private_key_b64, _token = _registered_token(tmp_path)
+    identity, _token = _registered_token(tmp_path)
 
     with connect(tmp_path / "license.sqlite3") as connection:
         with pytest.raises(HTTPException) as exc_info:
             verify_device_proof_token(
                 connection,
                 signed_license_token="签名.invalid",
-                private_key_b64=private_key_b64,
+                signing_identity=identity,
             )
 
     assert exc_info.value.status_code == 401
 
 
 def test_wrong_product_token_is_rejected(tmp_path):
-    private_key_b64, token = _registered_token(tmp_path)
-    payload = verify_license_token_payload(token, private_key_b64=private_key_b64)
+    identity, token = _registered_token(tmp_path)
+    payload = verify_license_token_payload(token, identity=identity)
     payload["product_id"] = "other-product"
-    token = sign_license_payload(payload, private_key_b64=private_key_b64)
+    token = sign_license_payload(payload, identity=identity)
 
     with connect(tmp_path / "license.sqlite3") as connection:
         with pytest.raises(HTTPException) as exc_info:
             verify_device_proof_token(
                 connection,
                 signed_license_token=token,
-                private_key_b64=private_key_b64,
+                signing_identity=identity,
             )
 
     assert exc_info.value.status_code == 401
 
 
 def test_missing_device_hash_is_rejected(tmp_path):
-    private_key_b64, token = _registered_token(tmp_path)
-    payload = verify_license_token_payload(token, private_key_b64=private_key_b64)
+    identity, token = _registered_token(tmp_path)
+    payload = verify_license_token_payload(token, identity=identity)
     payload["device_fingerprint_hash"] = "missing-device"
-    token = sign_license_payload(payload, private_key_b64=private_key_b64)
+    token = sign_license_payload(payload, identity=identity)
 
     with connect(tmp_path / "license.sqlite3") as connection:
         with pytest.raises(HTTPException) as exc_info:
             verify_device_proof_token(
                 connection,
                 signed_license_token=token,
-                private_key_b64=private_key_b64,
+                signing_identity=identity,
             )
 
     assert exc_info.value.status_code == 401
@@ -90,45 +94,46 @@ def test_missing_device_hash_is_rejected(tmp_path):
 
 def test_license_id_must_belong_to_device(tmp_path):
     private_key_b64 = _private_key_b64()
+    identity = LicenseSigningIdentity(private_key_b64)
     client = _proof_client(tmp_path, private_key_b64)
     first = client.post("/device/register", json=_register_payload("device-a")).json()
     second = client.post("/device/register", json=_register_payload("device-b")).json()
     payload = verify_license_token_payload(
         first["signed_license_token"],
-        private_key_b64=private_key_b64,
+        identity=identity,
     )
     payload["license_id"] = second["license_id"]
-    token = sign_license_payload(payload, private_key_b64=private_key_b64)
+    token = sign_license_payload(payload, identity=identity)
 
     with connect(tmp_path / "license.sqlite3") as connection:
         with pytest.raises(HTTPException) as exc_info:
             verify_device_proof_token(
                 connection,
                 signed_license_token=token,
-                private_key_b64=private_key_b64,
+                signing_identity=identity,
             )
 
     assert exc_info.value.status_code == 401
 
 
 def test_expired_trial_token_can_still_prove_device(tmp_path):
-    private_key_b64, token = _registered_token(tmp_path)
-    payload = verify_license_token_payload(token, private_key_b64=private_key_b64)
+    identity, token = _registered_token(tmp_path)
+    payload = verify_license_token_payload(token, identity=identity)
     payload["expires_at"] = _time_text(datetime.now(timezone.utc) - timedelta(days=1))
-    token = sign_license_payload(payload, private_key_b64=private_key_b64)
+    token = sign_license_payload(payload, identity=identity)
 
     with connect(tmp_path / "license.sqlite3") as connection:
         proof = verify_device_proof_token(
             connection,
             signed_license_token=token,
-            private_key_b64=private_key_b64,
+            signing_identity=identity,
         )
 
     assert proof.device_fingerprint_hash == "device-a"
 
 
 def test_revoked_license_is_rejected(tmp_path):
-    private_key_b64, token = _registered_token(tmp_path)
+    identity, token = _registered_token(tmp_path)
     with connect(tmp_path / "license.sqlite3") as connection:
         connection.execute("UPDATE licenses SET status = 'revoked'")
         connection.commit()
@@ -138,7 +143,7 @@ def test_revoked_license_is_rejected(tmp_path):
             verify_device_proof_token(
                 connection,
                 signed_license_token=token,
-                private_key_b64=private_key_b64,
+                signing_identity=identity,
             )
 
     assert exc_info.value.status_code == 403
@@ -157,7 +162,7 @@ def _registered_token(tmp_path):
     private_key_b64 = _private_key_b64()
     client = _proof_client(tmp_path, private_key_b64)
     payload = client.post("/device/register", json=_register_payload()).json()
-    return private_key_b64, payload["signed_license_token"]
+    return LicenseSigningIdentity(private_key_b64), payload["signed_license_token"]
 
 
 def _tamper(token: str) -> str:

@@ -13,7 +13,12 @@ from license_server.license_service import (
     create_license,
     latest_license,
 )
-from license_server.signer import datetime_text, sign_license_payload, utc_now_text
+from license_server.signer import (
+    LicenseSigningIdentity,
+    datetime_text,
+    sign_license_payload,
+    utc_now_text,
+)
 
 
 LEGACY_DEVICE_DESCRIPTION_FIELDS = {"device_name", "os", "app_version"}
@@ -46,7 +51,7 @@ class LicenseRefreshRequest(BaseModel):
 def create_router(
     *,
     database_path: Path,
-    private_key_b64: str,
+    signing_identity: LicenseSigningIdentity,
     payment_amount: str,
     payment_currency: str,
     payment_channels: tuple[str, ...],
@@ -114,7 +119,7 @@ def create_router(
             product_id=request.product_id,
             device_fingerprint_hash=request.device_fingerprint_hash,
             license_row=license_row,
-            private_key_b64=private_key_b64,
+            signing_identity=signing_identity,
         )
 
     @router.post("/license/refresh")
@@ -140,7 +145,7 @@ def create_router(
             product_id=request.product_id,
             device_fingerprint_hash=request.device_fingerprint_hash,
             license_row=license_row,
-            private_key_b64=private_key_b64,
+            signing_identity=signing_identity,
         )
 
     return router
@@ -162,7 +167,13 @@ def _drop_legacy_device_description_fields(data: Any) -> Any:
     }
 
 
-def _license_response(*, product_id: str, device_fingerprint_hash: str, license_row, private_key_b64: str):
+def _license_response(
+    *,
+    product_id: str,
+    device_fingerprint_hash: str,
+    license_row,
+    signing_identity: LicenseSigningIdentity,
+):
     expires_at = str(license_row["expires_at"])
     payload = {
         "product_id": product_id,
@@ -174,7 +185,10 @@ def _license_response(*, product_id: str, device_fingerprint_hash: str, license_
         "expires_at": expires_at,
         "features": ["auto_login"],
     }
-    signed_license_token = sign_license_payload(payload, private_key_b64=private_key_b64)
+    signed_license_token = sign_license_payload(
+        payload,
+        identity=signing_identity,
+    )
     return {
         "status": _response_status(str(license_row["license_type"]), str(license_row["status"]), expires_at),
         "product_id": product_id,

@@ -17,7 +17,10 @@ from cryptography.hazmat.primitives.serialization import (
 )
 
 from license_client.constants import PRICE_AMOUNT, PRICE_CURRENCY
-from license_server.ed25519_keys import Ed25519KeyFormatError, load_private_key_b64
+from license_server.ed25519_keys import (
+    Ed25519KeyFormatError,
+    validate_private_key_b64_text,
+)
 from license_server.payment import ANNUAL_V1
 
 if TYPE_CHECKING:
@@ -104,6 +107,8 @@ class LicenseServerConfig:
     admin_enabled: bool
     admin_operator_name: str
     admin_access_token_sha256: str | None
+    runtime_attestation_enabled: bool
+    runtime_source_commit: str | None
 
 
 def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
@@ -136,6 +141,9 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
         raise RuntimeError("PAYMENT_RECONCILIATION_WORKER_PROVIDER_UNAVAILABLE")
     reconciliation_worker_policy, reconciliation_policy = (
         _payment_reconciliation_policies_from_env(values)
+    )
+    runtime_attestation_enabled, runtime_source_commit = (
+        _runtime_attestation_from_env(values, environment)
     )
     return LicenseServerConfig(
         environment=environment,
@@ -171,6 +179,8 @@ def load_config(env: Mapping[str, str] | None = None) -> LicenseServerConfig:
         admin_enabled=_admin_enabled_from_env(values),
         admin_operator_name=values.get("ADMIN_OPERATOR_NAME", "").strip(),
         admin_access_token_sha256=_admin_access_token_sha256_from_env(values),
+        runtime_attestation_enabled=runtime_attestation_enabled,
+        runtime_source_commit=runtime_source_commit,
     )
 
 
@@ -181,7 +191,7 @@ def is_production_environment(env: Mapping[str, str] | None = None) -> bool:
 
 def validate_private_key_b64(private_key_b64: str, *, source: str = "LICENSE_PRIVATE_KEY") -> None:
     try:
-        load_private_key_b64(private_key_b64, source=source)
+        validate_private_key_b64_text(private_key_b64, source=source)
     except Ed25519KeyFormatError as exc:
         raise RuntimeError(str(exc)) from exc
 
@@ -445,6 +455,38 @@ def _boolean_from_env(values: Mapping[str, str], name: str) -> bool:
     if raw_value in FALSE_VALUES:
         return False
     raise RuntimeError(f"{name} must be true or false.")
+
+
+def _runtime_attestation_from_env(
+    values: Mapping[str, str],
+    environment: str,
+) -> tuple[bool, str | None]:
+    enabled = _boolean_from_env(
+        values,
+        "LICENSE_RUNTIME_ATTESTATION_ENABLED",
+    )
+    if not enabled:
+        return False, None
+    if environment != "production":
+        raise RuntimeError(
+            "LICENSE_RUNTIME_ATTESTATION_ENABLED requires production."
+        )
+    source_commit = values.get("LICENSE_RUNTIME_SOURCE_COMMIT", "").strip()
+    if (
+        len(source_commit) != 40
+        or not source_commit.isascii()
+        or any(character not in "0123456789abcdef" for character in source_commit)
+    ):
+        raise RuntimeError(
+            "LICENSE_RUNTIME_SOURCE_COMMIT must be a 40-character lowercase "
+            "Git commit."
+        )
+    from license_server.runtime_attestation import (
+        require_supported_production_platform,
+    )
+
+    require_supported_production_platform()
+    return True, source_commit
 
 
 def _payment_notification_worker_poll_seconds_from_env(

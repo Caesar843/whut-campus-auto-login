@@ -40,6 +40,7 @@ from license_server.payment_service import (
     create_or_restore_order,
 )
 from license_server.signer import datetime_text
+from license_server.signer import LicenseSigningIdentity
 
 
 _REFRESH_INTERVAL_SECONDS = 10
@@ -76,7 +77,7 @@ class PaymentRefreshRequest(BaseModel):
 def create_payment_router(
     *,
     database_path: Path,
-    private_key_b64: str,
+    signing_identity: LicenseSigningIdentity,
     payment_provider: str | None,
     payment_mock_admin_token: str | None,
     gateway: PaymentGateway | None,
@@ -105,7 +106,7 @@ def create_payment_router(
         proof = _proof(
             database_path,
             authorization=authorization,
-            private_key_b64=private_key_b64,
+            signing_identity=signing_identity,
         )
         try:
             result = create_or_restore_order(
@@ -129,7 +130,7 @@ def create_payment_router(
         proof = _proof(
             database_path,
             authorization=authorization,
-            private_key_b64=private_key_b64,
+            signing_identity=signing_identity,
         )
         try:
             result = _read_order_for_device(
@@ -153,7 +154,7 @@ def create_payment_router(
             proof = _proof(
                 database_path,
                 authorization=authorization,
-                private_key_b64=private_key_b64,
+                signing_identity=signing_identity,
             )
             try:
                 order = _read_order_for_device(
@@ -330,12 +331,17 @@ def _require_payment_provider(
         raise HTTPException(status_code=503, detail="payment_provider_not_configured")
 
 
-def _proof(database_path: Path, *, authorization: str, private_key_b64: str):
+def _proof(
+    database_path: Path,
+    *,
+    authorization: str,
+    signing_identity: LicenseSigningIdentity,
+):
     with connect(database_path) as connection:
         return verify_device_proof_token(
             connection,
             signed_license_token=bearer_token(authorization),
-            private_key_b64=private_key_b64,
+            signing_identity=signing_identity,
         )
 
 
