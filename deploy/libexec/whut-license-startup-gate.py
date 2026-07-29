@@ -152,6 +152,9 @@ def walk_trusted_tree(root: Path) -> tuple[Path, ...]:
             if _is_venv_python_alias(path):
                 checked.extend(validate_venv_python_alias(path))
                 continue
+            if _is_venv_lib64_alias(path):
+                checked.extend(validate_venv_lib64_alias(path))
+                continue
             raise GateError("symlink_insecure")
         kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "file"
         checked.append(validate_path(path, kind=kind))
@@ -173,6 +176,37 @@ def validate_venv_python_alias(path: Path) -> tuple[Path, ...]:
     if not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0:
         raise GateError("venv_python_insecure")
     return validate_executable_chain(path)
+
+
+def _is_venv_lib64_alias(path: Path) -> bool:
+    return path == VENV_ROOT / "lib64"
+
+
+def validate_venv_lib64_alias(path: Path) -> tuple[Path, ...]:
+    if path != VENV_ROOT / "lib64":
+        raise GateError("symlink_insecure")
+    try:
+        metadata = os.lstat(path)
+        raw_target = os.readlink(path)
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise GateError("venv_lib64_insecure") from exc
+
+    if not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0:
+        raise GateError("venv_lib64_insecure")
+    if raw_target != "lib":
+        raise GateError("venv_lib64_insecure")
+    if resolved != VENV_ROOT / "lib":
+        raise GateError("venv_lib64_insecure")
+
+    target_metadata = os.lstat(resolved)
+    if not stat.S_ISDIR(target_metadata.st_mode):
+        raise GateError("venv_lib64_insecure")
+
+    checked = list(validate_ancestor_chain(resolved.parent))
+    checked.append(path)
+    checked.append(validate_path(resolved, kind="directory"))
+    return tuple(dict.fromkeys(checked))
 
 
 def validate_venv_python_chain() -> tuple[Path, ...]:

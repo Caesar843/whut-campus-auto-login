@@ -211,6 +211,266 @@ def test_walk_keeps_validated_venv_alias_target_chain(tmp_path, monkeypatch):
     not sys.platform.startswith("linux"),
     reason="requires Linux symbolic links",
 )
+def test_walk_accepts_valid_venv_lib64_alias(tmp_path, monkeypatch):
+    gate = _gate()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    lib64 = tmp_path / "lib64"
+    lib64.symlink_to("lib")
+
+    real_lstat = gate.os.lstat
+
+    class RootOwnedStat:
+        def __init__(self, original):
+            self._original = original
+            self.st_uid = 0
+
+        def __getattr__(self, name):
+            return getattr(self._original, name)
+
+    def fake_lstat(path):
+        result = real_lstat(path)
+        if Path(path) == lib64:
+            return RootOwnedStat(result)
+        return result
+
+    monkeypatch.setattr(gate.os, "lstat", fake_lstat)
+    monkeypatch.setattr(gate, "VENV_ROOT", tmp_path)
+    monkeypatch.setattr(
+        gate,
+        "validate_path",
+        lambda path, *, kind: Path(path),
+    )
+    monkeypatch.setattr(
+        gate,
+        "validate_ancestor_chain",
+        lambda path: (path,),
+    )
+
+    checked = gate.walk_trusted_tree(tmp_path)
+
+    assert lib64 in checked
+    assert lib_dir in checked
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_lib64_alias_rejects_non_root_owner(tmp_path, monkeypatch):
+    gate = _gate()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    lib64 = tmp_path / "lib64"
+    lib64.symlink_to("lib")
+
+    real_lstat = gate.os.lstat
+
+    class NonRootStat:
+        def __init__(self, original):
+            self._original = original
+            self.st_uid = 1000
+
+        def __getattr__(self, name):
+            return getattr(self._original, name)
+
+    def fake_lstat(path):
+        result = real_lstat(path)
+        if Path(path) == lib64:
+            return NonRootStat(result)
+        return result
+
+    monkeypatch.setattr(gate.os, "lstat", fake_lstat)
+    monkeypatch.setattr(gate, "VENV_ROOT", tmp_path)
+
+    with pytest.raises(gate.GateError, match="venv_lib64_insecure"):
+        gate.validate_venv_lib64_alias(lib64)
+
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_lib64_alias_rejects_absolute_target(tmp_path, monkeypatch):
+    gate = _gate()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    lib64 = tmp_path / "lib64"
+    lib64.symlink_to(str(lib_dir))
+
+    monkeypatch.setattr(gate, "VENV_ROOT", tmp_path)
+
+    with pytest.raises(gate.GateError, match="venv_lib64_insecure"):
+        gate.validate_venv_lib64_alias(lib64)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_lib64_alias_rejects_parent_traversal(tmp_path, monkeypatch):
+    gate = _gate()
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    fake_venv = inner
+    lib64 = inner / "lib64"
+    lib64.symlink_to("../lib")
+
+    monkeypatch.setattr(gate, "VENV_ROOT", fake_venv)
+
+    with pytest.raises(gate.GateError, match="venv_lib64_insecure"):
+        gate.validate_venv_lib64_alias(lib64)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_lib64_alias_rejects_wrong_target_name(tmp_path, monkeypatch):
+    gate = _gate()
+    other = tmp_path / "other"
+    other.mkdir()
+    lib64 = tmp_path / "lib64"
+    lib64.symlink_to("other")
+
+    monkeypatch.setattr(gate, "VENV_ROOT", tmp_path)
+
+    with pytest.raises(gate.GateError, match="venv_lib64_insecure"):
+        gate.validate_venv_lib64_alias(lib64)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+@pytest.mark.parametrize("link_kind", ("dangling", "loop"))
+def test_lib64_alias_rejects_unresolvable(tmp_path, monkeypatch, link_kind):
+    gate = _gate()
+    lib64 = tmp_path / "lib64"
+    if link_kind == "dangling":
+        lib64.symlink_to("lib")
+    else:
+        lib64.symlink_to("lib64")
+
+    monkeypatch.setattr(gate, "VENV_ROOT", tmp_path)
+
+    with pytest.raises(gate.GateError, match="venv_lib64_insecure"):
+        gate.validate_venv_lib64_alias(lib64)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_lib64_alias_rejected_outside_venv(tmp_path, monkeypatch):
+    gate = _gate()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    lib64 = tmp_path / "lib64"
+    lib64.symlink_to("lib")
+
+    monkeypatch.setattr(gate, "VENV_ROOT", tmp_path / "other-venv")
+
+    monkeypatch.setattr(
+        gate,
+        "validate_path",
+        lambda path, *, kind: Path(path),
+    )
+
+    with pytest.raises(gate.GateError, match="symlink_insecure"):
+        gate.walk_trusted_tree(tmp_path)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_lib64_alias_rejects_target_that_is_file(tmp_path, monkeypatch):
+    gate = _gate()
+    lib_file = tmp_path / "lib"
+    lib_file.write_text("not a directory\n", encoding="utf-8")
+    lib64 = tmp_path / "lib64"
+    lib64.symlink_to("lib")
+
+    monkeypatch.setattr(gate, "VENV_ROOT", tmp_path)
+
+    with pytest.raises(gate.GateError, match="venv_lib64_insecure"):
+        gate.validate_venv_lib64_alias(lib64)
+
+
+def test_lib64_alias_rejects_group_writable_target(monkeypatch):
+    gate = _gate()
+    lib64 = Path("/opt/whut-campus-auto-login/.venv/lib64")
+
+    def fake_lstat(path):
+        path = Path(path)
+        if path == lib64:
+            return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0)
+        return SimpleNamespace(st_mode=stat.S_IFDIR | 0o775, st_uid=0)
+
+    monkeypatch.setattr(gate.os, "lstat", fake_lstat)
+    monkeypatch.setattr(gate.os, "readlink", lambda _p: "lib")
+    monkeypatch.setattr(
+        gate.Path,
+        "resolve",
+        lambda self, *, strict=False: gate.VENV_ROOT / "lib",
+    )
+    monkeypatch.setattr(
+        gate,
+        "validate_ancestor_chain",
+        lambda path: (path,),
+    )
+
+    with pytest.raises(gate.GateError, match="path_insecure"):
+        gate.validate_venv_lib64_alias(lib64)
+
+
+def test_lib64_alias_rejects_other_writable_target(monkeypatch):
+    gate = _gate()
+    lib64 = Path("/opt/whut-campus-auto-login/.venv/lib64")
+
+    def fake_lstat(path):
+        path = Path(path)
+        if path == lib64:
+            return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0)
+        return SimpleNamespace(st_mode=stat.S_IFDIR | 0o757, st_uid=0)
+
+    monkeypatch.setattr(gate.os, "lstat", fake_lstat)
+    monkeypatch.setattr(gate.os, "readlink", lambda _p: "lib")
+    monkeypatch.setattr(
+        gate.Path,
+        "resolve",
+        lambda self, *, strict=False: gate.VENV_ROOT / "lib",
+    )
+    monkeypatch.setattr(
+        gate,
+        "validate_ancestor_chain",
+        lambda path: (path,),
+    )
+
+    with pytest.raises(gate.GateError, match="path_insecure"):
+        gate.validate_venv_lib64_alias(lib64)
+
+
+def test_other_symlink_still_rejected_with_lib64_support(monkeypatch):
+    gate = _gate()
+
+    monkeypatch.setattr(
+        gate.os,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0),
+    )
+
+    with pytest.raises(gate.GateError, match="path_insecure"):
+        gate.validate_path(Path("/some/other/link"), kind="file")
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
 @pytest.mark.parametrize("link_kind", ("dangling", "loop"))
 def test_executable_chain_rejects_unresolvable_symlink(
     tmp_path,
