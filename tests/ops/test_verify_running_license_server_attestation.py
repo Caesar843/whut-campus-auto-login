@@ -231,3 +231,196 @@ def test_root_controlled_path_rejects_symlink_nonroot_and_unsafe_mode(
         ),
     )
     ops._validate_root_controlled_path(path, kind="file")
+
+
+def test_validate_resolved_executable_unit_checks(monkeypatch):
+    ops = _ops()
+    link = ops.Path("/opt/whut-campus-auto-login/.venv/bin/python")
+    target = ops.Path("/usr/bin/python3.12")
+
+    monkeypatch.setattr(ops, "_validate_root_parent_chain", lambda _p: None)
+    monkeypatch.setattr(ops, "_validate_root_controlled_path", lambda _p, kind: None)
+
+    def fake_resolve(path, strict=False):
+        return target
+
+    monkeypatch.setattr(ops.Path, "resolve", fake_resolve)
+
+    def fake_lstat(path):
+        p = ops.Path(path)
+        if p == link:
+            return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0)
+        elif p == target:
+            return SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+        raise FileNotFoundError
+
+    monkeypatch.setattr(ops.os, "lstat", fake_lstat)
+    monkeypatch.setattr(ops.os, "readlink", lambda _p: "/usr/bin/python3.12")
+
+    ops._validate_resolved_executable(link)
+
+    # Non-root symlink in chain rejected
+    def fake_lstat_non_root(path):
+        p = ops.Path(path)
+        if p == link:
+            return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=1000)
+        return SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+
+    monkeypatch.setattr(ops.os, "lstat", fake_lstat_non_root)
+    with pytest.raises(ops.AuditError, match="executable_path_insecure"):
+        ops._validate_resolved_executable(link)
+
+    # Writable target file rejected
+    def fake_lstat_writable_target(path):
+        p = ops.Path(path)
+        if p == link:
+            return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0)
+        return SimpleNamespace(st_mode=stat.S_IFREG | 0o777, st_uid=0)
+
+    monkeypatch.setattr(ops.os, "lstat", fake_lstat_writable_target)
+    with pytest.raises(ops.AuditError, match="executable_path_insecure"):
+        ops._validate_resolved_executable(link)
+
+    # Non-executable target file rejected (no 0100 bit)
+    def fake_lstat_no_exec_target(path):
+        p = ops.Path(path)
+        if p == link:
+            return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0)
+        return SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0)
+
+    monkeypatch.setattr(ops.os, "lstat", fake_lstat_no_exec_target)
+    with pytest.raises(ops.AuditError, match="executable_path_insecure"):
+        ops._validate_resolved_executable(link)
+
+
+@pytest.mark.skipif(
+    not __import__("sys").platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_validate_resolved_executable_accepts_valid_venv_chain(tmp_path, monkeypatch):
+    ops = _ops()
+    usr_bin = tmp_path / "usr/bin"
+    usr_bin.mkdir(parents=True)
+    target = usr_bin / "python3.12"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o755)
+
+    venv_bin = tmp_path / "opt/app/.venv/bin"
+    venv_bin.mkdir(parents=True)
+    python3_link = venv_bin / "python3"
+    python3_link.symlink_to(target)
+    python_link = venv_bin / "python"
+    python_link.symlink_to("python3")
+
+    monkeypatch.setattr(ops, "_validate_root_parent_chain", lambda _p: None)
+    monkeypatch.setattr(ops, "_validate_root_controlled_path", lambda _p, kind: None)
+
+    real_lstat = ops.os.lstat
+
+    class RootOwnedStat:
+        def __init__(self, original):
+            self._original = original
+            self.st_uid = 0
+
+        def __getattr__(self, name):
+            return getattr(self._original, name)
+
+    def fake_lstat(path):
+        res = real_lstat(path)
+        return RootOwnedStat(res)
+
+    monkeypatch.setattr(ops.os, "lstat", fake_lstat)
+
+    ops._validate_resolved_executable(python_link)
+
+
+@pytest.mark.skipif(
+    not __import__("sys").platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_validate_resolved_executable_rejects_non_root_symlink_in_chain(tmp_path, monkeypatch):
+    ops = _ops()
+    usr_bin = tmp_path / "usr/bin"
+    usr_bin.mkdir(parents=True)
+    target = usr_bin / "python3.12"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    venv_bin = tmp_path / "opt/app/.venv/bin"
+    venv_bin.mkdir(parents=True)
+    python_link = venv_bin / "python"
+    python_link.symlink_to(target)
+
+    monkeypatch.setattr(ops, "_validate_root_parent_chain", lambda _p: None)
+    monkeypatch.setattr(ops, "_validate_root_controlled_path", lambda _p, kind: None)
+
+    real_lstat = ops.os.lstat
+
+    class NonRootStat:
+        def __init__(self, original):
+            self._original = original
+            self.st_uid = 1000
+
+        def __getattr__(self, name):
+            return getattr(self._original, name)
+
+    def fake_lstat(path):
+        res = real_lstat(path)
+        if ops.Path(path) == python_link:
+            return NonRootStat(res)
+        return res
+
+    monkeypatch.setattr(ops.os, "lstat", fake_lstat)
+
+    with pytest.raises(ops.AuditError, match="executable_path_insecure"):
+        ops._validate_resolved_executable(python_link)
+
+
+@pytest.mark.skipif(
+    not __import__("sys").platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_validate_resolved_executable_rejects_dangling_and_loop_symlinks(tmp_path, monkeypatch):
+    ops = _ops()
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to("nonexistent")
+
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+
+    monkeypatch.setattr(ops, "_validate_root_parent_chain", lambda _p: None)
+    monkeypatch.setattr(ops, "_validate_root_controlled_path", lambda _p, kind: None)
+
+    with pytest.raises(ops.AuditError, match="executable_path_invalid"):
+        ops._validate_resolved_executable(dangling)
+
+    with pytest.raises(ops.AuditError, match="executable_path_invalid"):
+        ops._validate_resolved_executable(loop)
+
+
+@pytest.mark.skipif(
+    not __import__("sys").platform.startswith("linux"),
+    reason="requires Linux symbolic links",
+)
+def test_validate_resolved_executable_rejects_unsafe_target(tmp_path, monkeypatch):
+    ops = _ops()
+    target_dir = tmp_path / "target_dir"
+    target_dir.mkdir()
+    link_to_dir = tmp_path / "link_to_dir"
+    link_to_dir.symlink_to(target_dir)
+
+    monkeypatch.setattr(ops, "_validate_root_parent_chain", lambda _p: None)
+
+    real_lstat = ops.os.lstat
+
+    class RootOwnedStat:
+        def __init__(self, original):
+            self._original = original
+            self.st_uid = 0
+
+        def __getattr__(self, name):
+            return getattr(self._original, name)
+
+    monkeypatch.setattr(ops.os, "lstat", lambda p: RootOwnedStat(real_lstat(p)))
+
+    with pytest.raises(ops.AuditError, match="executable_path_insecure"):
+        ops._validate_resolved_executable(link_to_dir)

@@ -465,17 +465,47 @@ def _validate_root_controlled_path(path: Path, *, kind: str) -> None:
 
 def _validate_resolved_executable(path: Path) -> None:
     try:
-        metadata = os.lstat(path)
         resolved = path.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise AuditError("executable_path_invalid") from exc
-    if (
-        metadata.st_uid != 0
-        or metadata.st_mode & 0o022
-        or not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode))
-    ):
-        raise AuditError("executable_path_insecure")
-    _validate_root_parent_chain(path.parent)
+
+    current = path
+    visited = set()
+    while True:
+        if current in visited or len(visited) >= 40:
+            raise AuditError("executable_path_invalid")
+        visited.add(current)
+
+        try:
+            metadata = os.lstat(current)
+        except OSError as exc:
+            raise AuditError("executable_path_invalid") from exc
+
+        if metadata.st_uid != 0:
+            raise AuditError("executable_path_insecure")
+
+        _validate_root_parent_chain(current.parent)
+
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                target_str = os.readlink(current)
+            except OSError as exc:
+                raise AuditError("executable_path_invalid") from exc
+            target_path = Path(target_str)
+            if not target_path.is_absolute():
+                current = current.parent / target_path
+            else:
+                current = target_path
+        elif stat.S_ISREG(metadata.st_mode):
+            if (
+                metadata.st_mode & 0o022
+                or not (metadata.st_mode & 0o100)
+            ):
+                raise AuditError("executable_path_insecure")
+            break
+        else:
+            raise AuditError("executable_path_insecure")
+
     _validate_root_controlled_path(resolved, kind="executable")
     _validate_root_parent_chain(resolved.parent)
 
