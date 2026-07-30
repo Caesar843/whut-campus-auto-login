@@ -135,7 +135,7 @@ def test_committed_windows_lock_is_exact_complete_and_normalized_sorted():
     assert len(names) == len(set(names))
     assert locked["pyinstaller"] == "6.21.0"
     assert locked["pyside6"] == "6.11.1"
-    assert locked["pytest"] == "9.1.1"
+    assert "pytest" not in locked
     assert locked["cryptography"] == "48.0.1"
     assert locked["requests"] == "2.34.2"
     assert {"pyside6-addons", "pyside6-essentials", "shiboken6"} <= set(locked)
