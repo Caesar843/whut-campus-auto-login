@@ -57,3 +57,9 @@ references/
 .pytest-temp/
 .pytest-basetemp*/
 .pytest-runtime-temp*/
+
+# Inno Setup compiled installer output (binary output, not source)
+installer/output/
+
+# Local Windows build virtual environment
+/.venv-build/
