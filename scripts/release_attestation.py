@@ -480,32 +480,98 @@ def read_pyinstaller_module_names(exe_path: Path) -> set[str]:
         raise AttestationError("PyInstaller archive module inventory is unavailable") from exc
 
 
-_CONTENT_MARKERS = {
-    "private_key_marker": (
-        b"-----BEGIN PRIVATE KEY-----",
-        b"-----BEGIN OPENSSH PRIVATE KEY-----",
-        b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
-        b"-----BEGIN RSA PRIVATE KEY-----",
-        b"-----BEGIN EC PRIVATE KEY-----",
-        b"Ed25519PrivateKey",
-    ),
-    "credential_marker": (b"LICENSE_PRIVATE_KEY", b"CAMPUS_PASSWORD", b"Credential Manager"),
-    "absolute_path": (b"C:\\Users\\", b"/home/", b"/Users/"),
-    "environment_dump": (b"PATH=", b"USERPROFILE=", b"HOME="),
+MAX_ZIP_MEMBERS = 1000
+MAX_ZIP_MEMBER_SIZE_BYTES = 50 * 1024 * 1024
+MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+
+_BINARY_EXTENSIONS = {
+    ".dll", ".exe", ".pyd", ".so", ".dylib", ".dat", ".bin",
+    ".ico", ".png", ".jpg", ".jpeg", ".ttf", ".woff", ".woff2",
 }
 
+_PEM_PRIVATE_KEY_REGEX = re.compile(
+    b"-----BEGIN (?:RSA |EC |ENCRYPTED |OPENSSH )?PRIVATE KEY-----[^\\x00]{16,4096}?-----END (?:RSA |EC |ENCRYPTED |OPENSSH )?PRIVATE KEY-----"
+)
 
-def _contains_marker(path: Path, markers: Iterable[bytes]) -> bool:
-    marker_values = tuple(markers)
-    tail = b""
-    limit = max(map(len, marker_values)) - 1
+_SENSITIVE_ASSIGNMENT_REGEX = re.compile(
+    b"(?:LICENSE_PRIVATE_KEY|CAMPUS_PASSWORD)\\s*=\\s*['\"][^'\"]+['\"]|(?:LICENSE_PRIVATE_KEY|CAMPUS_PASSWORD)=[^\\s\\x00\\r\\n]{3,}"
+)
+
+_PROJECT_ABSOLUTE_PATH_REGEX = re.compile(
+    b"(?:[A-Za-z]:[/\\\\]+(?:Users|home)[/\\\\]+|/home/|/Users/)[^\\s\\x00\\r\\n]*whut-campus-auto-login|/etc/whut-campus-auto-login|/var/lib/whut-campus-auto-login",
+    re.IGNORECASE,
+)
+
+_TEXT_ABSOLUTE_PATH_REGEX = re.compile(
+    b"(?:[A-Za-z]:[/\\\\]+Users[/\\\\]+|/home/|/Users/)(?:[^\\s\\x00\\r\\n]*whut-campus-auto-login|lenovo[/\\\\]+Desktop[/\\\\]+whut-campus-auto-login)",
+    re.IGNORECASE,
+)
+
+_ENV_DUMP_KEYS = [
+    re.compile(b"(?:^|[\\r\\n\\x00])PATH=[^\\r\\n\\x00]+"),
+    re.compile(b"(?:^|[\\r\\n\\x00])(?:USERPROFILE|HOME)=[^\\r\\n\\x00]+"),
+    re.compile(b"(?:^|[\\r\\n\\x00])(?:SYSTEMROOT|SHELL|TMP|TEMP)=[^\\r\\n\\x00]+"),
+]
+
+
+def _is_binary_path(path: Path) -> bool:
+    return path.suffix.casefold() in _BINARY_EXTENSIONS
+
+
+def _read_file_head_tail(path: Path, max_bytes: int = 10 * 1024 * 1024) -> bytes:
+    file_size = path.stat().st_size
+    if file_size <= max_bytes:
+        return path.read_bytes()
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            data = tail + chunk
-            if any(marker in data for marker in marker_values):
-                return True
-            tail = data[-limit:] if limit else b""
-    return False
+        head = stream.read(max_bytes // 2)
+        stream.seek(max(0, file_size - (max_bytes // 2)))
+        tail = stream.read(max_bytes // 2)
+        return head + b"\n...\n" + tail
+
+
+def _check_content_category(path: Path) -> list[str]:
+    categories = []
+    data = _read_file_head_tail(path)
+    is_binary = _is_binary_path(path)
+
+    # 1. private_key_marker
+    if _PEM_PRIVATE_KEY_REGEX.search(data):
+        categories.append("private_key_marker")
+    elif not is_binary:
+        if b"Ed25519PrivateKey" in data:
+            categories.append("private_key_marker")
+        else:
+            for pem_boundary in (
+                b"-----BEGIN PRIVATE KEY-----",
+                b"-----BEGIN OPENSSH PRIVATE KEY-----",
+                b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+                b"-----BEGIN RSA PRIVATE KEY-----",
+                b"-----BEGIN EC PRIVATE KEY-----",
+            ):
+                if pem_boundary in data:
+                    categories.append("private_key_marker")
+                    break
+
+    # 2. credential_marker
+    if _SENSITIVE_ASSIGNMENT_REGEX.search(data):
+        categories.append("credential_marker")
+    elif not is_binary and (b"LICENSE_PRIVATE_KEY" in data or b"CAMPUS_PASSWORD" in data):
+        categories.append("credential_marker")
+
+    # 3. absolute_path
+    if is_binary:
+        if _PROJECT_ABSOLUTE_PATH_REGEX.search(data):
+            categories.append("absolute_path")
+    else:
+        if _PROJECT_ABSOLUTE_PATH_REGEX.search(data) or _TEXT_ABSOLUTE_PATH_REGEX.search(data):
+            categories.append("absolute_path")
+
+    # 4. environment_dump
+    matches = sum(1 for p in _ENV_DUMP_KEYS if p.search(data))
+    if matches >= 2:
+        categories.append("environment_dump")
+
+    return categories
 
 
 def scan_forbidden_content(root: Path) -> list[dict[str, Any]]:
@@ -527,9 +593,15 @@ def scan_forbidden_content(root: Path) -> list[dict[str, Any]]:
             categories.append("disallowed_source_tree")
         if "token" in filename or "credential" in filename:
             categories.append("token_or_credential_file")
-        for category, markers in _CONTENT_MARKERS.items():
-            if _contains_marker(root / Path(relative_path), markers):
-                categories.append(category)
+
+        file_path = root / Path(relative_path)
+        if filename.endswith(".zip"):
+            zip_findings = scan_zip_forbidden_content(file_path)
+            for zf in zip_findings:
+                categories.append(zf["category"])
+        else:
+            categories.extend(_check_content_category(file_path))
+
         findings.extend({"category": category, "count": 1, "relative_path": relative_path} for category in sorted(set(categories)))
     return sorted(findings, key=lambda item: (item["category"], item["relative_path"]))
 
@@ -537,16 +609,31 @@ def scan_forbidden_content(root: Path) -> list[dict[str, Any]]:
 def scan_zip_forbidden_content(zip_path: Path) -> list[dict[str, Any]]:
     findings = []
     with zipfile.ZipFile(zip_path) as archive:
-        for member in sorted(_validate_zip_member_names(archive.namelist())):
-            if member.endswith("/"):
+        members = archive.infolist()
+        if len(members) > MAX_ZIP_MEMBERS:
+            raise AttestationError("ZIP archive exceeds member count limit")
+        total_uncompressed = sum(info.file_size for info in members)
+        if total_uncompressed > MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES:
+            raise AttestationError("ZIP archive exceeds total uncompressed size limit")
+
+        checked_names = set(_validate_zip_member_names(archive.namelist()))
+        for info in sorted(members, key=lambda item: item.filename):
+            if info.filename not in checked_names or info.filename.endswith("/"):
                 continue
+            if info.file_size > MAX_ZIP_MEMBER_SIZE_BYTES:
+                raise AttestationError("ZIP member exceeds uncompressed size limit")
+
             temporary = tempfile.TemporaryDirectory()
             try:
-                path = Path(temporary.name) / member
+                path = Path(temporary.name) / info.filename
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(member) as source, path.open("wb") as destination:
+                with archive.open(info.filename) as source, path.open("wb") as destination:
                     shutil.copyfileobj(source, destination, length=1024 * 1024)
-                findings.extend(scan_forbidden_content(Path(temporary.name)))
+                member_findings = scan_forbidden_content(Path(temporary.name))
+                for mf in member_findings:
+                    if mf["category"] == "exposed_bytecode":
+                        continue
+                    findings.append({"category": mf["category"], "count": 1, "relative_path": info.filename})
             finally:
                 temporary.cleanup()
     return findings

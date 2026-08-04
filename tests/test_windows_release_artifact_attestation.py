@@ -561,3 +561,179 @@ def _cli_args(onedir: Path, staging: Path) -> list[str]:
         "--python-version", "3.11.9",
         "--pyinstaller-version", "6.21.0",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Content-Aware Scanner TDD Tests (Requirements 1-20)
+# ---------------------------------------------------------------------------
+
+def test_1_text_full_pem_private_key_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "key.pem").write_text("-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC...\n-----END PRIVATE KEY-----", encoding="utf-8")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "private_key_marker" and item["relative_path"] == "key.pem" for item in findings)
+
+
+def test_2_binary_full_pem_private_key_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "_internal" / "binary.dll").write_bytes(b"MZ\x00\x00-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC...\n-----END PRIVATE KEY-----\x00")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "private_key_marker" and item["relative_path"] == "_internal/binary.dll" for item in findings)
+
+
+def test_3_text_sensitive_variable_assignment_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "config.py").write_text("LICENSE_PRIVATE_KEY = 'secret-key-12345'", encoding="utf-8")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "credential_marker" and item["relative_path"] == "config.py" for item in findings)
+
+
+def test_4_binary_sensitive_variable_assignment_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "_internal" / "custom.pyd").write_bytes(b"MZ\x00LICENSE_PRIVATE_KEY=secret_key_bytes_12345\x00")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "credential_marker" and item["relative_path"] == "_internal/custom.pyd" for item in findings)
+
+
+def test_5_binary_openssl_function_name_allowed(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "_internal" / "libcrypto.dll").write_bytes(b"MZ\x00\x00PEM_read_bio_PrivateKey\x00\x00EVP_PKEY_CTX_new\x00")
+    findings = module.scan_forbidden_content(root)
+    assert not any(item["relative_path"] == "_internal/libcrypto.dll" for item in findings)
+
+
+def test_6_binary_private_key_error_message_allowed(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "_internal" / "qt.dll").write_bytes(b"MZ\x00\x00failed to load private key\x00private key operation failed\x00")
+    findings = module.scan_forbidden_content(root)
+    assert not any(item["relative_path"] == "_internal/qt.dll" for item in findings)
+
+
+def test_7_zip_raw_bytes_coincidental_match_allowed(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    zip_path = root / "_internal" / "base_library.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("safe_module.py", "def hello(): return 'world'\n")
+    findings = module.scan_forbidden_content(root)
+    assert not any(item["relative_path"] == "_internal/base_library.zip" for item in findings)
+
+
+def test_8_zip_member_real_environment_dump_must_block(tmp_path):
+    module = _module()
+    zip_path = tmp_path / "env_dump.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("env.txt", "PATH=/usr/bin:/bin\nUSERPROFILE=C:\\Users\\admin\nHOME=/home/admin\n")
+    findings = module.scan_zip_forbidden_content(zip_path)
+    assert any(item["category"] == "environment_dump" and item["relative_path"] == "env.txt" for item in findings)
+
+
+def test_9_zip_member_private_key_boundary_must_block(tmp_path):
+    module = _module()
+    zip_path = tmp_path / "key.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("secret.pem", "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADAN...\n-----END PRIVATE KEY-----\n")
+    findings = module.scan_zip_forbidden_content(zip_path)
+    assert any(item["category"] == "private_key_marker" and item["relative_path"] == "secret.pem" for item in findings)
+
+
+def test_10_zip_member_sensitive_assignment_must_block(tmp_path):
+    module = _module()
+    zip_path = tmp_path / "config.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("settings.py", "CAMPUS_PASSWORD = 'supersecretpassword123'\n")
+    findings = module.scan_zip_forbidden_content(zip_path)
+    assert any(item["category"] == "credential_marker" and item["relative_path"] == "settings.py" for item in findings)
+
+
+def test_11_third_party_upstream_build_path_in_binary_allowed(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "_internal" / "Qt6Core.dll").write_bytes(b"MZ\x00C:\\Users\\qt\\work\\qt\\qtbase_build\\bin\\Qt6Core.pdb\x00")
+    (root / "_internal" / "_rust.pyd").write_bytes(b"MZ\x00C:\\Users\\runneradmin\\.cargo\\registry\\src\\index.crates.io-6f17d22bba15001f\\...`\x00")
+    findings = module.scan_forbidden_content(root)
+    assert not any(item["relative_path"] in {"_internal/Qt6Core.dll", "_internal/_rust.pyd"} for item in findings)
+
+
+def test_12_current_repository_absolute_path_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "leak_source.py").write_text("SRC = 'C:\\\\Users\\\\lenovo\\\\Desktop\\\\whut-campus-auto-login\\\\secret.py'", encoding="utf-8")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "absolute_path" and item["relative_path"] == "leak_source.py" for item in findings)
+
+
+def test_13_simulated_user_dir_source_path_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "_internal" / "app.dll").write_bytes(b"MZ\x00C:\\Users\\devuser\\whut-campus-auto-login\\src\\main.py\x00")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "absolute_path" and item["relative_path"] == "_internal/app.dll" for item in findings)
+
+
+def test_14_env_file_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / ".env").write_text("SECRET=123", encoding="utf-8")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "environment_file" and item["relative_path"] == ".env" for item in findings)
+
+
+def test_15_db_sqlite_file_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "data.sqlite3").write_bytes(b"SQLite format 3\x00")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "sqlite_database" and item["relative_path"] == "data.sqlite3" for item in findings)
+
+
+def test_16_certifi_cacert_pem_only_ca_certs_allowed(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    cacert = root / "_internal" / "certifi" / "cacert.pem"
+    cacert.parent.mkdir(parents=True)
+    cacert.write_text("-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    findings = module.scan_forbidden_content(root)
+    assert not any(item["relative_path"] == "_internal/certifi/cacert.pem" for item in findings)
+
+
+def test_17_pem_file_with_private_key_must_block(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "private.pem").write_text("-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\n", encoding="utf-8")
+    findings = module.scan_forbidden_content(root)
+    assert any(item["category"] == "private_key_marker" and item["relative_path"] == "private.pem" for item in findings)
+
+
+def test_18_production_https_url_allowed(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    (root / "_internal" / "app.exe").write_bytes(b"MZ\x00https://license.whutlogin.cn\x00")
+    findings = module.scan_forbidden_content(root)
+    assert not any(item["relative_path"] == "_internal/app.exe" for item in findings)
+
+
+def test_19_production_ed25519_public_key_allowed(tmp_path):
+    module = _module()
+    root = _onedir(tmp_path)
+    pub_key_b64 = "A" * 44
+    (root / "_internal" / "app.exe").write_bytes(f"MZ\x00{pub_key_b64}\x00".encode("ascii"))
+    findings = module.scan_forbidden_content(root)
+    assert not any(item["relative_path"] == "_internal/app.exe" for item in findings)
+
+
+def test_20_zip_bomb_limits_enforced(tmp_path):
+    module = _module()
+    zip_path = tmp_path / "bomb.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        # 1001 members or huge file
+        for i in range(1005):
+            zf.writestr(f"file_{i}.txt", "safe")
+    with pytest.raises(module.AttestationError, match="ZIP"):
+        module.scan_zip_forbidden_content(zip_path)
