@@ -14,8 +14,8 @@ from urllib.parse import urlsplit
 
 EMBEDDED_CONFIG_MODULE_NAME = "_license_client_embedded_build_config"
 EMBEDDED_CONFIG_FILENAME = f"{EMBEDDED_CONFIG_MODULE_NAME}.py"
-VALID_BUILD_ENVIRONMENTS = {"development", "preproduction", "production"}
-RELEASE_BUILD_ENVIRONMENTS = {"preproduction", "production"}
+VALID_BUILD_ENVIRONMENTS = {"development", "preproduction", "public-beta", "production"}
+RELEASE_BUILD_ENVIRONMENTS = {"preproduction", "public-beta", "production"}
 EmbeddedConfig = Optional[tuple[str, str, str]]
 
 
@@ -33,7 +33,7 @@ def resolve_license_public_key(
     build_environment = _resolve_build_environment_from_config(embedded_config)
     if not build_environment:
         return ""
-    if build_environment in {"preproduction", "production"}:
+    if build_environment in RELEASE_BUILD_ENVIRONMENTS:
         return _embedded_public_key(embedded_config)
     values = os.environ if env is None else env
     configured = str(values.get("LICENSE_PUBLIC_KEY", "") or "").strip()
@@ -63,7 +63,7 @@ def write_embedded_build_config(
     clean_environment = _normalize_build_environment(build_environment)
     if not clean_environment:
         raise ValueError(
-            "Build environment must be one of: development, preproduction, production."
+            "Build environment must be one of: development, preproduction, public-beta, production."
         )
     raw_url = str(license_server_url or "")
     if clean_environment in RELEASE_BUILD_ENVIRONMENTS:

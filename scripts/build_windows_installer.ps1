@@ -4,8 +4,9 @@
 
 .DESCRIPTION
     Validates the PyInstaller onedir input, verifies a production-signed app
-    EXE before ISCC.exe, signs and verifies the production installer, prints
-    its post-signing SHA-256, and enforces environment separation.
+    EXE before ISCC.exe, signs and verifies the production installer, or
+    records an explicitly unsigned Public Beta installer, then prints its
+    final SHA-256 and enforces environment separation.
 
     This script MUST be run after scripts\build_windows.ps1 has produced
     a clean PyInstaller onedir in dist\WHUTCampusAutoLogin\.
@@ -13,8 +14,10 @@
     Do NOT call ISCC.exe directly; use this script for all gate checks.
 
 .PARAMETER BuildEnvironment
-    "development" or "production".
+    "development", "public-beta", or "production".
     - development: gate checks relaxed; output filename contains "development".
+    - public-beta: production-like release gates, explicit unsigned marker,
+      and owner-approval metadata; output filename contains "public-beta".
     - production: requires the Windows signing preflight and verified
       Authenticode signatures in addition to the existing release gates.
 
@@ -47,7 +50,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("development", "production")]
+    [ValidateSet("development", "public-beta", "production")]
     [string]$BuildEnvironment,
 
     [string]$InputDir = "",
@@ -140,6 +143,9 @@ Write-Host "ISCC: $IsccPath"
 $ShortVersion = $AppVersion -replace '\+.*$', ''   # strip build metadata
 if ($BuildEnvironment -eq "development") {
     $OutputBasename = "WHUTCampusAutoLogin-$ShortVersion-development-setup"
+} elseif ($BuildEnvironment -eq "public-beta") {
+    Write-Warning "PUBLIC BETA MODE: Authenticode is intentionally not applied; owner approval is still required."
+    $OutputBasename = "WHUTCampusAutoLogin-$ShortVersion-public-beta-setup"
 } else {
     # production output is only approved after all signing and release gates.
     Write-Warning "PRODUCTION MODE: additional gate checks apply."
@@ -148,8 +154,12 @@ if ($BuildEnvironment -eq "development") {
 Write-Host "OutputBasename: $OutputBasename"
 $installerPath = Join-Path $OutputDir "$OutputBasename.exe"
 $installerExistedBefore = Test-Path -LiteralPath $installerPath -PathType Leaf
+$releaseReportPath = Join-Path $OutputDir "$OutputBasename-release-report.txt"
 if ($SigningConfiguration.SigningRequired -and $installerExistedBefore) {
     Write-Error "PRODUCTION_OUTPUT_EXISTS: refusing to overwrite an existing production installer candidate: $installerPath"
+}
+if ($BuildEnvironment -eq "public-beta" -and ($installerExistedBefore -or (Test-Path -LiteralPath $releaseReportPath -PathType Leaf))) {
+    Write-Error "PUBLIC_BETA_OUTPUT_EXISTS: refusing to overwrite an existing public-beta candidate or report."
 }
 
 # ---------------------------------------------------------------------------
@@ -213,10 +223,11 @@ Write-Host "Forbidden content check: PASS"
 # 7. Gate: Git working tree check
 # ---------------------------------------------------------------------------
 $gitStatus = & git -C $RepoRoot status --porcelain 2>&1
-$trackedChanges = $gitStatus | Where-Object { $_ -match "^[MADRCU?!]" -and $_ -notmatch "^\?\? \.venv" -and $_ -notmatch "^\?\? installer.output" }
-if ($BuildEnvironment -eq "production") {
+$trackedChanges = $gitStatus | Where-Object { $_ -match "^\s*[MADRCU?!]" -and $_ -notmatch "^\?\? \.venv" -and $_ -notmatch "^\?\? installer.output" }
+if (@("public-beta", "production") -contains $BuildEnvironment) {
     if ($trackedChanges) {
-        Write-Error "Production build requires a clean git working tree. Uncommitted changes found:`n$($trackedChanges -join "`n")"
+        $cleanMessage = if ($BuildEnvironment -eq "public-beta") { "Public Beta" } else { "Production" }
+        Write-Error "$cleanMessage build requires a clean git working tree. Uncommitted changes found:`n$($trackedChanges -join "`n")"
     }
     Write-Host "Git working tree: CLEAN [OK]"
 } else {
@@ -266,6 +277,8 @@ Write-Host "Command: $IsccPath $($isccArgs -join ' ')"
 Write-Host ""
 
 $installerSize = $null
+$managedReleaseCandidate = @("public-beta", "production") -contains $BuildEnvironment
+$publicBetaSignatureStatus = $null
 try {
     $proc = Start-Process -FilePath $IsccPath -ArgumentList $isccArgs -Wait -PassThru -NoNewWindow
     $exitCode = $proc.ExitCode
@@ -297,10 +310,23 @@ try {
             -ArtifactPath $installerPath
         Write-Host "Installer Authenticode verification: PASS"
     }
+    if ($BuildEnvironment -eq "public-beta") {
+        $publicBetaSignature = Get-AuthenticodeSignature -FilePath $installerPath
+        $publicBetaSignatureStatus = [string]$publicBetaSignature.Status
+        if ($publicBetaSignatureStatus -ne "NotSigned") {
+            Write-Error "PUBLIC_BETA_SIGNATURE_STATE_INVALID: expected NotSigned, got $publicBetaSignatureStatus."
+        }
+        Write-Host "Public Beta Authenticode status: NotSigned (intentional)"
+    }
 }
 catch {
-    if ($SigningConfiguration.SigningRequired -and -not $installerExistedBefore -and (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
-        Remove-Item -LiteralPath $installerPath -Force
+    if ($managedReleaseCandidate -and -not $installerExistedBefore) {
+        if (Test-Path -LiteralPath $installerPath -PathType Leaf) {
+            Remove-Item -LiteralPath $installerPath -Force
+        }
+        if (Test-Path -LiteralPath $releaseReportPath -PathType Leaf) {
+            Remove-Item -LiteralPath $releaseReportPath -Force
+        }
     }
     throw
 }
@@ -309,8 +335,51 @@ catch {
 # 12. SHA-256
 # ---------------------------------------------------------------------------
 # Re-read after Authenticode signing; signing changes the PE bytes.
-$installerSize = (Get-Item $installerPath).Length
-$hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
+try {
+    $installerSize = (Get-Item $installerPath).Length
+    try {
+        $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
+    }
+    catch [System.Management.Automation.CommandNotFoundException] {
+        # Some constrained Windows PowerShell hosts do not auto-load the
+        # Microsoft.PowerShell.Utility Get-FileHash command. Keep the same
+        # SHA-256 contract with the framework API in that case.
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $sha256.ComputeHash([System.IO.File]::ReadAllBytes($installerPath))
+            $hash = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    if ($BuildEnvironment -eq "public-beta") {
+        $reportLines = @(
+            "ReleaseChannel: PublicBeta",
+            "Version: $AppVersion",
+            "Artifact: $([IO.Path]::GetFileName($installerPath))",
+            "SHA256: $hash",
+            "Authenticode: NotSigned",
+            "CodeSigningStatus: IntentionallyUnsignedPublicBeta",
+            "ManualAcceptanceCompleted: No",
+            "OwnerApproval: No",
+            "PublicDownloadEnabled: No"
+        )
+        Set-Content -LiteralPath $releaseReportPath -Value $reportLines -Encoding UTF8
+        Write-Host "Release report: $releaseReportPath"
+    }
+}
+catch {
+    if ($managedReleaseCandidate -and -not $installerExistedBefore) {
+        if (Test-Path -LiteralPath $installerPath -PathType Leaf) {
+            Remove-Item -LiteralPath $installerPath -Force
+        }
+        if (Test-Path -LiteralPath $releaseReportPath -PathType Leaf) {
+            Remove-Item -LiteralPath $releaseReportPath -Force
+        }
+    }
+    throw
+}
 
 # ---------------------------------------------------------------------------
 # 13. Final report
@@ -322,5 +391,12 @@ Write-Host "Size:         $([Math]::Round($installerSize/1MB,2)) MB ($installerS
 Write-Host "SHA-256:      $hash"
 Write-Host "Environment:  $BuildEnvironment"
 Write-Host "Version:      $AppVersion"
-Write-Host "Distributable: $(if ($BuildEnvironment -eq 'production') { 'REQUIRES additional review' } else { 'NO - development only' })"
+if ($BuildEnvironment -eq "production") {
+    $distributableStatus = "REQUIRES additional review"
+} elseif ($BuildEnvironment -eq "public-beta") {
+    $distributableStatus = "NO - owner approval and manual acceptance required"
+} else {
+    $distributableStatus = "NO - development only"
+}
+Write-Host "Distributable: $distributableStatus"
 Write-Host ""

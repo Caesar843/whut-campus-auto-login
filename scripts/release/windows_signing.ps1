@@ -57,7 +57,7 @@ function Get-WindowsSigningConfiguration {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('development', 'preproduction', 'production')]
+        [ValidateSet('development', 'preproduction', 'public-beta', 'production')]
         [string]$BuildEnvironment
     )
 
@@ -67,6 +67,22 @@ function Get-WindowsSigningConfiguration {
     $storeText = ([string](Get-WindowsSigningEnvironmentValue -Name 'WINDOWS_SIGNING_STORE')).Trim()
     $signToolPath = ([string](Get-WindowsSigningEnvironmentValue -Name 'WINDOWS_SIGNTOOL_PATH')).Trim()
     $timestampText = Get-WindowsSigningEnvironmentValue -Name 'WINDOWS_SIGNING_TIMESTAMP_URL'
+
+    if ($environment -eq 'public-beta') {
+        if ($enabled -eq 'true') {
+            Throw-WindowsSigningError `
+                'PUBLIC_BETA_SIGNING_CONFIGURATION_INVALID' `
+                'Public Beta must keep WINDOWS_SIGNING_ENABLED false; it is an explicitly unsigned channel.'
+        }
+        return [pscustomobject]@{
+            SigningRequired = $false
+            BuildEnvironment = $environment
+            CertificateThumbprint = $null
+            Store = 'CurrentUser'
+            SignToolPath = $signToolPath
+            TimestampUrl = $null
+        }
+    }
 
     if ($environment -ne 'production' -and $enabled -ne 'true') {
         return [pscustomobject]@{
@@ -250,7 +266,7 @@ function Assert-WindowsSigningPreflight {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('development', 'preproduction', 'production')]
+        [ValidateSet('development', 'preproduction', 'public-beta', 'production')]
         [string]$BuildEnvironment
     )
 

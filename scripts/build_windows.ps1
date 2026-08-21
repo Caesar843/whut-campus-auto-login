@@ -125,15 +125,15 @@ try {
 
     $buildEnvironmentValue = $BuildEnvironment.Trim().ToLowerInvariant()
     if (-not $buildEnvironmentValue) {
-        throw "BuildEnvironment is required. Pass -BuildEnvironment development, preproduction, or production."
+        throw "BuildEnvironment is required. Pass -BuildEnvironment development, public-beta, preproduction, or production."
     }
-    if (@('development', 'preproduction', 'production') -notcontains $buildEnvironmentValue) {
-        throw "BuildEnvironment must be one of: development, preproduction, production."
+    if (@('development', 'public-beta', 'preproduction', 'production') -notcontains $buildEnvironmentValue) {
+        throw "BuildEnvironment must be one of: development, public-beta, preproduction, production."
     }
 
     $licenseServerUrlValue = [string]$LicenseServerUrl
-    if (@('preproduction', 'production') -contains $buildEnvironmentValue -and -not $licenseServerUrlValue) {
-        throw "LicenseServerUrl is required for preproduction and production builds."
+    if (@('public-beta', 'preproduction', 'production') -contains $buildEnvironmentValue -and -not $licenseServerUrlValue) {
+        throw "LicenseServerUrl is required for public-beta, preproduction, and production builds."
     }
 
     $publicKey = $LicensePublicKey.Trim()
@@ -144,6 +144,13 @@ try {
     $signingConfiguration = Assert-WindowsSigningPreflight -BuildEnvironment $buildEnvironmentValue
     if ($signingConfiguration.SigningRequired) {
         Write-Output "Production signing preflight: PASS"
+    }
+    if ($buildEnvironmentValue -eq 'public-beta') {
+        Write-Warning @"
+PUBLIC BETA BUILD
+Authenticode signing is intentionally not applied.
+This artifact must not be represented as Signed Production.
+"@
     }
 
     if (Test-Path -LiteralPath $buildDir) {

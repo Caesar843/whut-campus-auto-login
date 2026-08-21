@@ -144,7 +144,7 @@ def test_frozen_app_missing_build_environment_fails_closed(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("build_environment", ["production", "preproduction"])
+@pytest.mark.parametrize("build_environment", ["production", "preproduction", "public-beta"])
 def test_release_builds_ignore_runtime_public_key_env(build_environment):
     assert (
         resolve_license_public_key(
@@ -344,7 +344,7 @@ def test_development_server_url_keeps_runtime_override_and_loopback_default():
     )
 
 
-@pytest.mark.parametrize("build_environment", ["preproduction", "production"])
+@pytest.mark.parametrize("build_environment", ["preproduction", "production", "public-beta"])
 def test_release_server_url_uses_embedded_value_and_ignores_runtime_env(build_environment):
     assert (
         resolve_license_server_url(
@@ -356,6 +356,26 @@ def test_release_server_url_uses_embedded_value_and_ignores_runtime_env(build_en
             ),
         )
         == "https://license.example.test"
+    )
+
+
+def test_public_beta_build_config_requires_approved_https_server_url(tmp_path):
+    _private_key, public_key_b64 = _key_pair()
+    output_path = tmp_path / EMBEDDED_CONFIG_FILENAME
+
+    write_embedded_build_config(
+        public_key_b64=public_key_b64,
+        build_environment="public-beta",
+        license_server_url="https://license.example.test/",
+        build_session_id="session-public-beta",
+        output_path=output_path,
+    )
+
+    assert output_path.read_text(encoding="utf-8") == (
+        'BUILD_ENVIRONMENT = "public-beta"\n'
+        f'LICENSE_PUBLIC_KEY_B64 = "{public_key_b64}"\n'
+        'LICENSE_SERVER_URL = "https://license.example.test"\n'
+        'BUILD_SESSION_ID = "session-public-beta"\n'
     )
 
 
