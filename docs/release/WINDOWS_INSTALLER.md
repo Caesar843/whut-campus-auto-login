@@ -258,15 +258,58 @@ Get-FileHash installer\output\WHUTCampusAutoLogin-<ver>-development-setup.exe -A
 
 ---
 
-## 代码签名
+## Authenticode 代码签名
 
-**当前阶段尚未完成代码签名。**
+Production Authenticode 是强制发布门禁。签名实现集中在
+`scripts/release/windows_signing.ps1`，不写入私钥、PFX 密码或任何其他秘密。
 
-正式发布前需要：
-- 申请并配置 Authenticode 证书；
-- 对 `WHUTCampusAutoLogin.exe` 签名（在 PyInstaller 构建后）；
-- 对安装器 EXE 签名（在 ISCC 编译后）；
-- 签名流程集成到 `build_windows_installer.ps1`。
+### Production 配置合同
+
+Production 签名只接受 Windows Certificate Store 中由精确 SHA-1 thumbprint
+选择的证书：
+
+| 环境变量 | 要求 |
+|------|------|
+| `WINDOWS_SIGNING_ENABLED` | Production 必须为 `true`；Development 可为 `false` |
+| `WINDOWS_SIGNING_CERT_SHA1` | 精确 40 位十六进制 thumbprint；忽略空格后规范化为大写 |
+| `WINDOWS_SIGNING_STORE` | `CurrentUser` 或 `LocalMachine`，对应 `Cert:\...\My` |
+| `WINDOWS_SIGNTOOL_PATH` | 可选的绝对 `signtool.exe` 路径；未提供时自动发现 Windows SDK x64 SignTool |
+| `WINDOWS_SIGNING_TIMESTAMP_URL` | Production 必须配置 approved HTTPS RFC3161 timestamp URL |
+
+证书必须：
+
+- 包含 Code Signing EKU：`1.3.6.1.5.5.7.3.3`；
+- 在当前时间有效；
+- 暴露可用 private key；
+- 不是 self-signed development certificate；
+- 能完成 SignTool 签名和受信任验证。
+
+不接受 subject-name 模糊匹配，也不接受 PFX/P12 密码参数、密码环境变量、
+cloud signing 或硬件厂商专用流程。
+
+### 签名顺序与验证
+
+正式流程由现有脚本和共享 helper 强制执行：
+
+1. PyInstaller 生成 `WHUTCampusAutoLogin.exe`；
+2. Production preflight 发现 SignTool，并验证 thumbprint、证书有效期、EKU 和 private key；
+3. 使用 `signtool sign /fd SHA256 /sha1 <thumbprint> /tr <RFC3161 URL> /td SHA256` 签名 app EXE；
+4. 使用 `signtool verify` 和 `Get-AuthenticodeSignature` 验证 app EXE，状态必须为 `Valid` 且 signer thumbprint 必须匹配；
+5. 只有 app EXE 验证通过后，才允许调用 `build_windows_installer.ps1` / ISCC；
+6. ISCC 生成 installer 后，使用同一 signing identity 再次签名并验证 installer；
+7. 只有 installer 签名验证通过后，才计算最终 SHA-256。
+
+Production 缺少任一配置、工具、证书、private key、EKU、有效期、时间戳、
+签名或验证条件时，流程必须 fail closed，并报告具体错误，例如
+`CODE_SIGNING_CERT_NOT_FOUND` 或 `TIMESTAMP_CONFIGURATION_MISSING`。
+
+Development 构建仍输出 `*-development-setup.exe`，不强制签名，也绝不能被视为
+formal production release。
+
+当前 V1 合同未要求单独签名 uninstaller；不扩大本轮范围。
+
+即使签名成功，`ManualAcceptanceCompleted`、GUI/安装验收和 `OwnerApproval`
+仍是后续人工发布门禁，脚本不会自动改为通过。
 
 ---
 

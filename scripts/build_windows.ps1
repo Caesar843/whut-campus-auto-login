@@ -17,6 +17,7 @@ $baselinePath = Join-Path $repoRoot 'packaging\windows\build_baseline.json'
 $environmentVerifierPath = Join-Path $repoRoot 'scripts\verify_windows_build_environment.py'
 $versionGeneratorPath = Join-Path $repoRoot 'scripts\generate_windows_version_info.py'
 $appIconPath = Join-Path $repoRoot 'assets\windows\whut_campus_auto_login.ico'
+$signingHelperPath = Join-Path $repoRoot 'scripts\release\windows_signing.ps1'
 $buildDir = Join-Path $repoRoot 'build'
 $generatedDir = Join-Path $buildDir 'generated'
 $generatedConfigModule = Join-Path $generatedDir '_license_client_embedded_build_config.py'
@@ -28,6 +29,12 @@ $previousBuildSessionId = [Environment]::GetEnvironmentVariable($buildSessionEnv
 $primaryExitCode = 0
 $primaryFailureMessage = $null
 $cleanupFailureMessage = $null
+$signingConfiguration = $null
+
+if (-not (Test-Path -LiteralPath $signingHelperPath -PathType Leaf)) {
+    throw "Missing Windows signing helper: $signingHelperPath"
+}
+. $signingHelperPath
 
 function Remove-GeneratedBuildConfig {
     if (Test-Path -LiteralPath $generatedConfigModule) {
@@ -134,6 +141,11 @@ try {
         throw "LicensePublicKey is required for Windows build. Pass -LicensePublicKey."
     }
 
+    $signingConfiguration = Assert-WindowsSigningPreflight -BuildEnvironment $buildEnvironmentValue
+    if ($signingConfiguration.SigningRequired) {
+        Write-Output "Production signing preflight: PASS"
+    }
+
     if (Test-Path -LiteralPath $buildDir) {
         Remove-Item -LiteralPath $buildDir -Recurse -Force
     }
@@ -188,6 +200,16 @@ try {
         Write-Output "EXE: $exePath"
         Write-Output ("BuildEnvironment: {0}" -f $buildEnvironmentValue)
         Write-Output ("SizeBytes: {0}" -f $sizeBytes)
+
+        if ($signingConfiguration.SigningRequired) {
+            Invoke-WindowsSigningArtifact `
+                -Configuration $signingConfiguration `
+                -ArtifactPath $exePath
+            Assert-WindowsSigningArtifact `
+                -Configuration $signingConfiguration `
+                -ArtifactPath $exePath
+            Write-Output "Authenticode: Valid"
+        }
     }
 }
 catch {
