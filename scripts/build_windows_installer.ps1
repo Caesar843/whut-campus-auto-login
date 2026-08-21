@@ -3,9 +3,9 @@
     Build the WHUTCampusAutoLogin Windows installer using Inno Setup 6.
 
 .DESCRIPTION
-    Validates the PyInstaller onedir input, drives ISCC.exe to produce a
-    signed-name installer EXE, prints SHA-256, and enforces environment
-    separation between development and production builds.
+    Validates the PyInstaller onedir input, verifies a production-signed app
+    EXE before ISCC.exe, signs and verifies the production installer, prints
+    its post-signing SHA-256, and enforces environment separation.
 
     This script MUST be run after scripts\build_windows.ps1 has produced
     a clean PyInstaller onedir in dist\WHUTCampusAutoLogin\.
@@ -15,8 +15,8 @@
 .PARAMETER BuildEnvironment
     "development" or "production".
     - development: gate checks relaxed; output filename contains "development".
-    - production: additional gate checks (clean git, no dev key, etc.); NOT
-      approved for actual release in this phase.
+    - production: requires the Windows signing preflight and verified
+      Authenticode signatures in addition to the existing release gates.
 
 .PARAMETER InputDir
     Path to the PyInstaller onedir to package. Defaults to dist\WHUTCampusAutoLogin.
@@ -69,6 +69,12 @@ $ErrorActionPreference = "Stop"
 # ---------------------------------------------------------------------------
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot   = Split-Path -Parent $ScriptDir
+$SigningHelperPath = Join-Path $RepoRoot "scripts\release\windows_signing.ps1"
+
+if (-not (Test-Path -LiteralPath $SigningHelperPath -PathType Leaf)) {
+    Write-Error "Windows signing helper not found: $SigningHelperPath"
+}
+. $SigningHelperPath
 
 if (-not $InputDir)  { $InputDir  = Join-Path $RepoRoot "dist\WHUTCampusAutoLogin" }
 if (-not $OutputDir) { $OutputDir = Join-Path $RepoRoot "installer\output" }
@@ -78,6 +84,7 @@ $InputDir   = [IO.Path]::GetFullPath($InputDir)
 $OutputDir  = [IO.Path]::GetFullPath($OutputDir)
 $IssScript  = [IO.Path]::GetFullPath($IssScript)
 $MainExe    = Join-Path $InputDir "WHUTCampusAutoLogin.exe"
+$SigningConfiguration = Assert-WindowsSigningPreflight -BuildEnvironment $BuildEnvironment
 
 # ---------------------------------------------------------------------------
 # 1. Detect app version (from app_version.py if not supplied)
@@ -134,11 +141,16 @@ $ShortVersion = $AppVersion -replace '\+.*$', ''   # strip build metadata
 if ($BuildEnvironment -eq "development") {
     $OutputBasename = "WHUTCampusAutoLogin-$ShortVersion-development-setup"
 } else {
-    # production guard (not yet approved for release)
+    # production output is only approved after all signing and release gates.
     Write-Warning "PRODUCTION MODE: additional gate checks apply."
     $OutputBasename = "WHUTCampusAutoLogin-$ShortVersion-setup"
 }
 Write-Host "OutputBasename: $OutputBasename"
+$installerPath = Join-Path $OutputDir "$OutputBasename.exe"
+$installerExistedBefore = Test-Path -LiteralPath $installerPath -PathType Leaf
+if ($SigningConfiguration.SigningRequired -and $installerExistedBefore) {
+    Write-Error "PRODUCTION_OUTPUT_EXISTS: refusing to overwrite an existing production installer candidate: $installerPath"
+}
 
 # ---------------------------------------------------------------------------
 # 4. Gate: ISS script exists
@@ -167,6 +179,13 @@ Write-Host "InputDir: $InputDir [OK] (EXE $([Math]::Round($exeSize/1MB,2)) MB)"
 $internalDir = Join-Path $InputDir "_internal"
 if (-not (Test-Path $internalDir -PathType Container)) {
     Write-Error "_internal directory not found in InputDir. This does not look like a complete PyInstaller onedir build."
+}
+
+if ($SigningConfiguration.SigningRequired) {
+    Assert-WindowsSigningArtifact `
+        -Configuration $SigningConfiguration `
+        -ArtifactPath $MainExe
+    Write-Host "Application Authenticode verification: PASS"
 }
 
 # ---------------------------------------------------------------------------
@@ -246,31 +265,51 @@ $isccArgs = @(
 Write-Host "Command: $IsccPath $($isccArgs -join ' ')"
 Write-Host ""
 
-$proc = Start-Process -FilePath $IsccPath -ArgumentList $isccArgs -Wait -PassThru -NoNewWindow
-$exitCode = $proc.ExitCode
+$installerSize = $null
+try {
+    $proc = Start-Process -FilePath $IsccPath -ArgumentList $isccArgs -Wait -PassThru -NoNewWindow
+    $exitCode = $proc.ExitCode
 
-Write-Host ""
-Write-Host "=== ISCC exit code: $exitCode ==="
+    Write-Host ""
+    Write-Host "=== ISCC exit code: $exitCode ==="
 
-if ($exitCode -ne 0) {
-    Write-Error "ISCC.exe failed with exit code $exitCode. Installer not produced."
+    if ($exitCode -ne 0) {
+        Write-Error "ISCC.exe failed with exit code $exitCode. Installer not produced."
+    }
+
+    # -----------------------------------------------------------------------
+    # 11. Verify output and sign production installer
+    # -----------------------------------------------------------------------
+    if (-not (Test-Path $installerPath)) {
+        Write-Error "Installer EXE not found at expected path: $installerPath"
+    }
+    $installerSize = (Get-Item $installerPath).Length
+    if ($installerSize -eq 0) {
+        Write-Error "Installer EXE has zero size: $installerPath"
+    }
+
+    if ($SigningConfiguration.SigningRequired) {
+        Invoke-WindowsSigningArtifact `
+            -Configuration $SigningConfiguration `
+            -ArtifactPath $installerPath
+        Assert-WindowsSigningArtifact `
+            -Configuration $SigningConfiguration `
+            -ArtifactPath $installerPath
+        Write-Host "Installer Authenticode verification: PASS"
+    }
 }
-
-# ---------------------------------------------------------------------------
-# 11. Verify output
-# ---------------------------------------------------------------------------
-$installerPath = Join-Path $OutputDir "$OutputBasename.exe"
-if (-not (Test-Path $installerPath)) {
-    Write-Error "Installer EXE not found at expected path: $installerPath"
-}
-$installerSize = (Get-Item $installerPath).Length
-if ($installerSize -eq 0) {
-    Write-Error "Installer EXE has zero size: $installerPath"
+catch {
+    if ($SigningConfiguration.SigningRequired -and -not $installerExistedBefore -and (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $installerPath -Force
+    }
+    throw
 }
 
 # ---------------------------------------------------------------------------
 # 12. SHA-256
 # ---------------------------------------------------------------------------
+# Re-read after Authenticode signing; signing changes the PE bytes.
+$installerSize = (Get-Item $installerPath).Length
 $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ BASELINE_PATH = ROOT / "packaging" / "windows" / "build_baseline.json"
 LOCK_PATH = ROOT / "requirements-windows-build.lock.txt"
 VERSION_GENERATOR = ROOT / "scripts" / "generate_windows_version_info.py"
 ENVIRONMENT_VERIFIER = ROOT / "scripts" / "verify_windows_build_environment.py"
+SIGNING_HELPER = ROOT / "scripts" / "release" / "windows_signing.ps1"
 APP_VERSION_PATH = ROOT / "app_version.py"
 APP_ICON_PATH = ROOT / "assets" / "windows" / "whut_campus_auto_login.ico"
 EMBEDDED_MODULE = "_license_client_embedded_build_config"
@@ -30,6 +31,7 @@ def _isolated_build_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     for relative in (
         "scripts",
+        "scripts/release",
         "desktop_app",
         "license_client",
         "tools",
@@ -40,6 +42,7 @@ def _isolated_build_repo(tmp_path: Path) -> Path:
     shutil.copy2(BUILD_SCRIPT, repo / "scripts" / BUILD_SCRIPT.name)
     shutil.copy2(VERSION_GENERATOR, repo / "scripts" / VERSION_GENERATOR.name)
     shutil.copy2(ENVIRONMENT_VERIFIER, repo / "scripts" / ENVIRONMENT_VERIFIER.name)
+    shutil.copy2(SIGNING_HELPER, repo / "scripts" / "release" / SIGNING_HELPER.name)
     shutil.copy2(APP_VERSION_PATH, repo / APP_VERSION_PATH.name)
     shutil.copy2(BASELINE_PATH, repo / "packaging" / "windows" / BASELINE_PATH.name)
     shutil.copy2(LOCK_PATH, repo / LOCK_PATH.name)
@@ -140,6 +143,14 @@ def _run_build(
     validator_exit_code: int = 0,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    for name in (
+        "WINDOWS_SIGNING_ENABLED",
+        "WINDOWS_SIGNING_CERT_SHA1",
+        "WINDOWS_SIGNING_STORE",
+        "WINDOWS_SIGNTOOL_PATH",
+        "WINDOWS_SIGNING_TIMESTAMP_URL",
+    ):
+        env.pop(name, None)
     env.update(
         {
             "FAKE_PYINSTALLER_EXIT_CODE": str(pyinstaller_exit_code),
@@ -216,7 +227,7 @@ def test_build_script_validates_environment_before_deleting_build_directory(tmp_
 def test_build_script_generates_version_info_and_logs_release_baseline(tmp_path):
     repo = _isolated_build_repo(tmp_path)
 
-    completed = _run_build(repo, *_valid_arguments())
+    completed = _run_build(repo, *_valid_arguments("development"))
     output = completed.stdout + completed.stderr
     version_info = repo / "build" / "generated" / VERSION_INFO_FILENAME
 
@@ -230,6 +241,17 @@ def test_build_script_generates_version_info_and_logs_release_baseline(tmp_path)
         "PackagingMode: onedir",
     ):
         assert expected in output
+
+
+def test_production_build_fails_closed_without_signing_configuration(tmp_path):
+    repo = _isolated_build_repo(tmp_path)
+
+    completed = _run_build(repo, *_valid_arguments("production"))
+    output = completed.stdout + completed.stderr
+
+    assert completed.returncode != 0
+    assert "SIGNING_CONFIGURATION_MISSING" in output
+    assert not (repo / "dist" / "WHUTCampusAutoLogin" / "WHUTCampusAutoLogin.exe").exists()
 
 
 @pytest.mark.parametrize(
@@ -262,7 +284,7 @@ def test_build_script_cleans_config_and_preserves_pyinstaller_failure_code(tmp_p
     repo = _isolated_build_repo(tmp_path)
     config = _generated_config(repo)
 
-    completed = _run_build(repo, *_valid_arguments(), pyinstaller_exit_code=23)
+    completed = _run_build(repo, *_valid_arguments("development"), pyinstaller_exit_code=23)
 
     assert completed.returncode == 23
     assert not config.exists()
@@ -272,7 +294,7 @@ def test_build_script_preserves_pyinstaller_failure_when_cleanup_also_fails(tmp_
     repo = _isolated_build_repo(tmp_path)
     _inject_final_cleanup_failure(repo)
 
-    completed = _run_build(repo, *_valid_arguments(), pyinstaller_exit_code=23)
+    completed = _run_build(repo, *_valid_arguments("development"), pyinstaller_exit_code=23)
     output = _normalize_powershell_output(completed.stdout + completed.stderr)
 
     assert completed.returncode == 23, output
@@ -285,7 +307,7 @@ def test_build_script_fails_when_successful_build_cleanup_fails(tmp_path):
     repo = _isolated_build_repo(tmp_path)
     _inject_final_cleanup_failure(repo)
 
-    completed = _run_build(repo, *_valid_arguments())
+    completed = _run_build(repo, *_valid_arguments("development"))
     output = _normalize_powershell_output(completed.stdout + completed.stderr)
 
     assert completed.returncode == 1, output
@@ -297,7 +319,7 @@ def test_build_script_cleans_config_after_success(tmp_path):
     repo = _isolated_build_repo(tmp_path)
     config = _generated_config(repo)
 
-    completed = _run_build(repo, *_valid_arguments())
+    completed = _run_build(repo, *_valid_arguments("development"))
 
     assert completed.returncode == 0, completed.stderr
     assert not config.exists()
