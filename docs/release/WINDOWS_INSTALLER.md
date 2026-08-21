@@ -11,6 +11,23 @@
 **前置条件**：必须先完成 PyInstaller 构建（`scripts\build_windows.ps1`），
 再运行安装器构建脚本（`scripts\build_windows_installer.ps1`）。
 
+## 发布 Channel
+
+| Channel | Authenticode | 公开下载 | 文件标识 |
+|------|------|------|------|
+| `development` | No | No | `-development-setup.exe` |
+| `public-beta` | No（明确且有意） | 仅 owner 批准后 | `-public-beta-setup.exe` |
+| `production` | Yes，强制 | 仅完成全部验收后 | `-setup.exe` |
+
+Public Beta is an explicitly unsigned release channel。
+`Public Beta` 是独立的、明确标识的 unsigned release channel，不是 production
+signing bypass。它仍要求 production-like
+授权服务器 URL、正式 Ed25519 公钥、干净 Git、输入内容门禁、真实 SHA-256、
+人工验收和 owner approval。构建成功不会自动设置 `PublicDownloadEnabled=Yes`。
+Windows 可能显示 Unknown Publisher 或 SmartScreen/信誉提示；SHA-256 不是数字签名。
+
+Signed Production Authenticode requirement remains unchanged。
+
 ---
 
 ## 前置：PyInstaller 构建
@@ -58,6 +75,37 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 `
     -IsccPath "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 ```
 
+### Public Beta 构建
+
+Public Beta 使用 production-like license inputs，但明确不执行 Authenticode：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 `
+    -Clean `
+    -BuildEnvironment public-beta `
+    -LicensePublicKey "<approved-production-ed25519-public-key>" `
+    -LicenseServerUrl "https://<approved-production-license-server>"
+
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 `
+    -BuildEnvironment public-beta `
+    -InputDir "dist\WHUTCampusAutoLogin" `
+    -OutputDir "installer\output"
+```
+
+输出为 `WHUTCampusAutoLogin-<ver>-public-beta-setup.exe`，并生成同名
+`-release-report.txt`。报告必须记录：
+
+```text
+ReleaseChannel: PublicBeta
+Authenticode: NotSigned
+CodeSigningStatus: IntentionallyUnsignedPublicBeta
+ManualAcceptanceCompleted: No
+OwnerApproval: No
+PublicDownloadEnabled: No
+```
+
+安装器完成不代表可以公开下载；必须先完成隔离安装、升级、卸载、GUI 验收和 owner approval。
+
 ### Production 构建（尚未批准）
 
 Production 构建目前不可用于正式发行。正式发布前必须满足：
@@ -71,15 +119,15 @@ Production 构建目前不可用于正式发行。正式发布前必须满足：
 
 ---
 
-## Development 与 Production 区分
+## Development、Public Beta 与 Production 区分
 
-| 项目 | Development | Production |
-|------|-------------|------------|
-| 输出文件名 | `WHUTCampusAutoLogin-<ver>-development-setup.exe` | `WHUTCampusAutoLogin-<ver>-setup.exe` |
-| 公钥 | 占位符（不可用于真实授权） | 正式 Ed25519 公钥 |
-| Git 状态要求 | 宽松 | 必须干净 |
-| 可向用户分发 | **否** | 仅满足发布前置条件后 |
-| AppId | 相同固定 GUID | 相同固定 GUID |
+| 项目 | Development | Public Beta | Production |
+|------|-------------|------------|------------|
+| 输出文件名 | `WHUTCampusAutoLogin-<ver>-development-setup.exe` | `WHUTCampusAutoLogin-<ver>-public-beta-setup.exe` | `WHUTCampusAutoLogin-<ver>-setup.exe` |
+| 公钥 | 占位符（不可用于真实授权） | 正式 Ed25519 公钥 | 正式 Ed25519 公钥 |
+| Git 状态要求 | 宽松 | 必须干净 | 必须干净 |
+| 可向用户分发 | **否** | 仅 owner 批准后 | 仅满足全部发布前置条件后 |
+| AppId | 相同固定 GUID | 相同固定 GUID | 相同固定 GUID |
 
 > **警告**：Development 安装器禁止分发给最终用户。
 
@@ -99,7 +147,7 @@ Production 构建目前不可用于正式发行。正式发布前必须满足：
 - "程序和功能"中会出现两条记录；
 - 用户数据不会自动迁移。
 
-Development 和 Production 使用同一个 AppId，以确保测试安装可以被正式版升级覆盖。
+Development、Public Beta 和 Production 使用同一个 AppId，以确保测试安装可以被后续版本升级覆盖。
 
 ---
 

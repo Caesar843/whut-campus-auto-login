@@ -5,9 +5,10 @@
 ; AppId is a fixed GUID generated once for this product.
 ; WARNING: Changing AppId will cause Windows to treat this as a different product,
 ; breaking upgrades and leaving orphan uninstall entries. Do NOT change it.
-; The same AppId is used for both development and production installers so that
-; a development build installed for testing can be cleanly upgraded by a production
-; build later. Development installers MUST NOT be distributed to end users.
+; The same AppId is used for development, public-beta, and production installers
+; so that a test build can be cleanly upgraded by a later build. Development
+; installers MUST NOT be distributed, and public-beta installers require owner
+; approval before any public download.
 ;
 ; Authority sources:
 ;   AppName / ProductName:   desktop_app/tray/runtime.py  APP_NAME
@@ -24,7 +25,7 @@
 ;   InputDir       - absolute path to dist\WHUTCampusAutoLogin
 ;   OutputDir      - absolute path to installer output directory
 ;   OutputBasename - e.g. "WHUTCampusAutoLogin-0.1.0-development-setup"
-;   BuildEnv       - "development" or "production"
+;   BuildEnv       - "development", "public-beta", or "production"
 
 #ifndef AppVersionStr
   #error AppVersionStr must be defined. Use scripts\build_windows_installer.ps1.
