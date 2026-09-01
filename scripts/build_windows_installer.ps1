@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Build the WHUTCampusAutoLogin Windows installer using Inno Setup 6.
 
@@ -338,7 +338,7 @@ catch {
 try {
     $installerSize = (Get-Item $installerPath).Length
     try {
-        $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
+        $hash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     catch [System.Management.Automation.CommandNotFoundException] {
         # Some constrained Windows PowerShell hosts do not auto-load the
