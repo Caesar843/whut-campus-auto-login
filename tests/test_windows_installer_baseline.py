@@ -172,7 +172,7 @@ def test_start_menu_shortcut_uses_authority_name(iss_text):
 
 
 # ---------------------------------------------------------------------------
-# 9. Desktop shortcut: optional, default OFF
+# 9. Desktop shortcut: optional, default ON (per-user {autodesktop})
 # ---------------------------------------------------------------------------
 def test_desktop_shortcut_is_optional_task(iss_text):
     """Desktop shortcut must be a task (optional), not unconditional."""
@@ -181,8 +181,8 @@ def test_desktop_shortcut_is_optional_task(iss_text):
     )
 
 
-def test_desktop_shortcut_default_unchecked(iss_text):
-    """Desktop shortcut task must default to unchecked."""
+def test_desktop_shortcut_default_checked(iss_text):
+    """Desktop shortcut task must default to checked (visible on desktop)."""
     task_match = re.search(
         r'Name:\s*"desktopicon".*?Flags:\s*([^\n]+)',
         iss_text,
@@ -190,8 +190,8 @@ def test_desktop_shortcut_default_unchecked(iss_text):
     )
     assert task_match, "desktopicon task with Flags not found."
     flags = task_match.group(1).lower()
-    assert "unchecked" in flags, (
-        "Desktop shortcut task must have 'unchecked' flag (off by default)."
+    assert "unchecked" not in flags, (
+        "Desktop shortcut task must NOT have 'unchecked' flag (on by default)."
     )
 
 

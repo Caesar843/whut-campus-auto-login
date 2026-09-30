@@ -28,7 +28,7 @@ TOKEN_PERSIST_FAILED_MESSAGE = (
     "restart or offline use may require another online check."
 )
 
-FREE_LICENSE_MESSAGE = "授权状态：免费版，永久免费使用，无试用期与内购限制。"
+FREE_LICENSE_MESSAGE = ""
 
 
 @dataclass(frozen=True)

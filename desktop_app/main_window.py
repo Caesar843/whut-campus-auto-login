@@ -60,7 +60,7 @@ from license_client.license_state import (
 
 LOGGER = logging.getLogger(__name__)
 WINDOW_TITLE = "武汉理工校园网助手"
-LICENSE_PLACEHOLDER = "授权状态：免费版，永久免费使用"
+LICENSE_PLACEHOLDER = ""
 
 
 LoginRunner = Callable[[str, str], LoginResult]
@@ -392,6 +392,8 @@ class MainWindow(QMainWindow):
             self._set_status("尚未保存配置，请输入校园网账号和密码。", "neutral")
         self.license_label.setText(state.license_message)
         self.license_label.set_variant(state.license_variant)
+        # 免费版正常状态下授权说明为空，直接隐藏该标签；异常提示仍会显示。
+        self.license_label.setVisible(bool(state.license_message))
         if self._should_auto_initialize_license(state):
             self._start_license_initialization(auto=True)
 
@@ -582,8 +584,11 @@ class MainWindow(QMainWindow):
         self._apply_license_label(decision)
 
     def _apply_license_label(self, decision: LicenseDecision) -> None:
-        self.license_label.setText(decision.message_for_ui or LICENSE_PLACEHOLDER)
+        message = decision.message_for_ui or LICENSE_PLACEHOLDER
+        self.license_label.setText(message)
         self.license_label.set_variant(_license_variant(decision))
+        # 与初始加载一致：免费版空说明时隐藏，异常/上报提示仍显示。
+        self.license_label.setVisible(bool(message))
 
     @Slot()
     def _release_license_worker(self) -> None:

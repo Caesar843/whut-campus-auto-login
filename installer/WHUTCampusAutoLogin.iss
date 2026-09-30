@@ -108,8 +108,8 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-; Desktop shortcut: optional, default OFF per spec
-Name: "desktopicon"; Description: "在桌面创建快捷方式"; GroupDescription: "附加图标:"; Flags: unchecked
+; Desktop shortcut: created by default, user can opt out
+Name: "desktopicon"; Description: "在桌面创建快捷方式"; GroupDescription: "附加图标:"; Flags: checkedonce
 ; Post-install launch: optional, default ON
 Name: "launchapp"; Description: "安装完成后启动应用"; GroupDescription: "完成操作:"; Flags: checkedonce
 

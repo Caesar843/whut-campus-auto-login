@@ -261,19 +261,17 @@ def test_main_window_has_no_payment_entry_points():
         assert forbidden not in joined
 
 
-def test_main_window_shows_free_license_label():
+def test_main_window_hides_free_license_label():
     _app()
     window = MainWindow(controller=_free_controller())
 
-    assert window.license_label.text() == FREE_LICENSE_MESSAGE
-    assert "免费" in window.license_label.text()
-    assert "#166534" in window.license_label.styleSheet()
+    # 免费版正常状态不显示授权说明文字
+    assert window.license_label.text() == FREE_LICENSE_MESSAGE == ""
+    assert window.license_label.isHidden()
 
 
-def test_license_placeholder_is_free_version_text():
-    assert "免费" in LICENSE_PLACEHOLDER
-    assert "试用" not in LICENSE_PLACEHOLDER
-    assert "9.9" not in LICENSE_PLACEHOLDER
+def test_license_placeholder_is_empty():
+    assert LICENSE_PLACEHOLDER == ""
 
 
 def test_license_label_never_blocks_for_legacy_states():
