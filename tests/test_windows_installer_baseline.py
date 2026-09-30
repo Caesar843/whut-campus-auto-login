@@ -321,13 +321,11 @@ def test_startup_shortcut_no_wildcard(iss_text):
 # 14. No server-side or secret content
 # ---------------------------------------------------------------------------
 def test_no_mock_secret_in_iss(iss_text):
-    """ISS script must not contain mock tokens, private keys, or payment secrets."""
+    """ISS script must not contain server credentials or signing keys."""
     forbidden = [
-        "MOCK_PAYMENT_ADMIN_TOKEN",
         "LICENSE_PRIVATE_KEY",
         "BEGIN PRIVATE KEY",
         "ADMIN_ACCESS_TOKEN",
-        "WECHAT_PAY_API_V3_KEY",
         "pytest",
     ]
     for marker in forbidden:
@@ -406,10 +404,9 @@ def test_build_script_development_and_production_different_names(build_script_te
 # 17. Build script: no secret printing
 # ---------------------------------------------------------------------------
 def test_build_script_does_not_print_secrets(build_script_text):
-    """Build script must not print private keys, admin tokens, or payment keys."""
+    """Build script must not print private keys or admin tokens."""
     dangerous = [
         "LICENSE_PRIVATE_KEY", "ADMIN_ACCESS_TOKEN",
-        "WECHAT_PAY_API_V3_KEY", "MOCK_PAYMENT_ADMIN_TOKEN",
     ]
     for d in dangerous:
         assert d not in build_script_text, (

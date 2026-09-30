@@ -2,8 +2,6 @@ import os
 
 from license_client.http_transport import is_loopback_url, request
 from license_client.license_api import LicenseApiClient
-from license_client.payment_api import PaymentApiClient
-from license_client.token_store import TokenLoadResult
 
 
 class FakeResponse:
@@ -81,7 +79,7 @@ def test_remote_request_keeps_requests_default_environment_behavior(monkeypatch)
     assert calls == [("https://license.example.com/device/register", {"json": {"x": 1}, "timeout": 2.0})]
 
 
-def test_license_and_payment_clients_bypass_proxy_for_loopback(monkeypatch):
+def test_license_client_bypasses_proxy_for_loopback(monkeypatch):
     calls = []
 
     class FakeSession:
@@ -89,34 +87,14 @@ def test_license_and_payment_clients_bypass_proxy_for_loopback(monkeypatch):
 
         def request(self, method, url, **kwargs):
             calls.append((method, url, self.trust_env, kwargs))
-            if url.endswith("/device/register"):
-                return FakeResponse({"status": "ok", "signed_license_token": "signed-token"})
-            return FakeResponse(
-                {
-                    "order_id": "pay_" + "1" * 32,
-                    "product_code": "annual_v1",
-                    "amount_fen": 990,
-                    "currency": "CNY",
-                    "provider": "mock",
-                    "status": "WAITING_PAYMENT",
-                    "created_at": "2026-07-06T08:00:00Z",
-                    "expires_at": "2026-07-06T08:15:00Z",
-                }
-            )
+            return FakeResponse({"status": "free_active", "signed_license_token": "signed-token"})
 
     monkeypatch.setattr("license_client.http_transport.requests.Session", FakeSession)
 
     license_result = LicenseApiClient(base_url="http://localhost:8787").register_device(
         device_fingerprint_hash="device-a",
     )
-    order = PaymentApiClient(
-        base_url="http://[::1]:8787",
-        token_loader=lambda: TokenLoadResult(status="loaded", signed_license_token="signed-token"),
-        token_initializer=lambda: None,
-    ).create_or_resume_order()
 
     assert license_result.signed_license_token == "signed-token"
-    assert order.order_id == "pay_" + "1" * 32
-    assert [call[2] for call in calls] == [False, False]
+    assert [call[2] for call in calls] == [False]
     assert calls[0][3]["timeout"] == 2.0
-    assert calls[1][3]["headers"] == {"Authorization": "Bearer signed-token"}

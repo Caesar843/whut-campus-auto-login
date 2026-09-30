@@ -134,7 +134,7 @@ def test_write_creates_jsonl_file_with_sanitized_allowlist_fields(tmp_path):
 def test_sanitizer_filters_sensitive_keys_values_and_full_accounts():
     text = (
         f"password={FAKE_PASSWORD}; token=abc.def; signed_license_token=signed-value; "
-        "LICENSE_PRIVATE_KEY=private-value; PAYMENT_MOCK_ADMIN_TOKEN=admin-value; "
+        "LICENSE_PRIVATE_KEY=private-value; admin_access_token=admin-value; "
         f"cookie=session-cookie; session={RAW_SESSION}; authCode=raw-auth; "
         f"authorization=Bearer {RAW_BEARER}; user={FAKE_ACCOUNT}"
     )

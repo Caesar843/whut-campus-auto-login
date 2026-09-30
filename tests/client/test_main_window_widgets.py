@@ -11,12 +11,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtWidgets import QApplication, QMessageBox, QLineEdit, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QLineEdit
 
 from desktop_app.log_window import RuntimeLogWindow
 from desktop_app.main_window import LICENSE_PLACEHOLDER, MainWindow, MainWindowController
 from desktop_app.widgets import AccountLineEdit, PasswordLineEdit
-from license_client.license_state import LicenseDecision, LicenseStatus
+from license_client.license_state import (
+    FREE_LICENSE_MESSAGE,
+    LicenseDecision,
+    LicenseStatus,
+    free_decision,
+)
 
 
 def _app():
@@ -45,11 +50,6 @@ class FakeLogStore:
         return True
 
 
-class _FakeSignal:
-    def connect(self, callback):
-        self.callback = callback
-
-
 def _controller_for_license(status):
     return MainWindowController(
         load_config_func=lambda: FakeConfig(),
@@ -63,28 +63,14 @@ def _controller_for_license(status):
     )
 
 
-def _is_child_of(widget, ancestor):
-    parent = widget.parent()
-    while parent is not None:
-        if parent is ancestor:
-            return True
-        parent = parent.parent()
-    return False
-
-
-def _layout_contains_widget(layout, widget):
-    for index in range(layout.count()):
-        item = layout.itemAt(index)
-        if item.widget() is widget:
-            return True
-        child_layout = item.layout()
-        if child_layout is not None and _layout_contains_widget(child_layout, widget):
-            return True
-        child_widget = item.widget()
-        if child_widget is not None and child_widget.layout() is not None:
-            if _layout_contains_widget(child_widget.layout(), widget):
-                return True
-    return False
+def _free_controller(**kwargs):
+    defaults = {
+        "load_config_func": lambda: FakeConfig(),
+        "is_autostart_enabled_func": lambda: True,
+        "license_state_func": lambda: free_decision(usage_sync_required=True),
+    }
+    defaults.update(kwargs)
+    return MainWindowController(**defaults)
 
 
 def test_password_field_is_hidden_by_default_and_toggles_visibility():
@@ -117,7 +103,7 @@ def test_account_field_has_placeholder_and_leading_action():
     assert field.actions()
 
 
-def test_main_window_has_runtime_log_entry_button_and_preserves_pricing_copy():
+def test_main_window_has_runtime_log_entry_button_and_free_version_copy():
     _app()
     controller = MainWindowController(
         load_config_func=lambda: FakeConfig(),
@@ -127,10 +113,14 @@ def test_main_window_has_runtime_log_entry_button_and_preserves_pricing_copy():
     window = MainWindow(controller=controller)
 
     assert window.runtime_logs_button.text() == "查看运行日志"
-    assert "免费试用 14 天" in window.notice_label.text()
-    assert "9.9 元" in window.notice_label.text()
-    assert ("8" + ".88") not in window.notice_label.text()
-    assert ("免费试用 " + "7 天") not in window.notice_label.text()
+    notice = window.notice_label.text()
+    assert "免费" in notice
+    assert "无需激活码" in notice
+    assert "校园网账号密码" in notice
+    # 免费版只声明"无试用期、无内购、无需激活码"，不再出现价格与购买入口
+    assert "无试用期" in notice
+    for forbidden in ("9.9", "购买", "付费", "支付", "续费", "元/年"):
+        assert forbidden not in notice
 
 
 def test_main_window_reuses_independent_runtime_log_window():
@@ -212,12 +202,12 @@ def test_clear_config_failure_does_not_reset_license_label(monkeypatch):
         "question",
         lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
     )
-    window.license_label.setText("paid active")
+    window.license_label.setText("free license")
     window.license_label.set_variant("success")
 
     window._confirm_clear_config()
 
-    assert window.license_label.text() == "paid active"
+    assert window.license_label.text() == "free license"
     assert "#166534" in window.license_label.styleSheet()
     assert "clear failed" in window.status_label.text()
 
@@ -244,141 +234,76 @@ def test_main_window_initializes_fields_from_controller():
     assert "未初始化" in window.license_label.text()
 
 
-def test_main_window_payment_button_text_tracks_license_state():
-    _app()
-    cases = [
-        (LicenseStatus.TRIAL_ACTIVE, "购买一年授权", True),
-        (LicenseStatus.TRIAL_EXPIRED, "立即购买授权", True),
-        (LicenseStatus.PAID_ACTIVE, "续费一年", True),
-        (LicenseStatus.PAID_EXPIRED, "续费授权", True),
-        (LicenseStatus.UNINITIALIZED, "初始化授权", True),
-        (LicenseStatus.SERVER_UNREACHABLE, "重试初始化", True),
-        (LicenseStatus.REVOKED, "授权已撤销", False),
-        (LicenseStatus.TOKEN_INVALID, "暂无法购买", False),
-    ]
+# ---------------------------------------------------------------------------
+# 免费版：主界面没有任何支付入口
+# ---------------------------------------------------------------------------
 
-    for status, text, enabled in cases:
+
+def test_main_window_has_no_payment_entry_points():
+    _app()
+    window = MainWindow(controller=_free_controller())
+
+    for attribute in (
+        "payment_button",
+        "_payment_window",
+        "_show_payment_window",
+        "_release_payment_window",
+        "_apply_payment_activation",
+        "_payment_button_text",
+        "_payment_button_enabled",
+        "_payment_button_action",
+    ):
+        assert not hasattr(window, attribute), attribute
+
+    labels = [child.text() for child in window.findChildren(type(window.license_label))]
+    joined = " ".join(labels)
+    for forbidden in ("购买", "续费", "支付", "激活码"):
+        assert forbidden not in joined
+
+
+def test_main_window_shows_free_license_label():
+    _app()
+    window = MainWindow(controller=_free_controller())
+
+    assert window.license_label.text() == FREE_LICENSE_MESSAGE
+    assert "免费" in window.license_label.text()
+    assert "#166534" in window.license_label.styleSheet()
+
+
+def test_license_placeholder_is_free_version_text():
+    assert "免费" in LICENSE_PLACEHOLDER
+    assert "试用" not in LICENSE_PLACEHOLDER
+    assert "9.9" not in LICENSE_PLACEHOLDER
+
+
+def test_license_label_never_blocks_for_legacy_states():
+    _app()
+    for status in (
+        LicenseStatus.TRIAL_EXPIRED,
+        LicenseStatus.PAID_EXPIRED,
+        LicenseStatus.REVOKED,
+        LicenseStatus.TOKEN_INVALID,
+        LicenseStatus.SERVER_UNREACHABLE,
+        LicenseStatus.UNINITIALIZED,
+    ):
         window = MainWindow(controller=_controller_for_license(status))
-
-        assert window.payment_button.text() == text
-        assert window.payment_button.isEnabled() is enabled
-
-
-def test_main_window_payment_button_is_visible_in_real_layout():
-    app = _app()
-    window = MainWindow(controller=_controller_for_license(LicenseStatus.UNINITIALIZED))
-
-    assert window.payment_button.parent() is not None
-    assert _is_child_of(window.payment_button, window)
-    assert _layout_contains_widget(window.centralWidget().layout(), window.payment_button)
-
-    window.show()
-    app.processEvents()
-
-    assert window.payment_button.text() == "初始化授权"
-    assert window.payment_button.isVisible() is True
-    assert window.payment_button.isVisibleTo(window) is True
-    window.close()
+        # 免费版界面不再出现任何"购买/初始化授权"按钮，只展示状态文本
+        assert not hasattr(window, "payment_button")
+        assert window.license_label.text()
 
 
-def test_main_window_payment_button_stays_visible_when_license_load_fails():
-    app = _app()
-
-    def fail_license():
-        raise RuntimeError("license load failed")
-
-    controller = MainWindowController(
-        load_config_func=lambda: FakeConfig(),
-        is_autostart_enabled_func=lambda: True,
-        license_state_func=fail_license,
-    )
-    window = MainWindow(controller=controller)
-
-    window.show()
-    app.processEvents()
-
-    assert window.payment_button.text() == "暂无法购买"
-    assert window.payment_button.isEnabled() is False
-    assert window.payment_button.isVisibleTo(window) is True
-    window.close()
-
-
-def test_uninitialized_payment_button_runs_license_initialization_without_payment(monkeypatch):
-    _app()
-    init_calls = []
-    payment_windows = []
-
-    class FakePaymentWindow(QWidget):
-        activated = _FakeSignal()
-        finished = _FakeSignal()
-
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            payment_windows.append(self)
-
-    monkeypatch.setattr("desktop_app.payment_window.PaymentWindow", FakePaymentWindow)
-    controller = MainWindowController(
-        load_config_func=lambda: FakeConfig(),
-        is_autostart_enabled_func=lambda: True,
-        license_state_func=lambda: LicenseDecision(
-            status=LicenseStatus.UNINITIALIZED,
-            allowed=False,
-            reason="missing_signed_license_token",
-            message_for_ui="uninitialized",
-        ),
-        license_initialize_func=lambda: init_calls.append("init")
-        or LicenseDecision(
-            status=LicenseStatus.TRIAL_ACTIVE,
-            allowed=True,
-            reason="trial_active",
-            message_for_ui="trial_active",
-        ),
-    )
-    window = MainWindow(controller=controller)
-
-    window._start_license_initialization = lambda auto=False: window._finish_license_initialization(
-        window._license_generation,
-        controller.initialize_license(),
-        None,
-    )
-    window.payment_button.click()
-
-    assert init_calls == ["init"]
-    assert payment_windows == []
-
-
-def test_license_initialization_in_progress_disables_button_and_releases_thread():
+def test_usage_report_in_progress_marks_label_and_releases_thread():
     app = _app()
     release = threading.Event()
     init_calls = []
-    current = {
-        "decision": LicenseDecision(
-            status=LicenseStatus.UNINITIALIZED,
-            allowed=False,
-            reason="missing_signed_license_token",
-            message_for_ui="uninitialized",
-        )
-    }
-    active = LicenseDecision(
-        status=LicenseStatus.TRIAL_ACTIVE,
-        allowed=True,
-        reason="trial_active",
-        message_for_ui="trial_active",
-    )
 
     def initialize():
         init_calls.append("init")
         release.wait(2)
-        current["decision"] = active
-        return active
+        return free_decision()
 
     window = MainWindow(
-        controller=MainWindowController(
-            load_config_func=lambda: FakeConfig(),
-            is_autostart_enabled_func=lambda: True,
-            license_state_func=lambda: current["decision"],
-            license_initialize_func=initialize,
-        )
+        controller=_free_controller(license_initialize_func=initialize)
     )
 
     window._start_license_initialization()
@@ -387,104 +312,63 @@ def test_license_initialization_in_progress_disables_button_and_releases_thread(
         app.processEvents()
         time.sleep(0.01)
 
-    window.payment_button.click()
+    # 进行中再次调用不会重复上报
+    window._start_license_initialization()
 
     assert init_calls == ["init"]
-    assert window.payment_button.text() == "正在初始化授权…"
-    assert window.payment_button.isEnabled() is False
+    assert window.license_label.text() == "正在上报设备使用情况…"
     assert window.save_button.isEnabled() is True
     assert window.test_button.isEnabled() is True
 
     release.set()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 3
     while window._license_thread is not None and time.monotonic() < deadline:
         app.processEvents()
         time.sleep(0.01)
 
     assert window._license_thread is None
     assert window._license_worker is None
-    assert window.payment_button.text() == "购买一年授权"
+    assert window.license_label.text() == FREE_LICENSE_MESSAGE
 
 
-def test_license_initialization_success_refreshes_payment_button():
+def test_usage_report_success_applies_free_label():
     _app()
-    current = {
-        "decision": LicenseDecision(
-            status=LicenseStatus.UNINITIALIZED,
-            allowed=False,
-            reason="missing_signed_license_token",
-            message_for_ui="uninitialized",
-        )
-    }
-    active = LicenseDecision(
-            status=LicenseStatus.TRIAL_ACTIVE,
-            allowed=True,
-            reason="trial_active",
-            message_for_ui="trial_active",
-    )
+    window = MainWindow(controller=_free_controller())
+
+    window._finish_license_initialization(0, free_decision(), None)
+
+    assert window.license_label.text() == FREE_LICENSE_MESSAGE
+    assert "#166534" in window.license_label.styleSheet()
+
+
+def test_usage_report_failure_keeps_free_label_and_no_retry_ui():
+    _app()
 
     def initialize():
-        current["decision"] = active
-        return active
+        raise RuntimeError("server unreachable")
 
-    controller = MainWindowController(
-        load_config_func=lambda: FakeConfig(),
-        is_autostart_enabled_func=lambda: True,
-        license_state_func=lambda: current["decision"],
-        license_initialize_func=initialize,
+    window = MainWindow(
+        controller=_free_controller(license_initialize_func=initialize)
     )
-    window = MainWindow(controller=controller)
 
-    window._finish_license_initialization(0, controller.initialize_license(), None)
+    window._finish_license_initialization(0, None, RuntimeError("server unreachable"))
 
-    assert window.payment_button.text() == "购买一年授权"
-    assert window.payment_button.isEnabled() is True
+    assert window.license_label.text() == FREE_LICENSE_MESSAGE
+    assert not hasattr(window, "payment_button")
 
 
-def test_license_initialization_failure_can_retry_without_payment_window(monkeypatch):
+def test_usage_report_invalid_decision_keeps_free_label():
     _app()
-    created = []
-    init_calls = []
+    window = MainWindow(controller=_free_controller())
 
-    class FakePaymentWindow(QWidget):
-        activated = _FakeSignal()
-        finished = _FakeSignal()
+    window._finish_license_initialization(0, "not-a-decision", None)
 
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            created.append(self)
-
-    monkeypatch.setattr("desktop_app.payment_window.PaymentWindow", FakePaymentWindow)
-    controller = MainWindowController(
-        load_config_func=lambda: FakeConfig(),
-        is_autostart_enabled_func=lambda: True,
-        license_state_func=lambda: LicenseDecision(
-            status=LicenseStatus.UNINITIALIZED,
-            allowed=False,
-            reason="missing_signed_license_token",
-            message_for_ui="uninitialized",
-        ),
-        license_initialize_func=lambda: init_calls.append("init")
-        or LicenseDecision(
-            status=LicenseStatus.SERVER_UNREACHABLE,
-            allowed=False,
-            reason="network_unreachable",
-            message_for_ui="network failed",
-        ),
-    )
-    window = MainWindow(controller=controller)
-
-    window._finish_license_initialization(0, controller.initialize_license(), None)
-
-    assert init_calls == ["init"]
-    assert created == []
-    assert window.payment_button.text() == "重试初始化"
-    assert window.payment_button.isEnabled() is True
+    assert window.license_label.text() == FREE_LICENSE_MESSAGE
 
 
-def test_license_initialization_late_response_is_ignored():
+def test_late_usage_report_response_is_ignored():
     _app()
-    window = MainWindow(controller=_controller_for_license(LicenseStatus.UNINITIALIZED))
+    window = MainWindow(controller=_free_controller())
     old_generation = window._license_generation
     window.close()
 
@@ -499,132 +383,26 @@ def test_license_initialization_late_response_is_ignored():
         None,
     )
 
-    assert window.payment_button.text() == "初始化授权"
+    assert window.license_label.text() == FREE_LICENSE_MESSAGE
 
 
-def test_main_window_reuses_single_payment_window(monkeypatch):
+def test_auto_usage_report_runs_once_on_startup():
     _app()
-    created = []
-
-    class FakePaymentWindow(QWidget):
-        activated = _FakeSignal()
-        finished = _FakeSignal()
-
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            created.append(self)
-            self.show_calls = 0
-
-        def show(self):
-            self.show_calls += 1
-
-        def raise_(self):
-            pass
-
-        def activateWindow(self):
-            pass
-
-    monkeypatch.setattr("desktop_app.payment_window.PaymentWindow", FakePaymentWindow)
-    window = MainWindow(controller=_controller_for_license(LicenseStatus.TRIAL_ACTIVE))
-
-    window.payment_button.click()
-    first = window._payment_window
-    window.payment_button.click()
-
-    assert len(created) == 1
-    assert window._payment_window is first
-    assert first.show_calls == 2
-
-
-def test_payment_activation_keeps_paid_state_when_old_license_init_finishes(monkeypatch):
-    _app()
-    paid = LicenseDecision(
-        status=LicenseStatus.PAID_ACTIVE,
-        allowed=True,
-        reason="paid_active",
-        message_for_ui="paid-after-refresh",
+    calls = []
+    controller = _free_controller(
+        license_initialize_func=lambda: calls.append("init") or free_decision()
     )
+    window = MainWindow(controller=controller, auto_initialize_license=False)
 
-    class Signal:
-        def __init__(self):
-            self._callbacks = []
-
-        def connect(self, callback):
-            self._callbacks.append(callback)
-
-        def emit(self, *args):
-            for callback in list(self._callbacks):
-                callback(*args)
-
-    class FakePaymentWindow(QWidget):
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self.activated = Signal()
-            self.finished = Signal()
-
-        def show(self):
-            pass
-
-        def raise_(self):
-            pass
-
-        def activateWindow(self):
-            pass
-
-    monkeypatch.setattr("desktop_app.payment_window.PaymentWindow", FakePaymentWindow)
-    window = MainWindow(
-        controller=MainWindowController(
-            load_config_func=lambda: FakeConfig(),
-            is_autostart_enabled_func=lambda: True,
-            license_state_func=lambda: paid,
-        )
-    )
-    window._license_generation += 1
-    pending_generation = window._license_generation
-
-    window.payment_button.click()
-    payment_window = window._payment_window
-    payment_window.activated.emit(paid)
-    payment_window.finished.emit()
-    window._finish_license_initialization(
-        pending_generation,
-        LicenseDecision(
-            status=LicenseStatus.TOKEN_INVALID,
-            allowed=False,
-            reason="signature_invalid",
-            message_for_ui="old-invalid",
-        ),
-        None,
-    )
-
-    assert window.license_label.text() == "paid-after-refresh"
-    assert window._payment_window is None
+    assert calls == []
+    window.load_state()
+    assert calls == []
+    window.close()
 
 
-def test_expired_license_payment_button_click_opens_payment_window(monkeypatch):
-    _app()
+def test_main_window_never_imports_payment_module():
+    import desktop_app.main_window as main_window_module
 
-    class FakePaymentWindow(QWidget):
-        activated = _FakeSignal()
-        finished = _FakeSignal()
-
-        def __init__(self, parent=None):
-            super().__init__(parent)
-
-        def show(self):
-            pass
-
-        def raise_(self):
-            pass
-
-        def activateWindow(self):
-            pass
-
-    monkeypatch.setattr("desktop_app.payment_window.PaymentWindow", FakePaymentWindow)
-    for status in (LicenseStatus.TRIAL_EXPIRED, LicenseStatus.PAID_EXPIRED):
-        window = MainWindow(controller=_controller_for_license(status))
-
-        assert window.payment_button.isEnabled() is True
-        window.payment_button.click()
-
-        assert isinstance(window._payment_window, FakePaymentWindow)
+    text = Path(main_window_module.__file__).read_text(encoding="utf-8")
+    for forbidden in ("payment", "Payment", "PAYMENT", "wechat"):
+        assert forbidden not in text, forbidden

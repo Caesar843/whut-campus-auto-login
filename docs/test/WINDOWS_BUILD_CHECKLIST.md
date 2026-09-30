@@ -16,12 +16,12 @@ $env:PYTHONDONTWRITEBYTECODE='1'
 $env:QT_QPA_PLATFORM='offscreen'
 python .\scripts\verify_windows_build_environment.py
 python -m pip check
-python -m pytest -p no:cacheprovider --ignore=tests\client\test_payment_flow.py tests\campus_login tests\client tests\license_client tests\test_windows_build_config_lifecycle.py tests\test_windows_build_environment.py tests\test_windows_release_baseline.py
+python -m pytest -p no:cacheprovider tests\campus_login tests\client tests\license_client tests\test_windows_build_config_lifecycle.py tests\test_windows_build_environment.py tests\test_windows_release_baseline.py
 ```
 
 The environment verifier must pass before any release build. Run `scripts/build_windows.ps1`; `WHUTCampusAutoLogin.spec` 不能直接运行 because it rejects a missing or stale build session.
 
-The Windows build lock excludes server-only dependencies. The scoped command excludes `tests\client\test_payment_flow.py` because it imports a license-server test helper. Run the complete repository suite separately in a development environment that also installs `requirements-server.txt`.
+The Windows build lock excludes server-only dependencies. Run the complete repository suite separately in a development environment that also installs `requirements-server.txt`.
 
 ## Controlled release command
 
@@ -35,7 +35,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 `
   -LicensePublicKey "<production-public-key>"
 ```
 
-P6-A1c must replace both placeholder values with approved production inputs. Do not place a private key or payment secret in this command.
+P6-A1c must replace both placeholder values with approved production inputs. Do not place a private key or admin token in this command.
 
 ## Manual checks after an approved P6-A1c build
 

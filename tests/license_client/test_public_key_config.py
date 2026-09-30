@@ -13,7 +13,6 @@ from license_client.constants import DEFAULT_LICENSE_SERVER_URL, resolve_license
 from license_client.license_api import LicenseApiClient
 from license_client.license_guard import get_current_license_state
 from license_client.license_state import LicenseStatus
-from license_client.payment_api import PaymentApiClient
 from license_client.public_key import (
     EMBEDDED_CONFIG_FILENAME,
     EMBEDDED_CONFIG_MODULE_NAME,
@@ -22,7 +21,7 @@ from license_client.public_key import (
     resolve_license_public_key,
     write_embedded_build_config,
 )
-from license_client.token_store import save_signed_license_token
+from license_client.token_store import save_signed_license_token  # noqa: F401  (保留 token 存储能力)
 
 
 PRODUCT_ID = "whut-campus-auto-login"
@@ -155,141 +154,39 @@ def test_release_builds_ignore_runtime_public_key_env(build_environment):
     )
 
 
-def test_production_packaged_public_key_verifies_token_when_env_is_malicious(
-    tmp_path,
-    monkeypatch,
-):
-    private_key, public_key_b64 = _key_pair()
-    _malicious_private, malicious_public_key_b64 = _key_pair()
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(_signed_license_token(private_key), token_path=token_path)
-    monkeypatch.setenv("LICENSE_PUBLIC_KEY", malicious_public_key_b64)
+def test_free_license_state_allows_use_without_local_token(tmp_path, monkeypatch):
+    """免费版：没有本地凭证也直接放行，且只上报设备使用情况。"""
+    monkeypatch.setenv("LICENSE_PUBLIC_KEY", "malicious-key")
     monkeypatch.setattr(
         "license_client.public_key._load_embedded_build_config",
-        lambda: ("production", public_key_b64),
+        lambda: ("production", "packaged-key"),
     )
 
-    decision = get_current_license_state(
-        token_path=token_path,
-        device_fingerprint_hash="device-a",
-    )
+    decision = get_current_license_state()
 
-    assert decision.status == LicenseStatus.PAID_ACTIVE
+    assert decision.status == LicenseStatus.FREE
     assert decision.allowed is True
+    assert decision.usage_sync_required is True
 
 
-def test_production_missing_packaged_public_key_fails_closed_even_with_env(
-    tmp_path,
-    monkeypatch,
-):
-    attacker_private_key, attacker_public_key_b64 = _key_pair()
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(_signed_license_token(attacker_private_key), token_path=token_path)
-    monkeypatch.setenv("LICENSE_PUBLIC_KEY", attacker_public_key_b64)
+def test_free_license_state_ignores_missing_or_invalid_public_key(tmp_path, monkeypatch):
+    """免费版：公钥缺失/错误不再影响放行，也不因签名问题阻断登录。"""
     monkeypatch.setattr(
         "license_client.public_key._load_embedded_build_config",
         lambda: ("production", ""),
     )
-
-    decision = get_current_license_state(
-        token_path=token_path,
-        device_fingerprint_hash="device-a",
-    )
-
-    assert decision.status == LicenseStatus.TOKEN_INVALID
-    assert decision.reason == "missing_public_key"
-
-
-def test_explicit_public_key_parameter_remains_test_injection(tmp_path, monkeypatch):
-    private_key, public_key_b64 = _key_pair()
-    _wrong_private_key, wrong_public_key_b64 = _key_pair()
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(_signed_license_token(private_key), token_path=token_path)
-    monkeypatch.setenv("LICENSE_PUBLIC_KEY", wrong_public_key_b64)
-    monkeypatch.setattr(
-        "license_client.public_key._load_embedded_build_config",
-        lambda: ("production", wrong_public_key_b64),
-    )
-
-    decision = get_current_license_state(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-    )
-
-    assert decision.status == LicenseStatus.PAID_ACTIVE
-    assert decision.allowed is True
-
-
-def test_guard_uses_packaged_public_key_when_env_missing(tmp_path, monkeypatch):
-    private_key, public_key_b64 = _key_pair()
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(_signed_license_token(private_key), token_path=token_path)
-    monkeypatch.delenv("LICENSE_PUBLIC_KEY", raising=False)
-    monkeypatch.setattr(
-        "license_client.public_key._load_embedded_build_config",
-        lambda: ("production", public_key_b64),
-    )
-
-    decision = get_current_license_state(
-        token_path=token_path,
-        device_fingerprint_hash="device-a",
-    )
-
-    assert decision.status == LicenseStatus.PAID_ACTIVE
-    assert decision.allowed is True
-
-
-def test_missing_public_key_fails_closed(tmp_path, monkeypatch):
-    private_key, _public_key_b64 = _key_pair()
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(_signed_license_token(private_key), token_path=token_path)
-    monkeypatch.delenv("LICENSE_PUBLIC_KEY", raising=False)
-    monkeypatch.setattr(
-        "license_client.public_key._load_embedded_build_config",
-        lambda: ("production", ""),
-    )
-
-    decision = get_current_license_state(
-        token_path=token_path,
-        device_fingerprint_hash="device-a",
-    )
-
-    assert decision.status == LicenseStatus.TOKEN_INVALID
-    assert decision.reason == "missing_public_key"
-
-
-def test_wrong_or_invalid_public_key_does_not_verify_token(tmp_path, monkeypatch):
-    private_key, _public_key_b64 = _key_pair()
-    _wrong_private, wrong_public_key_b64 = _key_pair()
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(_signed_license_token(private_key), token_path=token_path)
-
-    monkeypatch.delenv("LICENSE_PUBLIC_KEY", raising=False)
-    monkeypatch.setattr(
-        "license_client.public_key._load_embedded_build_config",
-        lambda: ("production", wrong_public_key_b64),
-    )
-
-    wrong_key = get_current_license_state(
-        token_path=token_path,
-        device_fingerprint_hash="device-a",
-    )
+    missing_key = get_current_license_state()
 
     monkeypatch.setattr(
         "license_client.public_key._load_embedded_build_config",
         lambda: ("production", "not-a-public-key"),
     )
+    invalid_key = get_current_license_state()
 
-    invalid_key = get_current_license_state(
-        token_path=token_path,
-        device_fingerprint_hash="device-a",
-    )
-
-    assert wrong_key.status == LicenseStatus.TOKEN_INVALID
-    assert wrong_key.reason == "signature_invalid"
-    assert invalid_key.status == LicenseStatus.TOKEN_INVALID
-    assert invalid_key.reason == "signature_invalid"
+    assert missing_key.status == LicenseStatus.FREE
+    assert missing_key.allowed is True
+    assert invalid_key.status == LicenseStatus.FREE
+    assert invalid_key.allowed is True
 
 
 def test_write_embedded_build_config_writes_only_allowed_constants(tmp_path):
@@ -401,12 +298,10 @@ def test_release_clients_use_same_url_from_real_embedded_module(tmp_path, monkey
         assert resolve_build_environment() == "production"
         assert resolve_license_public_key() == public_key_b64
         license_client = LicenseApiClient()
-        payment_client = PaymentApiClient()
     finally:
         restore()
 
     assert license_client.base_url == "https://frozen-license.example.test"
-    assert payment_client.base_url == license_client.base_url
 
 
 def test_real_embedded_module_reload_does_not_reuse_sys_modules_cache(tmp_path):
@@ -561,10 +456,7 @@ def test_pyinstaller_config_freezes_embedded_config_module_not_external_txt():
     assert "build/generated/" in gitignore
     for forbidden in (
         "LICENSE_PRIVATE_KEY",
-        "PAYMENT_MOCK_ADMIN_TOKEN",
-        "MOCK_PAYMENT_ADMIN_TOKEN",
-        "WECHAT_PAY_MERCHANT_PRIVATE_KEY",
-        "WECHAT_PAY_API_V3_KEY",
+        "ADMIN_ACCESS_TOKEN_SHA256",
     ):
         assert forbidden not in spec
         assert forbidden not in build_script

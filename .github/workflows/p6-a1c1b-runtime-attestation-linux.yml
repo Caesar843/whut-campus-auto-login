@@ -14,7 +14,7 @@ on:
       - "license_server/config.py"
       - "license_server/device_proof.py"
       - "license_server/ed25519_keys.py"
-      - "license_server/payment_routes.py"
+      - "license_server/admin_routes.py"
       - "license_server/routes.py"
       - "license_server/runtime_attestation.py"
       - "license_server/signer.py"

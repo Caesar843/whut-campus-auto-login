@@ -15,9 +15,6 @@ from license_client.public_key import (
 
 PRODUCT_ID = "whut-campus-auto-login"
 TRIAL_DAYS = 14
-PAID_LICENSE_DAYS = 365
-PRICE_AMOUNT = "9.9"
-PRICE_CURRENCY = "CNY"
 DEFAULT_LICENSE_SERVER_URL = "http://127.0.0.1:8787"
 LICENSE_TOKEN_FILE_NAME = "license_token.json"
 

@@ -1,8 +1,19 @@
+"""免费版授权签发。
+
+免费版不再区分试用/付费：设备注册成功后直接获得一条永久有效的 free 授权。
+订阅/试用相关的时间计算与支付订单关联字段已随支付模块移除。
+"""
+
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from license_server.signer import datetime_text
+
+
+FREE_LICENSE_TYPE = "free"
+FREE_LICENSE_SOURCE = "free"
+FREE_LICENSE_EXPIRES_AT = datetime(9999, 12, 31, 0, 0, 0, tzinfo=timezone.utc)
 
 
 def create_license(
@@ -13,14 +24,13 @@ def create_license(
     source: str,
     starts_at: datetime,
     expires_at: datetime,
-    order_id: str | None = None,
 ):
     cursor = connection.execute(
         """
         INSERT INTO licenses (
             device_id, license_type, status, starts_at, expires_at, source, order_id,
             created_at, revoked_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)
         """,
         (
             device_id,
@@ -29,7 +39,6 @@ def create_license(
             datetime_text(starts_at),
             datetime_text(expires_at),
             source,
-            order_id,
             datetime_text(starts_at),
         ),
     )
@@ -39,10 +48,18 @@ def create_license(
     ).fetchone()
 
 
+def create_free_license(connection, *, device_id: int, starts_at: datetime):
+    return create_license(
+        connection,
+        device_id=device_id,
+        license_type=FREE_LICENSE_TYPE,
+        source=FREE_LICENSE_SOURCE,
+        starts_at=starts_at,
+        expires_at=FREE_LICENSE_EXPIRES_AT,
+    )
+
+
 def latest_license(connection, device_id: int):
-    paid = latest_paid_license(connection, device_id)
-    if paid is not None:
-        return paid
     return connection.execute(
         """
         SELECT * FROM licenses
@@ -53,34 +70,15 @@ def latest_license(connection, device_id: int):
     ).fetchone()
 
 
-def latest_paid_license(connection, device_id: int):
+def active_license(connection, device_id: int):
+    """返回该设备当前可用的授权（active 且未过期），没有则返回 None。"""
     return connection.execute(
         """
         SELECT * FROM licenses
-        WHERE device_id = ? AND license_type = 'paid'
+        WHERE device_id = ?
+          AND status = 'active'
+          AND expires_at > ?
         ORDER BY id DESC LIMIT 1
         """,
-        (device_id,),
+        (device_id, datetime_text(datetime.now(timezone.utc))),
     ).fetchone()
-
-
-def paid_active_license_exists(
-    connection,
-    *,
-    device_fingerprint_hash: str,
-    now: datetime,
-) -> bool:
-    row = connection.execute(
-        """
-        SELECT licenses.id
-        FROM licenses
-        JOIN devices ON devices.id = licenses.device_id
-        WHERE devices.device_fingerprint_hash = ?
-          AND licenses.license_type = 'paid'
-          AND licenses.status = 'active'
-          AND licenses.expires_at > ?
-        LIMIT 1
-        """,
-        (device_fingerprint_hash, datetime_text(now)),
-    ).fetchone()
-    return row is not None

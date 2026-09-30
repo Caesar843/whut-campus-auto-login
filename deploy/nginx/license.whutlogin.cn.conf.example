@@ -1,5 +1,7 @@
 # Template only. Replace every REPLACE_WITH_* value before production use.
 # Production requires HTTPS with a valid certificate.
+# /internal/admin and /internal/runtime-attestation must stay blocked from
+# the public internet; access the admin console through an SSH tunnel only.
 # Do not put administrator tokens or token hashes in Nginx config.
 
 server {

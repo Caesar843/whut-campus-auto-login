@@ -1,6 +1,6 @@
 # 授权服务腾讯云部署说明
 
-本文档只说明授权服务部署配置。授权服务已完成预生产部署；当前后台只支持查询、审计和追加订单售后备注，不支持补发授权、关单、冻结、修改订单状态或修改授权。
+本文档只说明免费版授权服务的部署配置。授权服务已完成预生产部署；服务端职责仅剩设备注册、永久免费授权签发、内部只读后台统计与运行时证明。当前后台只支持只读查询、审计查看与追加备注，不支持签发、冻结或修改授权。
 
 ## 部署目标
 
@@ -47,7 +47,7 @@ sudo chmod 0600 /etc/whut-campus-auto-login/license-server.env
 python3 scripts/dev/generate_license_keys.py
 ```
 
-私钥只放在服务器环境变量 `LICENSE_PRIVATE_KEY` 中，不能提交到仓库。公钥 `LICENSE_PUBLIC_KEY` 用于客户端验签配置。
+生产私钥只保存为服务器上的本地文件（例如 `/etc/whut-campus-auto-login/license-private-key.b64`，权限 `0600`），并通过环境变量 `LICENSE_PRIVATE_KEY_FILE` 指向它。私钥内容不能提交到仓库，也不能复制到客户端；客户端只需要公钥 `LICENSE_PUBLIC_KEY` 用于验签配置。
 
 ## 环境变量
 
@@ -55,10 +55,12 @@ python3 scripts/dev/generate_license_keys.py
 
 ```bash
 LICENSE_SERVER_URL=http://127.0.0.1:8787
-LICENSE_PRIVATE_KEY=replace_with_base64_or_configured_private_key
+LICENSE_PRIVATE_KEY_FILE=/etc/whut-campus-auto-login/license-private-key.b64
 LICENSE_PUBLIC_KEY=replace_with_public_key
 DATABASE_URL=sqlite:////var/lib/whut-campus-auto-login/license.sqlite3
 LICENSE_SERVER_ENV=production
+LICENSE_RUNTIME_ATTESTATION_ENABLED=false
+LICENSE_RUNTIME_SOURCE_COMMIT=
 ADMIN_ENABLED=false
 ADMIN_OPERATOR_NAME=
 ADMIN_ACCESS_TOKEN_SHA256=
@@ -70,9 +72,11 @@ ADMIN_ACCESS_TOKEN_SHA256=
 /var/lib/whut-campus-auto-login/license.sqlite3
 ```
 
-不要把 `.env`、私钥、token、本地数据库或支付密钥提交到仓库。
+不要把 `.env`、私钥、后台管理令牌或本地数据库文件提交到仓库。
 
 生产默认保持 `ADMIN_ENABLED=false`。只有 SSH 隧道或受控内网入口验证完成后，才允许启用后台；启用时 `ADMIN_OPERATOR_NAME` 必须非空，`ADMIN_ACCESS_TOKEN_SHA256` 必须是管理员 Bearer Token 的 SHA-256 十六进制摘要。不要把原始 Token 或摘要写入 Nginx 配置。
+
+`LICENSE_RUNTIME_ATTESTATION_ENABLED` 默认保持 `false`。启用运行时证明前，先确认服务以 production 环境运行，并把 `LICENSE_RUNTIME_SOURCE_COMMIT` 设置为实际部署的 40 位 commit；公网 Nginx 必须继续拦截 `/internal/runtime-attestation`。
 
 ## 安装依赖
 
@@ -101,6 +105,18 @@ curl http://127.0.0.1:8787/healthz
 ```json
 {"status":"ok"}
 ```
+
+## 设备注册验证
+
+服务启动后，可以用本地 curl 验证设备注册与免费授权签发（`product_id` 固定为 `whut-campus-auto-login`）：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8787/device/register \
+  -H 'Content-Type: application/json' \
+  -d '{"product_id":"whut-campus-auto-login","device_fingerprint_hash":"local-test-device"}'
+```
+
+正常返回包含 `license_type` 为 `free`、`expires_at` 为 `9999-12-31T00:00:00Z` 的 `signed_license_token`。历史客户端附带的 `device_name`、`os`、`app_version` 字段会被忽略；携带校园网账号相关字段会返回 422。已注册设备可用 `POST /license/refresh` 刷新授权，未注册设备返回 404 `device_not_found`。
 
 ## systemd
 
@@ -131,41 +147,7 @@ sudo journalctl -u whut-license-server -n 100 --no-pager
 sudo journalctl -u whut-license-server -f
 ```
 
-上线前确认 journald 留存策略，例如 `/etc/systemd/journald.conf` 中的 `SystemMaxUse`、`MaxRetentionSec` 或所在系统的集中日志方案。不要在日志中记录管理员 Token、支付密钥、私钥或校园网凭据。
-
-### 支付对账补偿 Worker
-
-支付对账补偿 Worker 是 Web 服务之外的独立进程，用于支付回调缺失时的后台补偿。它不影响客户端手动刷新支付状态：Worker 默认关闭或未运行时，手动刷新仍可正常使用。该进程默认关闭，安装 unit 不代表启用或启动。
-
-reconciliation Worker 与 Web 服务是两个独立 systemd unit。Worker unit 中的 `After=whut-license-server.service` 只提供共同启动时的顺序，不会把 Worker 生命周期绑定到 Web 服务；重启 Web 服务不会停止该 Worker，Web 服务重启后应单独确认该 Worker 状态。Worker 不会因为 Web 服务再次启动而自动启动，启用 Worker 必须是单独的管理员动作。
-
-保持环境文件中的总开关为：
-
-```bash
-PAYMENT_RECONCILIATION_WORKER_ENABLED=false
-```
-
-安装独立 unit 后只刷新 systemd 配置并确认它仍为 disabled、inactive：
-
-```bash
-sudo cp deploy/systemd/whut-payment-reconciliation-worker.service.example /etc/systemd/system/whut-payment-reconciliation-worker.service
-sudo systemctl daemon-reload
-sudo systemctl is-enabled whut-payment-reconciliation-worker.service
-sudo systemctl is-active whut-payment-reconciliation-worker.service
-```
-
-启用前必须逐项确认：Web 服务已完成数据库迁移；当前数据库精确匹配 Schema V5；环境文件使用绝对 SQLite 路径；`PAYMENT_PROVIDER=wechat_native` 且微信支付配置完整；生产网络和真实微信商户查单、关单权限已经验证；已经取得完整数据库备份。Worker 自身只做只读 Schema V5 启动门禁，不会执行迁移，也不会创建或修复数据库。
-
-上述生产前置条件和真实微信商户验证未全部完成时，不得把总开关改为 true，不得启用或启动该 unit。本轮不启用该 Worker，不声称已验证生产网络、真实微信商户查单或关单，也不声称生产数据库已出现 claim。启动日志不得出现 Secret。该进程不得与 Notification Worker 混用入口或 unit。
-
-停止并保持关闭的回滚方式：
-
-```bash
-sudo systemctl stop whut-payment-reconciliation-worker.service
-sudo systemctl disable whut-payment-reconciliation-worker.service
-```
-
-随后把环境文件恢复为 `PAYMENT_RECONCILIATION_WORKER_ENABLED=false`。不要通过 Worker 入口运行数据库迁移；需要迁移时仍由既有 Web 服务部署流程在备份和维护窗口内完成。
+上线前确认 journald 留存策略，例如 `/etc/systemd/journald.conf` 中的 `SystemMaxUse`、`MaxRetentionSec` 或所在系统的集中日志方案。不要在日志中记录管理员 Token、私钥或校园网凭据。
 
 ## Nginx
 
@@ -211,9 +193,9 @@ ssh -N -L 8787:127.0.0.1:8787 deploy_user@SERVER_HOST
 
 随后在本机访问 `http://127.0.0.1:8787/internal/admin/`。管理员 Token 只在后台页面输入，不放进 URL、Nginx 配置或书签。
 
-## SQLite V1 到 V2 升级
+## SQLite 数据库备份与升级注意事项
 
-升级前停止服务并查看真实配置：
+升级或重新部署前，先停止服务并查看真实配置：
 
 ```bash
 sudo systemctl stop whut-license-server
@@ -247,7 +229,7 @@ sudo stat --format='%n %s bytes %U:%G %a' "$DB_PATH"
 
 ```bash
 BACKUP_DIR=/var/backups/whut-license-server
-BACKUP="$BACKUP_DIR/license.sqlite3.v1-pre-p4-$(date -u +%Y%m%dT%H%M%SZ)"
+BACKUP="$BACKUP_DIR/license.sqlite3.pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
 
 sudo install -d -m 0700 "$BACKUP_DIR"
 sudo cp -a -- "$DB_PATH" "$BACKUP"
@@ -255,33 +237,35 @@ sudo test -s "$BACKUP"
 sudo sqlite3 "$BACKUP" 'PRAGMA integrity_check;'
 ```
 
-部署新版本后启动服务，初始化逻辑会在启动时完成 V1 到 V2 迁移：
+部署新版本后启动服务，初始化逻辑会在启动时完成历史库兼容检查并把版本标记写入 `schema_meta`：
 
 ```bash
 sudo systemctl start whut-license-server
 sudo systemctl status whut-license-server
 ```
 
-验证版本、表和索引：
+验证版本、核心表和索引：
 
 ```bash
 sqlite3 "$DB_PATH" "SELECT key, value FROM schema_meta ORDER BY key;"
-sqlite3 "$DB_PATH" "PRAGMA table_info(admin_audit_logs);"
-sqlite3 "$DB_PATH" "PRAGMA index_list(admin_audit_logs);"
+sqlite3 "$DB_PATH" "PRAGMA table_info(devices);"
+sqlite3 "$DB_PATH" "PRAGMA table_info(licenses);"
 curl http://127.0.0.1:8787/healthz
 ```
 
-回滚前必须再次确认当前 shell 中的 `DB_PATH` 和 `BACKUP` 指向正确文件。回滚时停止新服务，保留失败后的 V2 数据库现场，恢复 V1 备份并切回部署前程序版本：
+当前 schema 版本为 6，核心表只有 `devices`、`licenses`、`admin_audit_logs`、`schema_meta`。历史遗留业务表保持原样，升级过程不会清空或迁移它们；`schema_version` 高于 6 的数据库会被服务拒绝启动。升级前必须完成备份并确认备份可恢复。
+
+回滚前必须再次确认当前 shell 中的 `DB_PATH` 和 `BACKUP` 指向正确文件。回滚时停止新服务，保留失败后的数据库现场，恢复备份并切回部署前程序版本：
 
 ```bash
 sudo systemctl stop whut-license-server
-FAILED_DB="${DB_PATH}.failed-v2-$(date -u +%Y%m%dT%H%M%SZ)"
+FAILED_DB="${DB_PATH}.failed-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
 sudo mv -- "$DB_PATH" "$FAILED_DB"
 sudo cp -a -- "$BACKUP" "$DB_PATH"
 sudo systemctl start whut-license-server
 ```
 
-已升级到 V2 的数据库禁止再由旧程序打开；旧程序必须配合恢复出的 V1 备份使用。
+已升级到新版 schema 的数据库禁止再由旧程序打开；旧程序必须配合恢复出的备份使用。
 
 ## 客户端切换生产授权服务
 
@@ -310,4 +294,4 @@ LICENSE_SERVER_URL=https://license.whutlogin.cn
 - 用户上网内容
 - 本地运行日志
 
-授权服务只处理设备授权状态、试用时间和后续支付订单状态。当前部署配置不接支付，不提交支付密钥。支付 V1 仅支持微信 Native；支付表、Mock 网关、支付客户端和真实微信商户联调仍以 `docs/design/PAYMENT_V1_IMPLEMENTATION.md` 为准。
+授权服务只处理设备指纹哈希、设备注册与免费授权签发（`license_type=free`、`expires_at=9999-12-31T00:00:00Z`），并保存后台备注与审计记录。数据库中历史遗留的 `payment_orders` 等表（见 `license_server/db.py` 的 `LEGACY_PAYMENT_TABLES`）保持原样：不清空、不校验、不读写。当前部署不包含任何商业化端点，也不提交任何商业化密钥。

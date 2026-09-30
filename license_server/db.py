@@ -1,14 +1,23 @@
+"""免费版授权服务数据库层。
+
+schema 版本 6 = 免费版核心结构：
+    devices / licenses / admin_audit_logs / schema_meta
+
+支付时代的表（payment_orders、payment_notifications、payment_reconciliations、
+license_grants 等）随支付模块一起移除：
+- 新建库不再创建这些表；
+- 历史库里如果还留着它们，保持原样、不再读写、也不参与结构校验，
+  以免误删历史订单数据。
+"""
+
 from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from license_server.payment import ANNUAL_V1, OrderStatus
 
-
-SUPPORTED_SCHEMA_VERSION = 5
+SUPPORTED_SCHEMA_VERSION = 6
 BUSY_TIMEOUT_MS = 5000
 
 LEGACY_REMOVED_DEVICE_COLUMNS = (
@@ -20,6 +29,24 @@ LEGACY_REMOVED_DEVICE_COLUMNS = (
 )
 LEGACY_REMOVED_LICENSE_COLUMNS = (
     "revoked_reason",
+)
+
+# 免费版核心表：结构会被严格校验。
+CORE_TABLES = (
+    "devices",
+    "licenses",
+    "admin_audit_logs",
+    "schema_meta",
+)
+
+# 支付时代的遗留表：只识别名称，不校验、不读写。
+LEGACY_PAYMENT_TABLES = (
+    "payment_orders",
+    "payment_notifications",
+    "payment_reconciliations",
+    "license_grants",
+    "payment_orders_legacy_v0",
+    "payment_notifications_v3",
 )
 
 LEGACY_UNVERSIONED_COLUMNS = {
@@ -42,25 +69,6 @@ LEGACY_UNVERSIONED_COLUMNS = {
         ("created_at", "TEXT", 1, None, 0, 0),
         ("revoked_at", "TEXT", 0, None, 0, 0),
     ),
-    "payment_orders": (
-        ("id", "INTEGER", 0, None, 1, 0),
-        ("order_id", "TEXT", 1, None, 0, 0),
-        ("product_id", "TEXT", 1, None, 0, 0),
-        ("device_fingerprint_hash", "TEXT", 1, None, 0, 0),
-        ("amount", "TEXT", 1, None, 0, 0),
-        ("currency", "TEXT", 1, None, 0, 0),
-        ("payment_channel", "TEXT", 1, None, 0, 0),
-        ("order_status", "TEXT", 1, None, 0, 0),
-        ("payment_status", "TEXT", 1, None, 0, 0),
-        ("provider_status", "TEXT", 1, None, 0, 0),
-        ("provider_order_id", "TEXT", 0, None, 0, 0),
-        ("transaction_id", "TEXT", 0, None, 0, 0),
-        ("created_at", "TEXT", 1, None, 0, 0),
-        ("expire_at", "TEXT", 1, None, 0, 0),
-        ("paid_at", "TEXT", 0, None, 0, 0),
-        ("closed_at", "TEXT", 0, None, 0, 0),
-        ("updated_at", "TEXT", 1, None, 0, 0),
-    ),
 }
 
 SCHEMA_META_COLUMNS = (
@@ -73,7 +81,6 @@ LEGACY_UNVERSIONED_FOREIGN_KEYS = {
     "licenses": {
         ("devices", "device_id", "id", "NO ACTION", "NO ACTION", "NONE"),
     },
-    "payment_orders": set(),
 }
 
 LEGACY_UNVERSIONED_INDEXES = {
@@ -81,21 +88,6 @@ LEGACY_UNVERSIONED_INDEXES = {
         (None, 1, "u", 0, (("device_fingerprint_hash", 0, "BINARY"),)),
     },
     "licenses": set(),
-    "payment_orders": {
-        (None, 1, "u", 0, (("order_id", 0, "BINARY"),)),
-        (
-            "idx_payment_orders_device_open",
-            0,
-            "c",
-            0,
-            (
-                ("device_fingerprint_hash", 0, "BINARY"),
-                ("payment_status", 0, "BINARY"),
-                ("order_status", 0, "BINARY"),
-                ("expire_at", 0, "BINARY"),
-            ),
-        ),
-    },
 }
 
 SCHEMA_META_INDEXES = {
@@ -105,8 +97,6 @@ SCHEMA_META_INDEXES = {
 LEGACY_UNVERSIONED_OBJECTS = {
     ("table", "devices"),
     ("table", "licenses"),
-    ("table", "payment_orders"),
-    ("index", "idx_payment_orders_device_open"),
 }
 
 LEGACY_UNVERSIONED_TABLE_SQL = {
@@ -132,27 +122,6 @@ LEGACY_UNVERSIONED_TABLE_SQL = {
             created_at TEXT NOT NULL,
             revoked_at TEXT,
             FOREIGN KEY (device_id) REFERENCES devices(id)
-        )
-    """,
-    "payment_orders": """
-        CREATE TABLE payment_orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id TEXT NOT NULL UNIQUE,
-            product_id TEXT NOT NULL,
-            device_fingerprint_hash TEXT NOT NULL,
-            amount TEXT NOT NULL,
-            currency TEXT NOT NULL,
-            payment_channel TEXT NOT NULL,
-            order_status TEXT NOT NULL,
-            payment_status TEXT NOT NULL,
-            provider_status TEXT NOT NULL,
-            provider_order_id TEXT,
-            transaction_id TEXT,
-            created_at TEXT NOT NULL,
-            expire_at TEXT NOT NULL,
-            paid_at TEXT,
-            closed_at TEXT,
-            updated_at TEXT NOT NULL
         )
     """,
 }
@@ -186,490 +155,6 @@ CREATE TABLE IF NOT EXISTS licenses (
     revoked_at TEXT,
     FOREIGN KEY (device_id) REFERENCES devices(id)
 );
-"""
-
-PAYMENT_ORDER_SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS payment_orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id TEXT NOT NULL UNIQUE,
-    device_fingerprint_hash TEXT NOT NULL,
-    product_code TEXT NOT NULL,
-    amount_fen INTEGER NOT NULL CHECK(amount_fen > 0),
-    currency TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN (
-        '{OrderStatus.CREATED.value}',
-        '{OrderStatus.WAITING_PAYMENT.value}',
-        '{OrderStatus.PAID.value}',
-        '{OrderStatus.CLOSED.value}',
-        '{OrderStatus.ABNORMAL.value}'
-    )),
-    open_slot TEXT CHECK(open_slot IS NULL OR open_slot = 'open'),
-    provider_order_id TEXT,
-    provider_transaction_id TEXT UNIQUE,
-    provider_trade_state TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    paid_at TEXT,
-    closed_at TEXT,
-    security_error_code TEXT,
-    provider_create_claimed_at TEXT,
-    provider_create_attempt_count INTEGER NOT NULL DEFAULT 0
-        CHECK(provider_create_attempt_count IN (0, 1)),
-    provider_code_url TEXT,
-    last_provider_query_at TEXT,
-    next_provider_query_at TEXT,
-    provider_query_attempt_count INTEGER NOT NULL DEFAULT 0
-        CHECK(provider_query_attempt_count >= 0)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_orders_device_open_slot
-ON payment_orders(device_fingerprint_hash, open_slot);
-
-CREATE INDEX IF NOT EXISTS idx_payment_orders_status
-ON payment_orders(status, expires_at);
-"""
-
-PAYMENT_ORDER_V2_TABLE_SQL = f"""
-CREATE TABLE payment_orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id TEXT NOT NULL UNIQUE,
-    device_fingerprint_hash TEXT NOT NULL,
-    product_code TEXT NOT NULL,
-    amount_fen INTEGER NOT NULL CHECK(amount_fen > 0),
-    currency TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN (
-        '{OrderStatus.CREATED.value}',
-        '{OrderStatus.WAITING_PAYMENT.value}',
-        '{OrderStatus.PAID.value}',
-        '{OrderStatus.CLOSED.value}',
-        '{OrderStatus.ABNORMAL.value}'
-    )),
-    open_slot TEXT CHECK(open_slot IS NULL OR open_slot = 'open'),
-    provider_order_id TEXT,
-    provider_transaction_id TEXT UNIQUE,
-    provider_trade_state TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    paid_at TEXT,
-    closed_at TEXT,
-    security_error_code TEXT
-)
-"""
-
-PAYMENT_ORDER_V2_COLUMNS = (
-    ("id", "INTEGER", 0, None, 1, 0),
-    ("order_id", "TEXT", 1, None, 0, 0),
-    ("device_fingerprint_hash", "TEXT", 1, None, 0, 0),
-    ("product_code", "TEXT", 1, None, 0, 0),
-    ("amount_fen", "INTEGER", 1, None, 0, 0),
-    ("currency", "TEXT", 1, None, 0, 0),
-    ("provider", "TEXT", 1, None, 0, 0),
-    ("status", "TEXT", 1, None, 0, 0),
-    ("open_slot", "TEXT", 0, None, 0, 0),
-    ("provider_order_id", "TEXT", 0, None, 0, 0),
-    ("provider_transaction_id", "TEXT", 0, None, 0, 0),
-    ("provider_trade_state", "TEXT", 0, None, 0, 0),
-    ("created_at", "TEXT", 1, None, 0, 0),
-    ("updated_at", "TEXT", 1, None, 0, 0),
-    ("expires_at", "TEXT", 1, None, 0, 0),
-    ("paid_at", "TEXT", 0, None, 0, 0),
-    ("closed_at", "TEXT", 0, None, 0, 0),
-    ("security_error_code", "TEXT", 0, None, 0, 0),
-)
-
-PAYMENT_ORDER_V3_COLUMNS = PAYMENT_ORDER_V2_COLUMNS + (
-    ("provider_create_claimed_at", "TEXT", 0, None, 0, 0),
-    ("provider_create_attempt_count", "INTEGER", 1, "0", 0, 0),
-    ("provider_code_url", "TEXT", 0, None, 0, 0),
-    ("last_provider_query_at", "TEXT", 0, None, 0, 0),
-    ("next_provider_query_at", "TEXT", 0, None, 0, 0),
-    ("provider_query_attempt_count", "INTEGER", 1, "0", 0, 0),
-)
-
-PAYMENT_ORDER_INDEXES = {
-    (None, 1, "u", 0, (("order_id", 0, "BINARY"),)),
-    (None, 1, "u", 0, (("provider_transaction_id", 0, "BINARY"),)),
-    (
-        "idx_payment_orders_device_open_slot",
-        1,
-        "c",
-        0,
-        (("device_fingerprint_hash", 0, "BINARY"), ("open_slot", 0, "BINARY")),
-    ),
-    (
-        "idx_payment_orders_status",
-        0,
-        "c",
-        0,
-        (("status", 0, "BINARY"), ("expires_at", 0, "BINARY")),
-    ),
-}
-
-PAYMENT_NOTIFICATION_V3_SCHEMA = """
-CREATE TABLE IF NOT EXISTS payment_notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    provider_notification_id TEXT NOT NULL UNIQUE,
-    order_id TEXT,
-    out_trade_no TEXT,
-    provider TEXT NOT NULL,
-    provider_transaction_id TEXT,
-    event_type TEXT,
-    signature_key_id TEXT,
-    signature_valid INTEGER NOT NULL DEFAULT 0,
-    payload_digest_sha256 TEXT,
-    reported_trade_type TEXT,
-    reported_trade_state TEXT,
-    reported_amount_fen INTEGER,
-    reported_currency TEXT,
-    merchant_identity_valid INTEGER NOT NULL DEFAULT 0,
-    process_status TEXT NOT NULL,
-    security_error_code TEXT,
-    failure_code TEXT,
-    provider_created_at TEXT,
-    received_at TEXT NOT NULL,
-    processing_started_at TEXT,
-    lease_expires_at TEXT,
-    worker_id TEXT,
-    processed_at TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_payment_notifications_order
-ON payment_notifications(order_id);
-
-CREATE INDEX IF NOT EXISTS idx_payment_notifications_process
-ON payment_notifications(process_status, next_attempt_at);
-"""
-
-PAYMENT_NOTIFICATION_V3_COLUMNS = (
-    ("id", "INTEGER", 0, None, 1, 0),
-    ("provider_notification_id", "TEXT", 1, None, 0, 0),
-    ("order_id", "TEXT", 0, None, 0, 0),
-    ("out_trade_no", "TEXT", 0, None, 0, 0),
-    ("provider", "TEXT", 1, None, 0, 0),
-    ("provider_transaction_id", "TEXT", 0, None, 0, 0),
-    ("event_type", "TEXT", 0, None, 0, 0),
-    ("signature_key_id", "TEXT", 0, None, 0, 0),
-    ("signature_valid", "INTEGER", 1, "0", 0, 0),
-    ("payload_digest_sha256", "TEXT", 0, None, 0, 0),
-    ("reported_trade_type", "TEXT", 0, None, 0, 0),
-    ("reported_trade_state", "TEXT", 0, None, 0, 0),
-    ("reported_amount_fen", "INTEGER", 0, None, 0, 0),
-    ("reported_currency", "TEXT", 0, None, 0, 0),
-    ("merchant_identity_valid", "INTEGER", 1, "0", 0, 0),
-    ("process_status", "TEXT", 1, None, 0, 0),
-    ("security_error_code", "TEXT", 0, None, 0, 0),
-    ("failure_code", "TEXT", 0, None, 0, 0),
-    ("provider_created_at", "TEXT", 0, None, 0, 0),
-    ("received_at", "TEXT", 1, None, 0, 0),
-    ("processing_started_at", "TEXT", 0, None, 0, 0),
-    ("lease_expires_at", "TEXT", 0, None, 0, 0),
-    ("worker_id", "TEXT", 0, None, 0, 0),
-    ("processed_at", "TEXT", 0, None, 0, 0),
-    ("attempt_count", "INTEGER", 1, "0", 0, 0),
-    ("next_attempt_at", "TEXT", 0, None, 0, 0),
-)
-
-PAYMENT_NOTIFICATION_V3_INDEXES = {
-    (None, 1, "u", 0, (("provider_notification_id", 0, "BINARY"),)),
-    (
-        "idx_payment_notifications_order",
-        0,
-        "c",
-        0,
-        (("order_id", 0, "BINARY"),),
-    ),
-    (
-        "idx_payment_notifications_process",
-        0,
-        "c",
-        0,
-        (("process_status", 0, "BINARY"), ("next_attempt_at", 0, "BINARY")),
-    ),
-}
-
-PAYMENT_NOTIFICATION_V4_TABLE_SQL = """
-CREATE TABLE payment_notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    provider_notification_id TEXT NOT NULL UNIQUE,
-    order_id TEXT,
-    out_trade_no TEXT,
-    provider TEXT NOT NULL,
-    provider_transaction_id TEXT,
-    event_type TEXT,
-    signature_key_id TEXT,
-    signature_valid INTEGER NOT NULL DEFAULT 0 CHECK(signature_valid IN (0, 1)),
-    payload_digest_sha256 TEXT,
-    reported_trade_type TEXT,
-    reported_trade_state TEXT,
-    reported_amount_fen INTEGER,
-    reported_currency TEXT,
-    merchant_identity_valid INTEGER NOT NULL DEFAULT 0
-        CHECK(merchant_identity_valid IN (0, 1)),
-    process_status TEXT NOT NULL CHECK(process_status IN (
-        'RECEIVED', 'PROCESSING', 'PROCESSED', 'RETRY',
-        'DUPLICATE', 'ABNORMAL', 'ORPHAN'
-    )),
-    security_error_code TEXT,
-    failure_code TEXT,
-    provider_created_at TEXT,
-    received_at TEXT NOT NULL,
-    processing_started_at TEXT,
-    lease_expires_at TEXT,
-    worker_id TEXT,
-    processed_at TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
-    next_attempt_at TEXT,
-    reported_appid TEXT,
-    reported_mchid TEXT,
-    reported_success_at TEXT,
-    claim_token TEXT,
-    FOREIGN KEY (order_id) REFERENCES payment_orders(order_id),
-    CHECK(
-        (process_status = 'PROCESSING'
-         AND worker_id IS NOT NULL
-         AND claim_token IS NOT NULL
-         AND processing_started_at IS NOT NULL
-         AND lease_expires_at IS NOT NULL
-         AND processed_at IS NULL)
-        OR
-        (process_status <> 'PROCESSING'
-         AND worker_id IS NULL
-         AND claim_token IS NULL
-         AND processing_started_at IS NULL
-         AND lease_expires_at IS NULL)
-    ),
-    CHECK(
-        process_status <> 'RETRY'
-        OR (next_attempt_at IS NOT NULL
-            AND failure_code IS NOT NULL
-            AND processed_at IS NULL)
-    ),
-    CHECK(process_status = 'RETRY' OR next_attempt_at IS NULL),
-    CHECK(
-        process_status NOT IN ('PROCESSED', 'DUPLICATE', 'ABNORMAL', 'ORPHAN')
-        OR processed_at IS NOT NULL
-    ),
-    CHECK(
-        process_status IN ('PROCESSED', 'DUPLICATE', 'ABNORMAL', 'ORPHAN')
-        OR processed_at IS NULL
-    ),
-    CHECK(process_status <> 'PROCESSED' OR failure_code IS NULL),
-    CHECK(process_status NOT IN ('ABNORMAL', 'ORPHAN') OR failure_code IS NOT NULL),
-    CHECK(
-        process_status NOT IN ('RECEIVED', 'PROCESSING', 'RETRY')
-        OR (
-            out_trade_no IS NOT NULL
-            AND provider_transaction_id IS NOT NULL
-            AND event_type IS NOT NULL
-            AND signature_key_id IS NOT NULL
-            AND signature_valid = 1
-            AND payload_digest_sha256 IS NOT NULL
-            AND reported_trade_type IS NOT NULL
-            AND reported_trade_state IS NOT NULL
-            AND reported_amount_fen IS NOT NULL
-            AND reported_currency IS NOT NULL
-            AND merchant_identity_valid = 1
-            AND provider_created_at IS NOT NULL
-            AND reported_appid IS NOT NULL
-            AND reported_mchid IS NOT NULL
-            AND reported_success_at IS NOT NULL
-        )
-    )
-)
-"""
-
-PAYMENT_NOTIFICATION_SCHEMA = PAYMENT_NOTIFICATION_V4_TABLE_SQL.replace(
-    "CREATE TABLE payment_notifications",
-    "CREATE TABLE IF NOT EXISTS payment_notifications",
-) + """;
-
-CREATE INDEX IF NOT EXISTS idx_payment_notifications_order
-ON payment_notifications(order_id);
-
-CREATE INDEX IF NOT EXISTS idx_payment_notifications_process
-ON payment_notifications(process_status, next_attempt_at, lease_expires_at, id);
-"""
-
-PAYMENT_NOTIFICATION_V4_COLUMNS = PAYMENT_NOTIFICATION_V3_COLUMNS + (
-    ("reported_appid", "TEXT", 0, None, 0, 0),
-    ("reported_mchid", "TEXT", 0, None, 0, 0),
-    ("reported_success_at", "TEXT", 0, None, 0, 0),
-    ("claim_token", "TEXT", 0, None, 0, 0),
-)
-
-PAYMENT_NOTIFICATION_V4_INDEXES = {
-    (None, 1, "u", 0, (("provider_notification_id", 0, "BINARY"),)),
-    (
-        "idx_payment_notifications_order",
-        0,
-        "c",
-        0,
-        (("order_id", 0, "BINARY"),),
-    ),
-    (
-        "idx_payment_notifications_process",
-        0,
-        "c",
-        0,
-        (
-            ("process_status", 0, "BINARY"),
-            ("next_attempt_at", 0, "BINARY"),
-            ("lease_expires_at", 0, "BINARY"),
-            ("id", 0, "BINARY"),
-        ),
-    ),
-}
-
-PAYMENT_RECONCILIATION_V5_TABLE_SQL = """
-CREATE TABLE payment_reconciliations (
-    order_id TEXT PRIMARY KEY NOT NULL,
-    reconcile_status TEXT NOT NULL
-        CHECK(reconcile_status IN ('READY', 'CLAIMED', 'TERMINAL')),
-    last_query_at TEXT,
-    next_attempt_at TEXT,
-    query_attempt_count INTEGER NOT NULL DEFAULT 0
-        CHECK(query_attempt_count >= 0),
-    last_close_at TEXT,
-    close_attempt_count INTEGER NOT NULL DEFAULT 0
-        CHECK(close_attempt_count >= 0),
-    trusted_trade_state TEXT CHECK(
-        trusted_trade_state IS NULL OR trusted_trade_state IN (
-            'SUCCESS', 'NOTPAY', 'CLOSED', 'REFUND', 'REVOKED',
-            'USERPAYING', 'PAYERROR', 'UNKNOWN'
-        )
-    ),
-    last_error_code TEXT,
-    terminal_reason TEXT,
-    terminal_at TEXT,
-    claim_token TEXT,
-    claimed_by TEXT,
-    claimed_at TEXT,
-    lease_expires_at TEXT,
-    updated_at TEXT NOT NULL,
-    state_version INTEGER NOT NULL DEFAULT 0 CHECK(state_version >= 0),
-    CHECK(
-        (
-            reconcile_status = 'READY'
-            AND next_attempt_at IS NOT NULL
-            AND claim_token IS NULL
-            AND claimed_by IS NULL
-            AND claimed_at IS NULL
-            AND lease_expires_at IS NULL
-            AND terminal_reason IS NULL
-            AND terminal_at IS NULL
-        ) OR (
-            reconcile_status = 'CLAIMED'
-            AND next_attempt_at IS NULL
-            AND claim_token IS NOT NULL
-            AND claimed_by IS NOT NULL
-            AND claimed_at IS NOT NULL
-            AND lease_expires_at IS NOT NULL
-            AND terminal_reason IS NULL
-            AND terminal_at IS NULL
-            AND lease_expires_at > claimed_at
-        ) OR (
-            reconcile_status = 'TERMINAL'
-            AND next_attempt_at IS NULL
-            AND claim_token IS NULL
-            AND claimed_by IS NULL
-            AND claimed_at IS NULL
-            AND lease_expires_at IS NULL
-            AND terminal_reason IS NOT NULL
-            AND terminal_at IS NOT NULL
-        )
-    ),
-    FOREIGN KEY (order_id) REFERENCES payment_orders(order_id)
-)
-"""
-
-PAYMENT_RECONCILIATION_V5_CLAIM_INDEX_SQL = """
-CREATE UNIQUE INDEX idx_payment_reconciliations_claim_token
-ON payment_reconciliations(claim_token)
-WHERE claim_token IS NOT NULL
-"""
-
-PAYMENT_RECONCILIATION_V5_CANDIDATE_INDEX_SQL = """
-CREATE INDEX idx_payment_reconciliations_candidate
-ON payment_reconciliations(
-    reconcile_status, next_attempt_at, lease_expires_at, order_id
-)
-"""
-
-PAYMENT_RECONCILIATION_SCHEMA = ";".join(
-    (
-        PAYMENT_RECONCILIATION_V5_TABLE_SQL,
-        PAYMENT_RECONCILIATION_V5_CLAIM_INDEX_SQL,
-        PAYMENT_RECONCILIATION_V5_CANDIDATE_INDEX_SQL,
-    )
-)
-
-PAYMENT_RECONCILIATION_V5_COLUMNS = (
-    ("order_id", "TEXT", 1, None, 1, 0),
-    ("reconcile_status", "TEXT", 1, None, 0, 0),
-    ("last_query_at", "TEXT", 0, None, 0, 0),
-    ("next_attempt_at", "TEXT", 0, None, 0, 0),
-    ("query_attempt_count", "INTEGER", 1, "0", 0, 0),
-    ("last_close_at", "TEXT", 0, None, 0, 0),
-    ("close_attempt_count", "INTEGER", 1, "0", 0, 0),
-    ("trusted_trade_state", "TEXT", 0, None, 0, 0),
-    ("last_error_code", "TEXT", 0, None, 0, 0),
-    ("terminal_reason", "TEXT", 0, None, 0, 0),
-    ("terminal_at", "TEXT", 0, None, 0, 0),
-    ("claim_token", "TEXT", 0, None, 0, 0),
-    ("claimed_by", "TEXT", 0, None, 0, 0),
-    ("claimed_at", "TEXT", 0, None, 0, 0),
-    ("lease_expires_at", "TEXT", 0, None, 0, 0),
-    ("updated_at", "TEXT", 1, None, 0, 0),
-    ("state_version", "INTEGER", 1, "0", 0, 0),
-)
-
-PAYMENT_RECONCILIATION_V5_INDEXES = {
-    (None, 1, "pk", 0, (("order_id", 0, "BINARY"),)),
-    (
-        "idx_payment_reconciliations_claim_token",
-        1,
-        "c",
-        1,
-        (("claim_token", 0, "BINARY"),),
-    ),
-    (
-        "idx_payment_reconciliations_candidate",
-        0,
-        "c",
-        0,
-        (
-            ("reconcile_status", 0, "BINARY"),
-            ("next_attempt_at", 0, "BINARY"),
-            ("lease_expires_at", 0, "BINARY"),
-            ("order_id", 0, "BINARY"),
-        ),
-    ),
-}
-
-LICENSE_GRANT_SCHEMA = """
-CREATE TABLE IF NOT EXISTS license_grants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_order_id TEXT NOT NULL UNIQUE,
-    device_fingerprint_hash TEXT NOT NULL,
-    license_id INTEGER NOT NULL,
-    product_code TEXT NOT NULL,
-    grant_days INTEGER NOT NULL CHECK(grant_days > 0),
-    previous_expire_at TEXT,
-    new_expire_at TEXT,
-    granted_at TEXT NOT NULL,
-    issued_by TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    FOREIGN KEY (license_id) REFERENCES licenses(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_license_grants_device
-ON license_grants(device_fingerprint_hash);
 """
 
 ADMIN_AUDIT_SCHEMA = """
@@ -728,119 +213,62 @@ def write_transaction(database_path: Path):
 
 
 def initialize_database(database_path: Path) -> None:
+    """初始化/升级到免费版核心 schema，并兼容历史版本的库。
+
+    历史库（无 schema_meta 的旧库、schema_version 1..5）只做核心表结构与外键校验，
+    随后把版本标记为 6；支付时代的遗留表保持原样。
+    """
     with write_transaction(database_path) as connection:
-        unversioned_legacy = False
         if _table_exists(connection, "schema_meta"):
-            schema_version = _schema_version(connection)
-        else:
-            schema_version = 0
-            if _has_user_schema_objects(connection):
-                _require_exact_empty_legacy_database(connection)
-                unversioned_legacy = True
-        if schema_version == 3:
-            _require_exact_versioned_schema(connection, 3)
-            _assert_no_foreign_key_violations(connection)
-            _require_safe_v3_payment_notifications(connection)
-        elif schema_version == 4:
-            _require_exact_versioned_schema(connection, 4)
-            _assert_no_foreign_key_violations(connection)
-            _migrate_schema_v4_to_v5(connection)
-            return
-        elif schema_version == 5:
-            _require_exact_versioned_schema(connection, 5)
-            _assert_no_foreign_key_violations(connection)
-            return
-        elif schema_version > 0:
-            _assert_no_foreign_key_violations(connection)
+            _schema_version(connection)
+        elif _has_user_schema_objects(connection):
+            _require_compatible_legacy_database(connection)
+        _assert_no_foreign_key_violations(connection)
         _execute_script(connection, CORE_SCHEMA)
         _drop_legacy_sensitive_columns(connection)
-        _ensure_payment_orders(connection)
-        _ensure_payment_orders_v3(connection, declared_version=schema_version)
-        if unversioned_legacy:
-            connection.execute("DROP TABLE payment_orders_legacy_v0")
-        _ensure_payment_notifications_v4(
-            connection,
-            declared_version=schema_version,
-        )
-        _execute_script(connection, LICENSE_GRANT_SCHEMA)
-        if unversioned_legacy:
-            _set_schema_version(connection, 1)
         _execute_script(connection, ADMIN_AUDIT_SCHEMA)
         _assert_no_foreign_key_violations(connection)
-        if _payment_notifications_signature(connection) != 4:
-            raise RuntimeError("payment_notifications V3 to V4 migration failed")
-        if schema_version in (2, 3) or unversioned_legacy:
-            _set_schema_version(connection, 4)
-            _require_exact_versioned_schema(connection, 4)
-        _create_payment_reconciliations_v5_table(connection)
-        _create_payment_reconciliations_v5_indexes(connection)
         _set_schema_version(connection, SUPPORTED_SCHEMA_VERSION)
-        _require_exact_versioned_schema(connection, 5)
-        _assert_no_foreign_key_violations(connection)
+        _require_core_schema(connection)
 
 
-def _migrate_schema_v4_to_v5(connection: sqlite3.Connection) -> None:
-    _create_payment_reconciliations_v5_table(connection)
-    _create_payment_reconciliations_v5_indexes(connection)
-    _set_schema_version(connection, 5)
-    _require_exact_versioned_schema(connection, 5)
-    _assert_no_foreign_key_violations(connection)
-
-
-def _create_payment_reconciliations_v5_table(
-    connection: sqlite3.Connection,
-) -> None:
-    connection.execute(PAYMENT_RECONCILIATION_V5_TABLE_SQL)
-
-
-def _create_payment_reconciliations_v5_indexes(
-    connection: sqlite3.Connection,
-) -> None:
-    connection.execute(PAYMENT_RECONCILIATION_V5_CLAIM_INDEX_SQL)
-    connection.execute(PAYMENT_RECONCILIATION_V5_CANDIDATE_INDEX_SQL)
-
-
-def _payment_reconciliations_signature(
-    connection: sqlite3.Connection,
-) -> int | None:
-    if (
-        _table_signature(connection, "payment_reconciliations")
-        != PAYMENT_RECONCILIATION_V5_COLUMNS
-        or _index_signature(connection, "payment_reconciliations")
-        != PAYMENT_RECONCILIATION_V5_INDEXES
-        or _foreign_key_signature(connection, "payment_reconciliations")
-        != {
-            (
-                "payment_orders",
-                "order_id",
-                "order_id",
-                "NO ACTION",
-                "NO ACTION",
-                "NONE",
-            )
-        }
-        or _table_options(connection, "payment_reconciliations") != (0, 0)
-        or not _table_sql_matches(
-            connection,
-            "payment_reconciliations",
-            PAYMENT_RECONCILIATION_V5_TABLE_SQL,
-        )
+def _require_compatible_legacy_database(connection: sqlite3.Connection) -> None:
+    """无 schema_meta 的历史库：允许支付遗留表存在，但核心表必须符合预期且没有业务数据。"""
+    core_tables = set(LEGACY_UNVERSIONED_COLUMNS)
+    leftover_tables = set(LEGACY_PAYMENT_TABLES)
+    unexpected_objects: set[tuple[str, str]] = set()
+    for row in connection.execute(
+        """
+        SELECT type, name, tbl_name
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+          AND type IN ('table', 'index', 'view', 'trigger')
+        """
     ):
-        return None
-    return 5
-
-
-def _require_exact_empty_legacy_database(connection: sqlite3.Connection) -> None:
-    expected_tables = set(LEGACY_UNVERSIONED_COLUMNS)
-    if _user_schema_objects(connection) != LEGACY_UNVERSIONED_OBJECTS:
+        object_type = str(row["type"])
+        name = str(row["name"])
+        table_name = str(row["tbl_name"])
+        if object_type == "table":
+            if name not in core_tables and name not in leftover_tables:
+                unexpected_objects.add((object_type, name))
+        elif object_type == "index":
+            if table_name in leftover_tables:
+                # 支付遗留表的索引随表一起忽略，不校验命名与结构。
+                continue
+            if table_name not in core_tables or name not in _declared_core_index_names(table_name):
+                unexpected_objects.add((object_type, name))
+        else:
+            # 免费版核心库不使用 view / trigger，历史库里也不接受。
+            unexpected_objects.add((object_type, name))
+    if unexpected_objects:
         raise RuntimeError(
             "unversioned database schema does not match the supported empty "
             "legacy schema; manual migration required"
         )
 
-    for table in expected_tables:
+    for table, expected_columns in LEGACY_UNVERSIONED_COLUMNS.items():
         if (
-            _table_signature(connection, table) != LEGACY_UNVERSIONED_COLUMNS[table]
+            _table_signature(connection, table) != expected_columns
             or _foreign_key_signature(connection, table)
             != LEGACY_UNVERSIONED_FOREIGN_KEYS[table]
             or _index_signature(connection, table) != LEGACY_UNVERSIONED_INDEXES[table]
@@ -854,9 +282,14 @@ def _require_exact_empty_legacy_database(connection: sqlite3.Connection) -> None
                 "legacy schema; manual migration required"
             )
 
+    data_tables = [
+        table
+        for table in (*LEGACY_UNVERSIONED_COLUMNS, *LEGACY_PAYMENT_TABLES)
+        if _table_exists(connection, table)
+    ]
     if any(
         connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-        for table in expected_tables
+        for table in data_tables
     ):
         raise RuntimeError(
             "unversioned legacy database contains business data; "
@@ -864,136 +297,13 @@ def _require_exact_empty_legacy_database(connection: sqlite3.Connection) -> None
         )
 
 
-def _ensure_payment_orders(connection: sqlite3.Connection) -> None:
-    if not _table_exists(connection, "payment_orders"):
-        _execute_script(connection, PAYMENT_ORDER_SCHEMA)
-        return
-    if _payment_orders_is_v1(connection):
-        _execute_script(connection, PAYMENT_ORDER_SCHEMA)
-        return
-    _migrate_legacy_payment_orders(connection)
-
-
-def _ensure_payment_orders_v3(
-    connection: sqlite3.Connection,
-    *,
-    declared_version: int,
-) -> None:
-    signature = _payment_orders_signature(connection)
-    if declared_version == 3:
-        if signature != 3:
-            raise RuntimeError(
-                "payment_orders schema does not match declared schema version 3"
-            )
-        return
-    if declared_version == 2 and signature != 2:
-        raise RuntimeError(
-            "payment_orders schema does not match declared schema version 2"
-        )
-    if signature == 3:
-        return
-    if signature == 2:
-        _migrate_payment_orders_v2_to_v3(connection)
-        if _payment_orders_signature(connection) == 3:
-            return
-    raise RuntimeError("payment_orders schema is not a supported V2 or V3 schema")
-
-
-def _ensure_payment_notifications_v4(
-    connection: sqlite3.Connection,
-    *,
-    declared_version: int,
-) -> None:
-    if not _table_exists(connection, "payment_notifications"):
-        _execute_script(connection, PAYMENT_NOTIFICATION_SCHEMA)
-        return
-
-    signature = _payment_notifications_signature(connection)
-    if declared_version == 4:
-        if signature != 4:
-            raise RuntimeError(
-                "payment_notifications schema does not match declared schema version 4"
-            )
-        return
-    if signature == 4:
-        raise RuntimeError(
-            "payment_notifications schema does not match declared schema version"
-        )
-    if signature != 3:
-        raise RuntimeError("payment_notifications schema is not a supported V3 schema")
-
-    _require_safe_v3_payment_notifications(connection)
-    _migrate_payment_notifications_v3_to_v4(connection)
-
-
-def _payment_notifications_signature(connection: sqlite3.Connection) -> int | None:
-    columns = _table_signature(connection, "payment_notifications")
-    indexes = _index_signature(connection, "payment_notifications")
-    foreign_keys = _foreign_key_signature(connection, "payment_notifications")
-    if _table_options(connection, "payment_notifications") != (0, 0):
-        return None
-    if (
-        columns == PAYMENT_NOTIFICATION_V3_COLUMNS
-        and indexes == PAYMENT_NOTIFICATION_V3_INDEXES
-        and not foreign_keys
-        and _table_sql_matches(
-            connection,
-            "payment_notifications",
-            PAYMENT_NOTIFICATION_V3_SCHEMA.split(";")[0].replace(
-                "IF NOT EXISTS ", ""
-            ),
-        )
-    ):
-        return 3
-    if (
-        columns == PAYMENT_NOTIFICATION_V4_COLUMNS
-        and indexes == PAYMENT_NOTIFICATION_V4_INDEXES
-        and foreign_keys
-        == {("payment_orders", "order_id", "order_id", "NO ACTION", "NO ACTION", "NONE")}
-        and _table_sql_matches(
-            connection,
-            "payment_notifications",
-            PAYMENT_NOTIFICATION_V4_TABLE_SQL,
-        )
-    ):
-        return 4
-    return None
-
-
-def _require_safe_v3_payment_notifications(connection: sqlite3.Connection) -> None:
-    unsafe = connection.execute(
-        """
-        SELECT 1
-        FROM payment_notifications
-        WHERE process_status NOT IN ('PROCESSED', 'DUPLICATE', 'ABNORMAL', 'ORPHAN')
-           OR processed_at IS NULL
-           OR worker_id IS NOT NULL
-           OR processing_started_at IS NOT NULL
-           OR lease_expires_at IS NOT NULL
-           OR next_attempt_at IS NOT NULL
-           OR signature_valid NOT IN (0, 1)
-           OR merchant_identity_valid NOT IN (0, 1)
-           OR attempt_count < 0
-           OR (process_status = 'PROCESSED' AND failure_code IS NOT NULL)
-           OR (process_status IN ('ABNORMAL', 'ORPHAN') AND failure_code IS NULL)
-        LIMIT 1
-        """
-    ).fetchone()
-    orphan = connection.execute(
-        """
-        SELECT 1
-        FROM payment_notifications AS notification
-        LEFT JOIN payment_orders AS payment_order
-          ON payment_order.order_id = notification.order_id
-        WHERE notification.order_id IS NOT NULL
-          AND payment_order.order_id IS NULL
-        LIMIT 1
-        """
-    ).fetchone()
-    if unsafe is not None or orphan is not None:
-        raise RuntimeError(
-            "unsafe V3 payment notification data; manual migration required"
-        )
+def _declared_core_index_names(table: str) -> set[str]:
+    """核心 legacy 表允许出现的显式索引名（自动索引不在 sqlite_master 查询里）。"""
+    return {
+        str(entry[0])
+        for entry in LEGACY_UNVERSIONED_INDEXES[table]
+        if entry[0] is not None
+    }
 
 
 def _assert_no_foreign_key_violations(connection: sqlite3.Connection) -> None:
@@ -1003,216 +313,6 @@ def _assert_no_foreign_key_violations(connection: sqlite3.Connection) -> None:
         raise RuntimeError("DATABASE_FOREIGN_KEY_VIOLATION") from None
     if violation is not None:
         raise RuntimeError("DATABASE_FOREIGN_KEY_VIOLATION")
-
-
-def _migrate_payment_notifications_v3_to_v4(
-    connection: sqlite3.Connection,
-) -> None:
-    sequence_row = connection.execute(
-        "SELECT seq FROM sqlite_sequence WHERE name = 'payment_notifications'"
-    ).fetchone()
-    sequence = int(sequence_row["seq"]) if sequence_row is not None else 0
-    _create_payment_notifications_v4_table(connection)
-    _copy_payment_notifications_v3_rows(connection)
-    _drop_payment_notifications_v3_table(connection)
-    _restore_payment_notifications_sequence(connection, sequence)
-    _create_payment_notifications_v4_indexes(connection)
-
-
-def _create_payment_notifications_v4_table(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        "ALTER TABLE payment_notifications RENAME TO payment_notifications_v3"
-    )
-    connection.execute(PAYMENT_NOTIFICATION_V4_TABLE_SQL)
-
-
-def _copy_payment_notifications_v3_rows(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        """
-        INSERT INTO payment_notifications (
-            id, provider_notification_id, order_id, out_trade_no, provider,
-            provider_transaction_id, event_type, signature_key_id,
-            signature_valid, payload_digest_sha256, reported_trade_type,
-            reported_trade_state, reported_amount_fen, reported_currency,
-            merchant_identity_valid, process_status, security_error_code,
-            failure_code, provider_created_at, received_at,
-            processing_started_at, lease_expires_at, worker_id, processed_at,
-            attempt_count, next_attempt_at, reported_appid, reported_mchid,
-            reported_success_at, claim_token
-        )
-        SELECT
-            id, provider_notification_id, order_id, out_trade_no, provider,
-            provider_transaction_id, event_type, signature_key_id,
-            signature_valid, payload_digest_sha256, reported_trade_type,
-            reported_trade_state, reported_amount_fen, reported_currency,
-            merchant_identity_valid, process_status, security_error_code,
-            failure_code, provider_created_at, received_at,
-            processing_started_at, lease_expires_at, worker_id, processed_at,
-            attempt_count, next_attempt_at, NULL, NULL, NULL, NULL
-        FROM payment_notifications_v3
-        ORDER BY id
-        """
-    )
-
-
-def _drop_payment_notifications_v3_table(connection: sqlite3.Connection) -> None:
-    connection.execute("DROP TABLE payment_notifications_v3")
-
-
-def _restore_payment_notifications_sequence(
-    connection: sqlite3.Connection,
-    sequence: int,
-) -> None:
-    cursor = connection.execute(
-        """
-        UPDATE sqlite_sequence
-        SET seq = CASE WHEN seq < ? THEN ? ELSE seq END
-        WHERE name = 'payment_notifications'
-        """,
-        (sequence, sequence),
-    )
-    if cursor.rowcount == 0:
-        connection.execute(
-            "INSERT INTO sqlite_sequence (name, seq) VALUES ('payment_notifications', ?)",
-            (sequence,),
-        )
-
-
-def _create_payment_notifications_v4_indexes(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        "CREATE INDEX idx_payment_notifications_order "
-        "ON payment_notifications(order_id)"
-    )
-    connection.execute(
-        "CREATE INDEX idx_payment_notifications_process "
-        "ON payment_notifications("
-        "process_status, next_attempt_at, lease_expires_at, id)"
-    )
-
-
-def _payment_orders_signature(connection: sqlite3.Connection) -> int | None:
-    columns = _table_signature(connection, "payment_orders")
-    if (
-        _index_signature(connection, "payment_orders") != PAYMENT_ORDER_INDEXES
-        or _foreign_key_signature(connection, "payment_orders")
-        or _table_options(connection, "payment_orders") != (0, 0)
-    ):
-        return None
-    if columns == PAYMENT_ORDER_V2_COLUMNS and _table_sql_matches(
-        connection, "payment_orders", PAYMENT_ORDER_V2_TABLE_SQL
-    ):
-        return 2
-    if columns == PAYMENT_ORDER_V3_COLUMNS and _table_sql_matches(
-        connection,
-        "payment_orders",
-        PAYMENT_ORDER_SCHEMA.split(";")[0].replace("IF NOT EXISTS ", ""),
-    ):
-        return 3
-    return None
-
-
-def _migrate_payment_orders_v2_to_v3(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        "ALTER TABLE payment_orders ADD COLUMN provider_create_claimed_at TEXT"
-    )
-    connection.execute(
-        """
-        ALTER TABLE payment_orders
-        ADD COLUMN provider_create_attempt_count INTEGER NOT NULL DEFAULT 0
-        CHECK(provider_create_attempt_count IN (0, 1))
-        """
-    )
-    connection.execute("ALTER TABLE payment_orders ADD COLUMN provider_code_url TEXT")
-    connection.execute("ALTER TABLE payment_orders ADD COLUMN last_provider_query_at TEXT")
-    connection.execute("ALTER TABLE payment_orders ADD COLUMN next_provider_query_at TEXT")
-    connection.execute(
-        """
-        ALTER TABLE payment_orders
-        ADD COLUMN provider_query_attempt_count INTEGER NOT NULL DEFAULT 0
-        CHECK(provider_query_attempt_count >= 0)
-        """
-    )
-
-
-def _migrate_legacy_payment_orders(connection: sqlite3.Connection) -> None:
-    rows = connection.execute("SELECT * FROM payment_orders ORDER BY id").fetchall()
-    migrated_rows = [_legacy_payment_order(row) for row in rows]
-    connection.execute("ALTER TABLE payment_orders RENAME TO payment_orders_legacy_v0")
-    _execute_script(connection, PAYMENT_ORDER_SCHEMA)
-    connection.executemany(
-        """
-        INSERT INTO payment_orders (
-            order_id, device_fingerprint_hash, product_code, amount_fen,
-            currency, provider, status, open_slot, provider_order_id,
-            provider_transaction_id, provider_trade_state, created_at, updated_at,
-            expires_at, paid_at, closed_at, security_error_code
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        migrated_rows,
-    )
-
-
-def _legacy_payment_order(row: sqlite3.Row) -> tuple[object, ...]:
-    amount_fen = _legacy_amount_fen(str(row["amount"]))
-    currency = str(row["currency"]).strip().upper()
-    if currency != ANNUAL_V1.currency:
-        raise RuntimeError(f"legacy payment currency is not supported: {currency}")
-    status, open_slot, error_code = _legacy_status(row)
-    return (
-        str(row["order_id"]),
-        str(row["device_fingerprint_hash"]),
-        ANNUAL_V1.product_code,
-        amount_fen,
-        currency,
-        str(row["payment_channel"]),
-        status,
-        open_slot,
-        row["provider_order_id"],
-        row["transaction_id"],
-        str(row["provider_status"]),
-        str(row["created_at"]),
-        str(row["updated_at"]),
-        str(row["expire_at"]),
-        row["paid_at"] if status == OrderStatus.ABNORMAL.value else None,
-        row["closed_at"] if status == OrderStatus.CLOSED.value else None,
-        error_code,
-    )
-
-
-def _legacy_amount_fen(raw_amount: str) -> int:
-    try:
-        amount = Decimal(raw_amount)
-        fen = amount * Decimal(100)
-        if fen != fen.to_integral_exact():
-            raise InvalidOperation
-        amount_fen = int(fen)
-    except (InvalidOperation, ValueError) as exc:
-        raise RuntimeError(f"legacy payment amount cannot be converted: {raw_amount}") from exc
-    if amount_fen != ANNUAL_V1.amount_fen:
-        raise RuntimeError(f"legacy payment amount is not supported: {raw_amount}")
-    return amount_fen
-
-
-def _legacy_status(row: sqlite3.Row) -> tuple[str, str | None, str]:
-    values = {
-        str(row["order_status"]).strip().lower(),
-        str(row["payment_status"]).strip().lower(),
-        str(row["provider_status"]).strip().lower(),
-    }
-    paid_like = {"paid", "success", "provider_paid"}
-    closed_like = {
-        "created",
-        "unpaid",
-        "pending_payment",
-        "not_configured",
-        "expired",
-        "closed",
-    }
-    if values & paid_like:
-        return OrderStatus.ABNORMAL.value, "open", "legacy_paid_like_status"
-    if values <= closed_like:
-        return OrderStatus.CLOSED.value, None, "legacy_closed_unpaid_order"
-    return OrderStatus.ABNORMAL.value, "open", "legacy_unknown_status"
 
 
 def _drop_legacy_sensitive_columns(connection: sqlite3.Connection) -> None:
@@ -1259,80 +359,55 @@ def _schema_version(connection: sqlite3.Connection) -> int:
     return schema_version
 
 
-def _require_exact_versioned_schema(
-    connection: sqlite3.Connection,
-    version: int,
-) -> None:
+def _require_core_schema(connection: sqlite3.Connection) -> None:
+    """只校验免费版核心表；历史遗留的支付表不参与校验。"""
     expected = sqlite3.connect(":memory:")
     expected.row_factory = sqlite3.Row
     expected.execute("PRAGMA foreign_keys = ON")
     try:
-        notification_schema = (
-            PAYMENT_NOTIFICATION_V3_SCHEMA
-            if version == 3
-            else PAYMENT_NOTIFICATION_SCHEMA
-        )
-        scripts = [
-            CORE_SCHEMA,
-            PAYMENT_ORDER_SCHEMA,
-            notification_schema,
-            LICENSE_GRANT_SCHEMA,
-            ADMIN_AUDIT_SCHEMA,
-            SCHEMA_META_SQL,
-        ]
-        if version == 5:
-            scripts.append(PAYMENT_RECONCILIATION_SCHEMA)
-        for script in scripts:
-            _execute_script(expected, script)
-        if _schema_structure_signature(connection) != _schema_structure_signature(
-            expected
-        ):
-            raise RuntimeError(
-                f"database schema does not match declared schema version {version}"
-            )
+        _execute_script(expected, CORE_SCHEMA)
+        _execute_script(expected, ADMIN_AUDIT_SCHEMA)
+        _execute_script(expected, SCHEMA_META_SQL)
+        if _core_structure_signature(connection) != _core_structure_signature(expected):
+            raise RuntimeError("database schema does not match the free-version core schema")
     finally:
         expected.close()
 
 
-def _schema_structure_signature(connection: sqlite3.Connection) -> tuple[object, ...]:
-    objects = tuple(
+def _core_structure_signature(connection: sqlite3.Connection) -> tuple[object, ...]:
+    return tuple(
+        (
+            table,
+            _table_signature(connection, table),
+            frozenset(_foreign_key_signature(connection, table)),
+            frozenset(_index_signature(connection, table)),
+            _table_options(connection, table),
+            _table_object_sql(connection, table),
+        )
+        for table in CORE_TABLES
+    )
+
+
+def _table_object_sql(
+    connection: sqlite3.Connection, table: str
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
         (
             str(row["type"]),
             str(row["name"]),
-            str(row["tbl_name"]),
-            _normalize_sql(str(row["sql"])),
+            _normalize_sql(str(row["sql"] or "")),
         )
         for row in connection.execute(
             """
-            SELECT type, name, tbl_name, sql
+            SELECT type, name, sql
             FROM sqlite_master
-            WHERE name NOT LIKE 'sqlite_%'
-              AND type IN ('table', 'index', 'view', 'trigger')
+            WHERE tbl_name = ?
+              AND name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index')
             ORDER BY type, name
-            """
+            """,
+            (table,),
         )
-    )
-    tables = sorted(
-        str(row["name"])
-        for row in connection.execute(
-            """
-            SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-            """
-        )
-    )
-    return (
-        objects,
-        tuple(
-            (
-                table,
-                _table_signature(connection, table),
-                frozenset(_foreign_key_signature(connection, table)),
-                frozenset(_index_signature(connection, table)),
-                _table_options(connection, table),
-            )
-            for table in tables
-        ),
     )
 
 
@@ -1360,16 +435,6 @@ def _execute_script(connection: sqlite3.Connection, script: str) -> None:
         statement = statement.strip()
         if statement:
             connection.execute(statement)
-
-
-def _payment_orders_is_v1(connection: sqlite3.Connection) -> bool:
-    return {
-        "product_code",
-        "amount_fen",
-        "status",
-        "open_slot",
-        "expires_at",
-    } <= _columns(connection, "payment_orders")
 
 
 def _table_exists(connection: sqlite3.Connection, table: str) -> bool:

@@ -1,3 +1,10 @@
+"""历史库升级到免费版 schema（版本 6）的边界测试。
+
+免费版核心表只有 devices / licenses / admin_audit_logs / schema_meta。
+历史库里可能残留支付时代的表（payment_orders 等）：它们保持原样、不参与结构校验、
+也不会被读写；新建库不再创建它们。
+"""
+
 import sqlite3
 from pathlib import Path
 
@@ -6,6 +13,8 @@ import pytest
 import license_server.db as db
 from license_server.db import connect, initialize_database
 
+
+FREE_SCHEMA_VERSION = "6"
 
 LEGACY_DDL = """
 CREATE TABLE devices (
@@ -52,6 +61,26 @@ ON payment_orders(device_fingerprint_hash, payment_status, order_status, expire_
 PRAGMA user_version = 0;
 """
 
+PAYMENT_ORDER_COLUMNS = [
+    "id",
+    "order_id",
+    "product_id",
+    "device_fingerprint_hash",
+    "amount",
+    "currency",
+    "payment_channel",
+    "order_status",
+    "payment_status",
+    "provider_status",
+    "provider_order_id",
+    "transaction_id",
+    "created_at",
+    "expire_at",
+    "paid_at",
+    "closed_at",
+    "updated_at",
+]
+
 
 def test_exact_empty_production_legacy_schema_upgrades_idempotently(tmp_path):
     database_path = tmp_path / "license.sqlite3"
@@ -65,48 +94,102 @@ def test_exact_empty_production_legacy_schema_upgrades_idempotently(tmp_path):
         tables = _tables(connection)
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "5"
+        ).fetchone()[0] == FREE_SCHEMA_VERSION
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert _columns(connection, "payment_orders") == [
-            "id",
-            "order_id",
-            "device_fingerprint_hash",
-            "product_code",
-            "amount_fen",
-            "currency",
-            "provider",
-            "status",
-            "open_slot",
-            "provider_order_id",
-            "provider_transaction_id",
-            "provider_trade_state",
-            "created_at",
-            "updated_at",
-            "expires_at",
-            "paid_at",
-            "closed_at",
-            "security_error_code",
-            "provider_create_claimed_at",
-            "provider_create_attempt_count",
-            "provider_code_url",
-            "last_provider_query_at",
-            "next_provider_query_at",
-            "provider_query_attempt_count",
-        ]
+        # 支付遗留表保持历史结构，不再被迁移成支付时代的 V3 结构
+        assert _columns(connection, "payment_orders") == PAYMENT_ORDER_COLUMNS
 
     assert {
         "devices",
         "licenses",
         "payment_orders",
-        "payment_notifications",
-        "payment_reconciliations",
-        "license_grants",
         "admin_audit_logs",
         "schema_meta",
     } <= tables
+    # 免费版不再创建任何支付表，也不再产生 legacy 迁移中间表
     assert "payment_orders_legacy_v0" not in tables
+    assert "payment_notifications" not in tables
+    assert "payment_reconciliations" not in tables
+    assert "license_grants" not in tables
     assert _database_snapshot(database_path) == first
+
+
+def test_free_schema_creates_no_payment_tables(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+
+    initialize_database(database_path)
+
+    tables = _table_names(database_path)
+    assert {name for name in tables if not name.startswith("sqlite_")} == {
+        "devices",
+        "licenses",
+        "admin_audit_logs",
+        "schema_meta",
+    }
+    assert db.SUPPORTED_SCHEMA_VERSION == 6
+    assert set(db.LEGACY_PAYMENT_TABLES).isdisjoint(tables)
+
+
+def test_payment_leftover_tables_are_listed_for_ignoring():
+    """历史遗留支付表清单必须覆盖旧库可能出现的表名。"""
+    assert {
+        "payment_orders",
+        "payment_notifications",
+        "payment_reconciliations",
+        "license_grants",
+    } <= set(db.LEGACY_PAYMENT_TABLES)
+
+
+def test_versioned_legacy_database_upgrades_and_keeps_payment_data(tmp_path):
+    """真实历史库：schema_version=1 且带支付表与数据，升级后数据原样保留。"""
+    database_path = tmp_path / "license.sqlite3"
+    _create_legacy_database(database_path)
+    _insert_placeholder_row(database_path, "devices")
+    _insert_placeholder_row(database_path, "licenses")
+    _insert_placeholder_row(database_path, "payment_orders")
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta VALUES ('schema_version', '1');
+            CREATE TABLE payment_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_notification_id TEXT NOT NULL
+            );
+            INSERT INTO payment_notifications (provider_notification_id) VALUES ('legacy-note');
+            """
+        )
+    before_orders = _rows(database_path, "payment_orders")
+    before_notifications = _rows(database_path, "payment_notifications")
+
+    initialize_database(database_path)
+
+    with connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == FREE_SCHEMA_VERSION
+        assert connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM licenses").fetchone()[0] == 1
+
+    assert _rows(database_path, "payment_orders") == before_orders
+    assert _rows(database_path, "payment_notifications") == before_notifications
+    assert _database_snapshot_stable_after_second_run(database_path)
+
+
+def test_database_newer_than_supported_fails_closed(tmp_path):
+    database_path = tmp_path / "license.sqlite3"
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE schema_meta SET value = '7' WHERE key = 'schema_version'"
+        )
+    before = _database_snapshot(database_path)
+
+    with pytest.raises(RuntimeError, match="newer than supported"):
+        initialize_database(database_path)
+
+    assert _database_snapshot(database_path) == before
 
 
 def test_legacy_autoincrement_accepts_keyword_case_and_whitespace(tmp_path):
@@ -122,16 +205,12 @@ def test_legacy_autoincrement_accepts_keyword_case_and_whitespace(tmp_path):
     with connect(database_path) as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "5"
+        ).fetchone()[0] == FREE_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize(
     "old,new",
     [
-        ("    paid_at TEXT,\n", ""),
-        ("    updated_at TEXT NOT NULL\n", "    updated_at TEXT NOT NULL,\n    unexpected TEXT\n"),
-        ("    amount TEXT NOT NULL,", "    amount INTEGER NOT NULL,"),
-        ("    amount TEXT NOT NULL,", "    amount TEXT,"),
         (
             "    product_id TEXT NOT NULL,",
             "    product_id TEXT NOT NULL CHECK(length(product_id) > 0),",
@@ -143,37 +222,21 @@ def test_legacy_autoincrement_accepts_keyword_case_and_whitespace(tmp_path):
         ("    id INTEGER PRIMARY KEY AUTOINCREMENT,", "    id INTEGER NOT NULL,"),
         ("REFERENCES devices(id)", "REFERENCES devices(id) ON DELETE CASCADE"),
         ("device_fingerprint_hash TEXT NOT NULL UNIQUE", "device_fingerprint_hash TEXT NOT NULL"),
-        ("order_id TEXT NOT NULL UNIQUE", "order_id TEXT NOT NULL"),
-        (
-            "CREATE INDEX idx_payment_orders_device_open\nON payment_orders(device_fingerprint_hash, payment_status, order_status, expire_at);",
-            "",
-        ),
-        (
-            "ON payment_orders(device_fingerprint_hash, payment_status, order_status, expire_at)",
-            "ON payment_orders(payment_status, device_fingerprint_hash, order_status, expire_at)",
-        ),
         (
             "PRAGMA user_version = 0;",
             "CREATE INDEX unexpected_license_index ON licenses(status);\nPRAGMA user_version = 0;",
         ),
     ],
     ids=[
-        "missing-column",
-        "extra-column",
-        "changed-type",
-        "changed-not-null",
         "added-check-constraint",
         "changed-column-order",
         "changed-primary-key",
         "changed-foreign-key",
         "missing-device-unique",
-        "missing-order-unique",
-        "missing-index",
-        "changed-index-order",
         "extra-index",
     ],
 )
-def test_legacy_schema_mismatch_fails_closed(tmp_path, old, new):
+def test_legacy_core_schema_mismatch_fails_closed(tmp_path, old, new):
     database_path = tmp_path / "license.sqlite3"
     _create_legacy_database(database_path, replacements=((old, new),))
     before = _database_snapshot(database_path)
@@ -183,6 +246,47 @@ def test_legacy_schema_mismatch_fails_closed(tmp_path, old, new):
 
     assert _database_snapshot(database_path) == before
     assert "schema_meta" not in _table_names(database_path)
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("    paid_at TEXT,\n", ""),
+        ("    updated_at TEXT NOT NULL\n", "    updated_at TEXT NOT NULL,\n    unexpected TEXT\n"),
+        ("    amount TEXT NOT NULL,", "    amount INTEGER NOT NULL,"),
+        ("order_id TEXT NOT NULL UNIQUE", "order_id TEXT NOT NULL"),
+        (
+            "CREATE INDEX idx_payment_orders_device_open\nON payment_orders(device_fingerprint_hash, payment_status, order_status, expire_at);",
+            "",
+        ),
+        (
+            "ON payment_orders(device_fingerprint_hash, payment_status, order_status, expire_at)",
+            "ON payment_orders(payment_status, device_fingerprint_hash, order_status, expire_at)",
+        ),
+    ],
+    ids=[
+        "missing-column",
+        "extra-column",
+        "changed-type",
+        "missing-order-unique",
+        "missing-index",
+        "changed-index-order",
+    ],
+)
+def test_legacy_payment_schema_mismatch_is_ignored_and_preserved(tmp_path, old, new):
+    """支付遗留表结构异常不再挡住免费版升级，也不会被改写。"""
+    database_path = tmp_path / "license.sqlite3"
+    _create_legacy_database(database_path, replacements=((old, new),))
+    before_columns = _table_columns(database_path, "payment_orders")
+
+    initialize_database(database_path)
+
+    with connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == FREE_SCHEMA_VERSION
+    assert _rows(database_path, "payment_orders") == []
+    assert _table_columns(database_path, "payment_orders") == before_columns
 
 
 @pytest.mark.parametrize(
@@ -231,8 +335,8 @@ def test_legacy_generated_column_fails_closed(tmp_path, kind):
     assert "schema_meta" not in _table_names(database_path)
 
 
-@pytest.mark.parametrize("table", ["devices", "licenses", "payment_orders"])
-def test_legacy_id_without_autoincrement_fails_closed(tmp_path, table):
+@pytest.mark.parametrize("table", ["devices", "licenses"])
+def test_legacy_core_id_without_autoincrement_fails_closed(tmp_path, table):
     database_path = tmp_path / "license.sqlite3"
     old = f"CREATE TABLE {table} (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,"
     new = f"CREATE TABLE {table} (\n    id INTEGER PRIMARY KEY,"
@@ -380,6 +484,12 @@ def test_schema_meta_zero_cannot_version_nonempty_legacy_database(tmp_path):
     assert _database_snapshot(database_path) == before
 
 
+def _database_snapshot_stable_after_second_run(database_path: Path) -> bool:
+    first = _database_snapshot(database_path)
+    initialize_database(database_path)
+    return _database_snapshot(database_path) == first
+
+
 def _create_legacy_database(database_path: Path, replacements=(), suffix="") -> None:
     ddl = LEGACY_DDL
     for old, new in replacements:
@@ -401,8 +511,8 @@ def _insert_placeholder_row(database_path: Path, table: str) -> None:
             INSERT INTO licenses (
                 device_id, license_type, status, starts_at, expires_at, source,
                 created_at
-            ) VALUES (1, 'trial', 'active', '2026-07-13T00:00:00Z',
-                      '2026-07-27T00:00:00Z', 'trial', '2026-07-13T00:00:00Z')
+            ) VALUES (1, 'free', 'active', '2026-07-13T00:00:00Z',
+                      '9999-12-31T00:00:00Z', 'free', '2026-07-13T00:00:00Z')
         """,
         "payment_orders": """
             INSERT INTO payment_orders (
@@ -434,6 +544,19 @@ def _database_snapshot(database_path: Path) -> list[tuple[object, ...]]:
 def _table_names(database_path: Path) -> set[str]:
     with sqlite3.connect(database_path) as connection:
         return _tables(connection)
+
+
+def _table_columns(database_path: Path, table: str) -> list[str]:
+    with sqlite3.connect(database_path) as connection:
+        return [
+            row[1]
+            for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+        ]
+
+
+def _rows(database_path: Path, table: str) -> list[tuple[object, ...]]:
+    with sqlite3.connect(database_path) as connection:
+        return connection.execute(f'SELECT * FROM "{table}"').fetchall()
 
 
 def _tables(connection) -> set[str]:

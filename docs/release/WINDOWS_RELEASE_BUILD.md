@@ -20,12 +20,12 @@ python -m pip check
 python .\scripts\verify_windows_build_environment.py
 $env:PYTHONDONTWRITEBYTECODE='1'
 $env:QT_QPA_PLATFORM='offscreen'
-python -m pytest -p no:cacheprovider --ignore=tests\client\test_payment_flow.py tests\campus_login tests\client tests\license_client tests\test_windows_build_config_lifecycle.py tests\test_windows_build_environment.py tests\test_windows_release_baseline.py
+python -m pytest -p no:cacheprovider tests\campus_login tests\client tests\license_client tests\test_windows_build_config_lifecycle.py tests\test_windows_build_environment.py tests\test_windows_release_baseline.py
 ```
 
 `python --version` must print 3.11.9, and the verifier must exit zero. Do not continue after any mismatch; do not fill gaps from a global Python installation.
 
-The Windows build lock intentionally excludes server-only dependencies. The scoped command excludes `tests\client\test_payment_flow.py` because that integration test imports a license-server test helper. 完整仓库测试需要另行安装 requirements-server.txt in a separate development environment and then run `python -m pytest -p no:cacheprovider`; do not add the server stack to the Windows release bundle merely to run those tests.
+The Windows build lock intentionally excludes server-only dependencies. 完整仓库测试需要另行安装 requirements-server.txt in a separate development environment and then run `python -m pytest -p no:cacheprovider`; do not add the server stack to the Windows release bundle merely to run those tests.
 
 ## Release build interface
 
@@ -41,7 +41,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 `
   -LicensePublicKey "<production-public-key>"
 ```
 
-P6-A1c must supply an approved HTTPS license URL and approved Ed25519 verification public key. Never place a signing private key, campus-network credential, payment key, token, or other secret in the command or repository.
+P6-A1c must supply an approved HTTPS license URL and approved Ed25519 verification public key. Never place a signing private key, campus-network credential, admin token, or other secret in the command or repository.
 
 Before a production build, run
 [`PRODUCTION_LICENSE_KEY_PREFLIGHT.md`](PRODUCTION_LICENSE_KEY_PREFLIGHT.md) on

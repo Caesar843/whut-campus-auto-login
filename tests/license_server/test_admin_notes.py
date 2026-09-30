@@ -41,7 +41,7 @@ def test_new_admin_routes_require_bearer_and_stay_out_of_openapi(tmp_path, monke
     for method, path, kwargs in (
         (client.get, "/internal/admin/api/audit-logs", {}),
         (client.get, "/internal/admin/api/audit-logs/1", {}),
-        (client.post, "/internal/admin/api/orders/order-paid/notes", {"json": {"note": "check"}}),
+        (client.post, "/internal/admin/api/devices/device-a/notes", {"json": {"note": "check"}}),
     ):
         response = method(path, **kwargs)
         assert response.status_code == 401
@@ -60,16 +60,16 @@ def test_audit_list_filters_sorts_pages_and_detail_uses_safe_fields(tmp_path, mo
     first_id = _record(
         database_path,
         request_id="request-a",
-        target_id="order-paid",
-        action="ORDER_REVIEWED",
+        target_id="device-a",
+        action="DEVICE_REVIEWED",
         result=AuditResult.SUCCESS,
         created_at="2026-07-10T08:00:00Z",
     )
     second_id = _record(
         database_path,
         request_id="request-b",
-        target_id="order-paid",
-        action="ORDER_NOTE_ADDED",
+        target_id="device-a",
+        action="DEVICE_NOTE_ADDED",
         result=AuditResult.SUCCESS,
         created_at="2026-07-10T09:00:00Z",
     )
@@ -77,8 +77,8 @@ def test_audit_list_filters_sorts_pages_and_detail_uses_safe_fields(tmp_path, mo
         database_path,
         request_id="request-c",
         target_type="LICENSE",
-        target_id="license-1",
-        action="ORDER_NOTE_ADDED",
+        target_id="1",
+        action="DEVICE_NOTE_ADDED",
         result=AuditResult.REJECTED,
         created_at="2026-07-10T10:00:00Z",
     )
@@ -87,9 +87,9 @@ def test_audit_list_filters_sorts_pages_and_detail_uses_safe_fields(tmp_path, mo
         "/internal/admin/api/audit-logs",
         headers=_auth(),
         params={
-            "target_type": "PAYMENT_ORDER",
-            "target_id": "order-paid",
-            "action": "ORDER_NOTE_ADDED",
+            "target_type": "DEVICE",
+            "target_id": "device-a",
+            "action": "DEVICE_NOTE_ADDED",
             "result": "SUCCESS",
             "request_id": "request-b",
             "created_from": "2026-07-10T08:30:00Z",
@@ -117,7 +117,7 @@ def test_audit_list_filters_sorts_pages_and_detail_uses_safe_fields(tmp_path, mo
     detail = client.get(f"/internal/admin/api/audit-logs/{first_id}", headers=_auth())
     assert detail.status_code == 200
     assert detail.json()["id"] == first_id
-    assert detail.json()["before_state"] == {"status": "ABNORMAL"}
+    assert detail.json()["before_state"] == {"license_status": "active"}
     assert set(detail.json()) == AUDIT_FIELDS
     _assert_security_headers(detail)
 
@@ -127,9 +127,9 @@ def test_audit_list_filters_sorts_pages_and_detail_uses_safe_fields(tmp_path, mo
     ).status_code == 400
 
     expected_filters = (
-        ({"target_type": "PAYMENT_ORDER"}, [second_id, first_id]),
-        ({"target_id": "order-paid"}, [second_id, first_id]),
-        ({"action": "ORDER_REVIEWED"}, [first_id]),
+        ({"target_type": "DEVICE"}, [second_id, first_id]),
+        ({"target_id": "device-a"}, [second_id, first_id]),
+        ({"action": "DEVICE_REVIEWED"}, [first_id]),
         ({"result": "REJECTED"}, [third_id]),
         ({"request_id": "request-b"}, [second_id]),
         ({"created_from": "2026-07-10T09:30:00Z"}, [third_id]),
@@ -154,7 +154,7 @@ def test_equal_created_at_sorts_by_id_desc(tmp_path, monkeypatch):
     assert [item["id"] for item in response.json()["items"]] == [second, first]
 
 
-def test_add_note_appends_one_audit_without_changing_order_or_license_data(
+def test_add_device_note_appends_one_audit_without_changing_device_or_license_data(
     tmp_path,
     monkeypatch,
 ):
@@ -163,9 +163,9 @@ def test_add_note_appends_one_audit_without_changing_order_or_license_data(
     before = _business_rows(database_path)
 
     response = client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers={**_auth(), "X-Forwarded-For": "203.0.113.9"},
-        json={"note": "  customer supplied payment receipt  "},
+        json={"note": "  设备已重装系统，麻烦核对使用状态。  "},
     )
 
     assert response.status_code == 201
@@ -174,11 +174,11 @@ def test_add_note_appends_one_audit_without_changing_order_or_license_data(
     assert body["actor"] == "tester"
     assert body["source_ip"] == "testclient"
     assert body["source_ip"] != "203.0.113.9"
-    assert body["action"] == "ORDER_NOTE_ADDED"
-    assert body["target_type"] == "PAYMENT_ORDER"
-    assert body["target_id"] == "order-paid"
+    assert body["action"] == "DEVICE_NOTE_ADDED"
+    assert body["target_type"] == "DEVICE"
+    assert body["target_id"] == "device-a"
     assert body["result"] == "SUCCESS"
-    assert body["reason"] == "customer supplied payment receipt"
+    assert body["reason"] == "设备已重装系统，麻烦核对使用状态。"
     assert body["before_state"] is None
     assert body["after_state"] is None
     assert body["failure_code"] is None
@@ -189,13 +189,45 @@ def test_add_note_appends_one_audit_without_changing_order_or_license_data(
     _assert_security_headers(response)
 
 
+def test_add_license_note_appends_one_audit(tmp_path, monkeypatch):
+    client, database_path = _admin_client(tmp_path, monkeypatch)
+    _seed_admin_rows(database_path)
+    before = _business_rows(database_path)
+
+    response = client.post(
+        "/internal/admin/api/licenses/1/notes",
+        headers=_auth(),
+        json={"note": "授权到期时间已人工核对。"},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["action"] == "LICENSE_NOTE_ADDED"
+    assert body["target_type"] == "LICENSE"
+    assert body["target_id"] == "1"
+    assert body["reason"] == "授权到期时间已人工核对。"
+    assert _business_rows(database_path) == before
+    assert _audit_count(database_path) == 1
+    _assert_security_headers(response)
+
+    missing = client.post(
+        "/internal/admin/api/licenses/99999/notes",
+        headers=_auth(),
+        json={"note": "check"},
+    )
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "ADMIN_RESOURCE_NOT_FOUND"}
+    assert _audit_count(database_path) == 1
+    _assert_security_headers(missing)
+
+
 @pytest.mark.parametrize("length", [1, 500])
 def test_note_length_boundaries_are_accepted(tmp_path, monkeypatch, length):
     client, database_path = _admin_client(tmp_path, monkeypatch)
     _seed_admin_rows(database_path)
 
     response = client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers=_auth(),
         json={"note": "界" * length},
     )
@@ -210,7 +242,7 @@ def test_invalid_note_shape_is_rejected_without_writing(tmp_path, monkeypatch, n
     _seed_admin_rows(database_path)
 
     response = client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers=_auth(),
         json={"note": note},
     )
@@ -243,7 +275,7 @@ def test_sensitive_note_is_rejected_without_echo_or_write(tmp_path, monkeypatch,
     _seed_admin_rows(database_path)
 
     response = client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers=_auth(),
         json={"note": note},
     )
@@ -260,13 +292,13 @@ def test_punctuated_chinese_note_remains_allowed(tmp_path, monkeypatch):
     _seed_admin_rows(database_path)
 
     response = client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers=_auth(),
-        json={"note": "客户已支付，麻烦核对订单。"},
+        json={"note": "设备已重装系统，麻烦核对。"},
     )
 
     assert response.status_code == 201
-    assert response.json()["reason"] == "客户已支付，麻烦核对订单。"
+    assert response.json()["reason"] == "设备已重装系统，麻烦核对。"
     assert _audit_count(database_path) == 1
 
 
@@ -275,7 +307,7 @@ def test_client_cannot_supply_request_id(tmp_path, monkeypatch):
     _seed_admin_rows(database_path)
 
     response = client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers=_auth(),
         json={"note": "check", "request_id": "client-chosen"},
     )
@@ -293,7 +325,7 @@ def test_other_admin_validation_errors_have_security_headers_and_public_api_is_u
     _seed_admin_rows(database_path)
 
     response = client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers=_auth(),
         json={"note": 123},
     )
@@ -343,10 +375,10 @@ def test_audit_queries_redact_sensitive_historical_reasons(tmp_path, monkeypatch
     assert "secret-value" not in sensitive_detail.text
 
 
-def test_missing_order_and_empty_operator_fail_closed_without_writing(tmp_path, monkeypatch):
+def test_missing_device_and_empty_operator_fail_closed_without_writing(tmp_path, monkeypatch):
     client, database_path = _admin_client(tmp_path, monkeypatch)
     missing = client.post(
-        "/internal/admin/api/orders/missing/notes",
+        "/internal/admin/api/devices/missing/notes",
         headers=_auth(),
         json={"note": "check"},
     )
@@ -359,7 +391,7 @@ def test_missing_order_and_empty_operator_fail_closed_without_writing(tmp_path, 
     monkeypatch.setenv("ADMIN_OPERATOR_NAME", "   ")
     empty_operator_client = TestClient(create_app())
     rejected = empty_operator_client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers=_auth(),
         json={"note": "check"},
     )
@@ -384,7 +416,7 @@ def test_audit_insert_failure_rolls_back_and_leaves_business_data_unchanged(
 
     monkeypatch.setattr(admin_routes, "insert_admin_audit", fail_after_insert)
     response = client.post(
-        "/internal/admin/api/orders/order-paid/notes",
+        "/internal/admin/api/devices/device-a/notes",
         headers=_auth(),
         json={"note": "check"},
     )
@@ -418,9 +450,9 @@ def _record(
     database_path,
     *,
     request_id="request-1",
-    target_type="PAYMENT_ORDER",
-    target_id="order-paid",
-    action="ORDER_NOTE_ADDED",
+    target_type="DEVICE",
+    target_id="device-a",
+    action="DEVICE_NOTE_ADDED",
     result=AuditResult.SUCCESS,
     reason="safe note",
     created_at="2026-07-10T09:00:00Z",
@@ -435,8 +467,8 @@ def _record(
             target_type=target_type,
             target_id=target_id,
             result=result,
-            before_state={"status": "ABNORMAL"},
-            after_state={"status": "ABNORMAL"},
+            before_state={"license_status": "active"},
+            after_state={"license_status": "active"},
             reason=reason,
             failure_code=None,
             created_at=datetime.fromisoformat(created_at.replace("Z", "+00:00")),
@@ -453,5 +485,5 @@ def _business_rows(database_path):
     with connect(database_path) as connection:
         return {
             table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY id")]
-            for table in ("payment_orders", "licenses", "license_grants")
+            for table in ("devices", "licenses")
         }

@@ -6,7 +6,7 @@ import json
 import sqlite3
 import unicodedata
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,7 +16,6 @@ from pydantic import BaseModel, ConfigDict
 
 from license_server.admin_audit import AdminAuditEntry, AuditResult, insert_admin_audit
 from license_server.db import connect, write_transaction
-from license_server.payment import OrderStatus
 from license_server.signer import datetime_text
 
 
@@ -25,15 +24,6 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
-}
-NOTIFICATION_STATUSES = {
-    "RECEIVED",
-    "PROCESSING",
-    "PROCESSED",
-    "RETRY",
-    "DUPLICATE",
-    "ABNORMAL",
-    "ORPHAN",
 }
 LICENSE_STATUSES = {"active", "revoked"}
 AUDIT_RESULTS = {item.value for item in AuditResult}
@@ -57,6 +47,22 @@ SENSITIVE_TEXT_PATTERNS = (
     "bodydecrypted",
     "callbackbody",
     "回调正文",
+)
+DEVICE_DETAIL_FIELDS = (
+    "device_id_hash",
+    "product_id",
+    "first_seen_at",
+    "last_seen_at",
+)
+DEVICE_LICENSE_FIELDS = (
+    "license_id",
+    "license_type",
+    "status",
+    "starts_at",
+    "expires_at",
+    "source",
+    "created_at",
+    "revoked_at",
 )
 
 
@@ -105,71 +111,116 @@ def create_admin_router(
     def summary():
         try:
             with _connection(database_path) as connection:
+                now_text = datetime_text(datetime.now(timezone.utc))
                 return {
-                    "orders_by_status": _count_by(connection, "payment_orders", "status"),
-                    "notifications_by_status": _count_by(
+                    "devices_total": _count(connection, "devices"),
+                    "devices_active_24h": _count_devices_seen_since(
                         connection,
-                        "payment_notifications",
-                        "process_status",
+                        now_text,
+                        hours=24,
                     ),
-                    "license_grants_total": _count(connection, "license_grants"),
-                    "active_paid_licenses": connection.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM licenses
-                        WHERE license_type = 'paid'
-                          AND status = 'active'
-                          AND expires_at > ?
-                        """,
-                        (datetime_text(datetime.now(timezone.utc)),),
-                    ).fetchone()[0],
+                    "devices_active_7d": _count_devices_seen_since(
+                        connection,
+                        now_text,
+                        hours=24 * 7,
+                    ),
+                    "devices_active_30d": _count_devices_seen_since(
+                        connection,
+                        now_text,
+                        hours=24 * 30,
+                    ),
+                    "licenses_by_type": _count_by(connection, "licenses", "license_type"),
+                    "licenses_by_status": _count_by(connection, "licenses", "status"),
+                    "licenses_active_unexpired": int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM licenses
+                            WHERE status = 'active'
+                              AND datetime(expires_at) > datetime(?)
+                            """,
+                            (now_text,),
+                        ).fetchone()[0]
+                    ),
                 }
         except sqlite3.Error as exc:
             raise _admin_error(500, "ADMIN_INTERNAL_ERROR") from exc
 
-    @router.get("/api/orders", dependencies=admin_dependency)
-    def orders(
-        order_id: str | None = None,
-        out_trade_no: str | None = None,
-        provider_transaction_id: str | None = None,
+    @router.get("/api/devices", dependencies=admin_dependency)
+    def devices(
         device_id_hash: str | None = None,
-        status: str | None = None,
-        created_from: str | None = None,
-        created_to: str | None = None,
+        product_id: str | None = None,
+        seen_from: str | None = None,
+        seen_to: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ):
         limit, offset = _page(limit, offset)
-        status = _enum(status, {item.value for item in OrderStatus})
         clauses: list[str] = []
         params: list[object] = []
-        _eq(clauses, params, "order_id", order_id)
-        _eq(clauses, params, "order_id", out_trade_no)
-        _eq(clauses, params, "provider_transaction_id", provider_transaction_id)
-        _eq(clauses, params, "device_fingerprint_hash", device_id_hash)
-        _eq(clauses, params, "status", status)
-        _range(clauses, params, "created_at", created_from, created_to)
-        rows = _rows(
-            database_path,
-            "payment_orders",
-            clauses,
-            params,
-            "created_at",
-            limit,
-            offset,
-        )
-        return {"items": [_order(row) for row in rows], "limit": limit, "offset": offset}
+        _eq(clauses, params, "devices.device_fingerprint_hash", device_id_hash)
+        _eq(clauses, params, "devices.product_id", product_id)
+        _range(clauses, params, "devices.last_seen_at", seen_from, seen_to)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT
+                devices.id,
+                devices.device_fingerprint_hash,
+                devices.product_id,
+                devices.first_seen_at,
+                devices.last_seen_at,
+                licenses.id AS license_id,
+                licenses.license_type,
+                licenses.status AS license_status,
+                licenses.expires_at AS license_expires_at
+            FROM devices
+            LEFT JOIN licenses ON licenses.id = (
+                SELECT latest.id
+                FROM licenses AS latest
+                WHERE latest.device_id = devices.id
+                ORDER BY (latest.status = 'active') DESC,
+                         latest.expires_at DESC,
+                         latest.id DESC
+                LIMIT 1
+            )
+            {where}
+            ORDER BY devices.last_seen_at DESC, devices.id DESC
+            LIMIT ? OFFSET ?
+        """
+        rows = _select(database_path, sql, (*params, limit, offset))
+        return {"items": [_device(row) for row in rows], "limit": limit, "offset": offset}
 
-    @router.get("/api/orders/{order_id}", dependencies=admin_dependency)
-    def order_detail(order_id: str):
-        row = _one(
+    @router.get("/api/devices/{device_fingerprint_hash}", dependencies=admin_dependency)
+    def device_detail(device_fingerprint_hash: str):
+        device = _one(
             database_path,
-            "SELECT * FROM payment_orders WHERE order_id = ?",
-            (order_id,),
+            """
+            SELECT id, device_fingerprint_hash, product_id, first_seen_at, last_seen_at
+            FROM devices
+            WHERE device_fingerprint_hash = ?
+            """,
+            (device_fingerprint_hash,),
         )
-        if row is None:
+        if device is None:
             raise _admin_error(404, "ADMIN_RESOURCE_NOT_FOUND")
-        return _order(row)
+        license_rows = _select(
+            database_path,
+            """
+            SELECT id, license_type, status, starts_at, expires_at, source,
+                   created_at, revoked_at
+            FROM licenses
+            WHERE device_id = ?
+            ORDER BY expires_at DESC, id DESC
+            """,
+            (device["id"],),
+        )
+        return {
+            "device_id_hash": str(device["device_fingerprint_hash"]),
+            "product_id": str(device["product_id"]),
+            "first_seen_at": str(device["first_seen_at"]),
+            "last_seen_at": str(device["last_seen_at"]),
+            "licenses": [_license(row) for row in license_rows],
+        }
 
     @router.get("/api/audit-logs", dependencies=admin_dependency)
     def audit_logs(
@@ -226,9 +277,9 @@ def create_admin_router(
             raise _admin_error(404, "ADMIN_RESOURCE_NOT_FOUND")
         return _audit(row)
 
-    @router.post("/api/orders/{order_id}/notes", status_code=201)
-    def add_order_note(
-        order_id: str,
+    @router.post("/api/devices/{device_fingerprint_hash}/notes", status_code=201)
+    def add_device_note(
+        device_fingerprint_hash: str,
         body: AdminNoteRequest,
         request: Request,
         operator: str = Depends(require_admin),
@@ -241,11 +292,15 @@ def create_admin_router(
             raise _admin_error(500, "ADMIN_INTERNAL_ERROR")
         try:
             with write_transaction(database_path) as connection:
-                order = connection.execute(
-                    "SELECT order_id FROM payment_orders WHERE order_id = ?",
-                    (order_id,),
+                device = connection.execute(
+                    """
+                    SELECT device_fingerprint_hash
+                    FROM devices
+                    WHERE device_fingerprint_hash = ?
+                    """,
+                    (device_fingerprint_hash,),
                 ).fetchone()
-                if order is None:
+                if device is None:
                     raise _admin_error(404, "ADMIN_RESOURCE_NOT_FOUND")
                 audit_id = insert_admin_audit(
                     connection,
@@ -253,9 +308,9 @@ def create_admin_router(
                         actor=operator,
                         source_ip=source_ip,
                         request_id=str(uuid4()),
-                        action="ORDER_NOTE_ADDED",
-                        target_type="PAYMENT_ORDER",
-                        target_id=order_id,
+                        action="DEVICE_NOTE_ADDED",
+                        target_type="DEVICE",
+                        target_id=str(device["device_fingerprint_hash"]),
                         result=AuditResult.SUCCESS,
                         before_state=None,
                         after_state=None,
@@ -279,84 +334,6 @@ def create_admin_router(
         except (sqlite3.Error, RuntimeError, ValueError) as exc:
             raise _admin_error(500, "ADMIN_INTERNAL_ERROR") from exc
         return _audit(row)
-
-    @router.get("/api/notifications", dependencies=admin_dependency)
-    def notifications(
-        notification_id: str | None = None,
-        order_id: str | None = None,
-        out_trade_no: str | None = None,
-        provider_transaction_id: str | None = None,
-        process_status: str | None = None,
-        signature_valid: str | None = None,
-        received_from: str | None = None,
-        received_to: str | None = None,
-        limit: int = 50,
-        offset: int = 0,
-    ):
-        limit, offset = _page(limit, offset)
-        process_status = _enum(process_status, NOTIFICATION_STATUSES)
-        signature_value = _bool(signature_valid)
-        clauses: list[str] = []
-        params: list[object] = []
-        _eq(clauses, params, "provider_notification_id", notification_id)
-        _eq(clauses, params, "order_id", order_id)
-        _eq(clauses, params, "out_trade_no", out_trade_no)
-        _eq(clauses, params, "provider_transaction_id", provider_transaction_id)
-        _eq(clauses, params, "process_status", process_status)
-        _eq(clauses, params, "signature_valid", signature_value)
-        _range(clauses, params, "received_at", received_from, received_to)
-        rows = _rows(
-            database_path,
-            "payment_notifications",
-            clauses,
-            params,
-            "received_at",
-            limit,
-            offset,
-        )
-        return {"items": [_notification(row) for row in rows], "limit": limit, "offset": offset}
-
-    @router.get("/api/notifications/{notification_id}", dependencies=admin_dependency)
-    def notification_detail(notification_id: str):
-        row = _one(
-            database_path,
-            """
-            SELECT * FROM payment_notifications
-            WHERE CAST(id AS TEXT) = ? OR provider_notification_id = ?
-            """,
-            (notification_id, notification_id),
-        )
-        if row is None:
-            raise _admin_error(404, "ADMIN_RESOURCE_NOT_FOUND")
-        return _notification(row)
-
-    @router.get("/api/grants", dependencies=admin_dependency)
-    def grants(
-        source_order_id: str | None = None,
-        device_id_hash: str | None = None,
-        issued_by: str | None = None,
-        created_from: str | None = None,
-        created_to: str | None = None,
-        limit: int = 50,
-        offset: int = 0,
-    ):
-        limit, offset = _page(limit, offset)
-        clauses: list[str] = []
-        params: list[object] = []
-        _eq(clauses, params, "source_order_id", source_order_id)
-        _eq(clauses, params, "device_fingerprint_hash", device_id_hash)
-        _eq(clauses, params, "issued_by", issued_by)
-        _range(clauses, params, "created_at", created_from, created_to)
-        rows = _rows(
-            database_path,
-            "license_grants",
-            clauses,
-            params,
-            "created_at",
-            limit,
-            offset,
-        )
-        return {"items": [_grant(row) for row in rows], "limit": limit, "offset": offset}
 
     @router.get("/api/licenses", dependencies=admin_dependency)
     def licenses(
@@ -384,7 +361,6 @@ def create_admin_router(
                 licenses.starts_at,
                 licenses.expires_at,
                 licenses.source,
-                licenses.order_id,
                 licenses.created_at,
                 licenses.revoked_at
             FROM licenses
@@ -395,6 +371,60 @@ def create_admin_router(
         """
         rows = _select(database_path, sql, (*params, limit, offset))
         return {"items": [_license(row) for row in rows], "limit": limit, "offset": offset}
+
+    @router.post("/api/licenses/{license_id}/notes", status_code=201)
+    def add_license_note(
+        license_id: str,
+        body: AdminNoteRequest,
+        request: Request,
+        operator: str = Depends(require_admin),
+    ):
+        if not operator.strip():
+            raise _admin_error(503, "ADMIN_OPERATOR_REQUIRED")
+        note = _note(body.note)
+        source_ip = request.client.host if request.client else ""
+        if not source_ip:
+            raise _admin_error(500, "ADMIN_INTERNAL_ERROR")
+        try:
+            with write_transaction(database_path) as connection:
+                license_row = connection.execute(
+                    "SELECT id FROM licenses WHERE id = ?",
+                    (license_id,),
+                ).fetchone()
+                if license_row is None:
+                    raise _admin_error(404, "ADMIN_RESOURCE_NOT_FOUND")
+                audit_id = insert_admin_audit(
+                    connection,
+                    AdminAuditEntry(
+                        actor=operator,
+                        source_ip=source_ip,
+                        request_id=str(uuid4()),
+                        action="LICENSE_NOTE_ADDED",
+                        target_type="LICENSE",
+                        target_id=str(license_row["id"]),
+                        result=AuditResult.SUCCESS,
+                        before_state=None,
+                        after_state=None,
+                        reason=note,
+                        failure_code=None,
+                        created_at=datetime.now(timezone.utc),
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT id, actor, source_ip, request_id, action, target_type,
+                           target_id, result, before_state_json, after_state_json,
+                           reason, failure_code, created_at
+                    FROM admin_audit_logs
+                    WHERE id = ?
+                    """,
+                    (audit_id,),
+                ).fetchone()
+        except HTTPException:
+            raise
+        except (sqlite3.Error, RuntimeError, ValueError) as exc:
+            raise _admin_error(500, "ADMIN_INTERNAL_ERROR") from exc
+        return _audit(row)
 
     return router
 
@@ -420,17 +450,6 @@ def _enum(value: str | None, allowed: set[str]) -> str | None:
     if value not in allowed:
         raise _admin_error(400, "ADMIN_QUERY_INVALID")
     return value
-
-
-def _bool(value: str | None) -> int | None:
-    if value is None:
-        return None
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes"}:
-        return 1
-    if normalized in {"0", "false", "no"}:
-        return 0
-    raise _admin_error(400, "ADMIN_QUERY_INVALID")
 
 
 def _note(value: str) -> str:
@@ -495,23 +514,6 @@ def _range(
         params.append(end_text)
 
 
-def _rows(
-    database_path: Path,
-    table: str,
-    clauses: list[str],
-    params: list[object],
-    sort_column: str,
-    limit: int,
-    offset: int,
-):
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    return _select(
-        database_path,
-        f"SELECT * FROM {table} {where} ORDER BY {sort_column} DESC LIMIT ? OFFSET ?",
-        (*params, limit, offset),
-    )
-
-
 def _one(database_path: Path, sql: str, params: tuple[object, ...]):
     rows = _select(database_path, sql, params)
     return rows[0] if rows else None
@@ -545,83 +547,41 @@ def _count_by(connection, table: str, column: str) -> dict[str, int]:
     }
 
 
-def _order(row) -> dict[str, object]:
+def _count_devices_seen_since(connection, now_text: str, *, hours: int) -> int:
+    return int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM devices
+            WHERE datetime(last_seen_at) >= datetime(?, ?)
+              AND datetime(last_seen_at) <= datetime(?)
+            """,
+            (now_text, f"-{hours} hours", now_text),
+        ).fetchone()[0]
+    )
+
+
+def _device(row) -> dict[str, object]:
     return {
-        "id": int(row["id"]),
-        "order_id": str(row["order_id"]),
-        "out_trade_no": str(row["order_id"]),
         "device_id_hash": str(row["device_fingerprint_hash"]),
-        "product_code": str(row["product_code"]),
-        "amount_fen": int(row["amount_fen"]),
-        "currency": str(row["currency"]),
-        "provider": str(row["provider"]),
-        "status": str(row["status"]),
-        "provider_order_id": row["provider_order_id"],
-        "provider_transaction_id": row["provider_transaction_id"],
-        "provider_trade_state": row["provider_trade_state"],
-        "created_at": str(row["created_at"]),
-        "updated_at": str(row["updated_at"]),
-        "expires_at": str(row["expires_at"]),
-        "paid_at": row["paid_at"],
-        "closed_at": row["closed_at"],
-        "security_error_code": row["security_error_code"],
-    }
-
-
-def _notification(row) -> dict[str, object]:
-    return {
-        "id": int(row["id"]),
-        "provider_notification_id": str(row["provider_notification_id"]),
-        "order_id": row["order_id"],
-        "out_trade_no": row["out_trade_no"],
-        "provider": str(row["provider"]),
-        "provider_transaction_id": row["provider_transaction_id"],
-        "event_type": row["event_type"],
-        "signature_key_id": row["signature_key_id"],
-        "signature_valid": bool(row["signature_valid"]),
-        "payload_digest_sha256": row["payload_digest_sha256"],
-        "reported_trade_type": row["reported_trade_type"],
-        "reported_trade_state": row["reported_trade_state"],
-        "reported_amount_fen": row["reported_amount_fen"],
-        "reported_currency": row["reported_currency"],
-        "merchant_identity_valid": bool(row["merchant_identity_valid"]),
-        "process_status": str(row["process_status"]),
-        "security_error_code": row["security_error_code"],
-        "failure_code": row["failure_code"],
-        "provider_created_at": row["provider_created_at"],
-        "received_at": str(row["received_at"]),
-        "processed_at": row["processed_at"],
-        "attempt_count": int(row["attempt_count"]),
-        "next_attempt_at": row["next_attempt_at"],
-    }
-
-
-def _grant(row) -> dict[str, object]:
-    return {
-        "id": int(row["id"]),
-        "source_order_id": str(row["source_order_id"]),
-        "device_id_hash": str(row["device_fingerprint_hash"]),
-        "license_id": str(row["license_id"]),
-        "product_code": str(row["product_code"]),
-        "grant_days": int(row["grant_days"]),
-        "previous_expire_at": row["previous_expire_at"],
-        "new_expire_at": row["new_expire_at"],
-        "granted_at": str(row["granted_at"]),
-        "issued_by": str(row["issued_by"]),
-        "created_at": str(row["created_at"]),
+        "product_id": str(row["product_id"]),
+        "first_seen_at": str(row["first_seen_at"]),
+        "last_seen_at": str(row["last_seen_at"]),
+        "license_id": int(row["license_id"]) if row["license_id"] is not None else None,
+        "license_type": row["license_type"],
+        "license_status": row["license_status"],
+        "license_expires_at": row["license_expires_at"],
     }
 
 
 def _license(row) -> dict[str, object]:
     return {
-        "id": int(row["id"]),
-        "device_id_hash": str(row["device_fingerprint_hash"]),
+        "license_id": int(row["id"]),
         "license_type": str(row["license_type"]),
         "status": str(row["status"]),
         "starts_at": str(row["starts_at"]),
         "expires_at": str(row["expires_at"]),
         "source": str(row["source"]),
-        "order_id": row["order_id"],
         "created_at": str(row["created_at"]),
         "revoked_at": row["revoked_at"],
     }
@@ -654,12 +614,12 @@ _ADMIN_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>支付后台</title>
+  <title>管理后台</title>
   <script src="/internal/admin/assets/admin.js" defer></script>
 </head>
 <body>
   <main>
-    <h1>支付后台</h1>
+    <h1>管理后台</h1>
     <p>只读后台。页面不含业务数据；管理员令牌仅保存在本次浏览器会话的 sessionStorage 中。</p>
 
     <section aria-labelledby="access-title">
@@ -672,35 +632,38 @@ _ADMIN_HTML = """<!doctype html>
     </section>
 
     <section aria-labelledby="summary-title">
-      <h2 id="summary-title">摘要</h2>
-      <button id="load-summary" type="button">加载摘要</button>
+      <h2 id="summary-title">使用统计</h2>
+      <button id="load-summary" type="button">加载统计</button>
       <div id="summary-output"></div>
     </section>
 
-    <section aria-labelledby="orders-title">
-      <h2 id="orders-title">订单</h2>
-      <label for="orders-status">状态</label>
-      <input id="orders-status" autocomplete="off">
-      <label for="orders-order-id">order_id</label>
-      <input id="orders-order-id" autocomplete="off">
-      <label for="orders-out-trade-no">out_trade_no</label>
-      <input id="orders-out-trade-no" autocomplete="off">
-      <label for="orders-limit">limit</label>
-      <input id="orders-limit" type="number" min="1" max="100" value="50">
-      <label for="orders-offset">offset</label>
-      <input id="orders-offset" type="number" min="0" value="0">
-      <button id="orders-load" type="button">加载订单</button>
-      <button id="orders-prev" type="button">上一页</button>
-      <button id="orders-next" type="button">下一页</button>
-      <p id="orders-page">offset 0</p>
-      <div id="orders-output"></div>
-      <h3>追加售后备注</h3>
-      <label for="order-note-order-id">order_id</label>
-      <input id="order-note-order-id" autocomplete="off">
-      <label for="order-note-text">备注</label>
-      <textarea id="order-note-text" maxlength="500"></textarea>
-      <button id="order-note-submit" type="button">追加备注</button>
-      <p id="order-note-status" role="status"></p>
+    <section aria-labelledby="devices-title">
+      <h2 id="devices-title">设备</h2>
+      <label for="devices-device-id">device_id_hash</label>
+      <input id="devices-device-id" autocomplete="off">
+      <label for="devices-product-id">product_id</label>
+      <input id="devices-product-id" autocomplete="off">
+      <label for="devices-limit">limit</label>
+      <input id="devices-limit" type="number" min="1" max="100" value="50">
+      <label for="devices-offset">offset</label>
+      <input id="devices-offset" type="number" min="0" value="0">
+      <button id="devices-load" type="button">加载设备</button>
+      <button id="devices-prev" type="button">上一页</button>
+      <button id="devices-next" type="button">下一页</button>
+      <p id="devices-page">offset 0</p>
+      <div id="devices-output"></div>
+      <h3>设备详情</h3>
+      <label for="device-detail-hash">device_id_hash</label>
+      <input id="device-detail-hash" autocomplete="off">
+      <button id="device-detail-load" type="button">加载详情</button>
+      <div id="device-detail-output"></div>
+      <h3>追加设备备注</h3>
+      <label for="device-note-device-id">device_id_hash</label>
+      <input id="device-note-device-id" autocomplete="off">
+      <label for="device-note-text">备注</label>
+      <textarea id="device-note-text" maxlength="500"></textarea>
+      <button id="device-note-submit" type="button">追加备注</button>
+      <p id="device-note-status" role="status"></p>
     </section>
 
     <section aria-labelledby="audit-title">
@@ -732,38 +695,6 @@ _ADMIN_HTML = """<!doctype html>
       <div id="audit-detail-output"></div>
     </section>
 
-    <section aria-labelledby="notifications-title">
-      <h2 id="notifications-title">支付通知</h2>
-      <label for="notifications-status">process_status</label>
-      <input id="notifications-status" autocomplete="off">
-      <label for="notifications-limit">limit</label>
-      <input id="notifications-limit" type="number" min="1" max="100" value="50">
-      <label for="notifications-offset">offset</label>
-      <input id="notifications-offset" type="number" min="0" value="0">
-      <button id="notifications-load" type="button">加载支付通知</button>
-      <button id="notifications-prev" type="button">上一页</button>
-      <button id="notifications-next" type="button">下一页</button>
-      <p id="notifications-page">offset 0</p>
-      <div id="notifications-output"></div>
-    </section>
-
-    <section aria-labelledby="grants-title">
-      <h2 id="grants-title">授权发放</h2>
-      <label for="grants-source-order-id">source_order_id</label>
-      <input id="grants-source-order-id" autocomplete="off">
-      <label for="grants-device-id">device_id_hash</label>
-      <input id="grants-device-id" autocomplete="off">
-      <label for="grants-limit">limit</label>
-      <input id="grants-limit" type="number" min="1" max="100" value="50">
-      <label for="grants-offset">offset</label>
-      <input id="grants-offset" type="number" min="0" value="0">
-      <button id="grants-load" type="button">加载授权发放</button>
-      <button id="grants-prev" type="button">上一页</button>
-      <button id="grants-next" type="button">下一页</button>
-      <p id="grants-page">offset 0</p>
-      <div id="grants-output"></div>
-    </section>
-
     <section aria-labelledby="licenses-title">
       <h2 id="licenses-title">当前授权</h2>
       <label for="licenses-device-id">device_id_hash</label>
@@ -779,6 +710,13 @@ _ADMIN_HTML = """<!doctype html>
       <button id="licenses-next" type="button">下一页</button>
       <p id="licenses-page">offset 0</p>
       <div id="licenses-output"></div>
+      <h3>追加授权备注</h3>
+      <label for="license-note-license-id">license_id</label>
+      <input id="license-note-license-id" autocomplete="off">
+      <label for="license-note-text">备注</label>
+      <textarea id="license-note-text" maxlength="500"></textarea>
+      <button id="license-note-submit" type="button">追加备注</button>
+      <p id="license-note-status" role="status"></p>
     </section>
   </main>
 </body>
@@ -790,42 +728,33 @@ _ADMIN_JS = """
 (() => {
   "use strict";
 
-  const KEY = "whut-payment-admin-secret";
+  const KEY = "whut-admin-secret";
   const API_BASE = "/internal/admin/api/";
   const state = {
-    orders: { offset: 0, lastCount: null },
+    devices: { offset: 0, lastCount: null },
     audit: { offset: 0, lastCount: null },
-    notifications: { offset: 0, lastCount: null },
-    grants: { offset: 0, lastCount: null },
     licenses: { offset: 0, lastCount: null },
-    noteSubmitting: false,
+    deviceNoteSubmitting: false,
+    licenseNoteSubmitting: false,
   };
   const config = {
-    orders: {
-      path: "orders",
-      output: "orders-output",
-      page: "orders-page",
+    devices: {
+      path: "devices",
+      output: "devices-output",
+      page: "devices-page",
       fields: [
-        "order_id",
-        "out_trade_no",
         "device_id_hash",
-        "product_code",
-        "amount_fen",
-        "currency",
-        "provider",
-        "status",
-        "provider_transaction_id",
-        "provider_trade_state",
-        "created_at",
-        "updated_at",
-        "expires_at",
-        "paid_at",
-        "security_error_code",
+        "product_id",
+        "first_seen_at",
+        "last_seen_at",
+        "license_id",
+        "license_type",
+        "license_status",
+        "license_expires_at",
       ],
       filters: [
-        ["orders-status", "status"],
-        ["orders-order-id", "order_id"],
-        ["orders-out-trade-no", "out_trade_no"],
+        ["devices-device-id", "device_id_hash"],
+        ["devices-product-id", "product_id"],
       ],
     },
     audit: {
@@ -857,64 +786,18 @@ _ADMIN_JS = """
         ["audit-created-to", "created_to"],
       ],
     },
-    notifications: {
-      path: "notifications",
-      output: "notifications-output",
-      page: "notifications-page",
-      fields: [
-        "provider_notification_id",
-        "order_id",
-        "out_trade_no",
-        "provider",
-        "provider_transaction_id",
-        "event_type",
-        "signature_valid",
-        "reported_trade_state",
-        "reported_amount_fen",
-        "reported_currency",
-        "merchant_identity_valid",
-        "process_status",
-        "security_error_code",
-        "failure_code",
-        "received_at",
-        "processed_at",
-        "attempt_count",
-      ],
-      filters: [["notifications-status", "process_status"]],
-    },
-    grants: {
-      path: "grants",
-      output: "grants-output",
-      page: "grants-page",
-      fields: [
-        "source_order_id",
-        "device_id_hash",
-        "license_id",
-        "product_code",
-        "grant_days",
-        "previous_expire_at",
-        "new_expire_at",
-        "granted_at",
-        "issued_by",
-        "created_at",
-      ],
-      filters: [
-        ["grants-source-order-id", "source_order_id"],
-        ["grants-device-id", "device_id_hash"],
-      ],
-    },
     licenses: {
       path: "licenses",
       output: "licenses-output",
       page: "licenses-page",
       fields: [
+        "license_id",
         "device_id_hash",
         "license_type",
         "status",
         "starts_at",
         "expires_at",
         "source",
-        "order_id",
         "created_at",
         "revoked_at",
       ],
@@ -1157,35 +1040,122 @@ _ADMIN_JS = """
     }
   }
 
-  async function submitOrderNote() {
-    if (state.noteSubmitting) {
-      return;
-    }
-    const orderId = byId("order-note-order-id").value.trim();
-    const note = byId("order-note-text").value.trim();
-    if (!orderId || note.length < 1 || note.length > 500) {
-      byId("order-note-status").textContent = "备注要求 1-500 字符。";
+  async function loadDeviceDetail() {
+    const output = byId("device-detail-output");
+    clearNode(output);
+    const deviceHash = byId("device-detail-hash").value.trim();
+    if (!deviceHash) {
       setStatus("请求参数无效。");
       return;
     }
-    state.noteSubmitting = true;
-    byId("order-note-submit").disabled = true;
     try {
-      const data = await adminFetch(API_BASE + "orders/" + encodeURIComponent(orderId) + "/notes", {
+      const data = await adminFetch(API_BASE + "devices/" + encodeURIComponent(deviceHash));
+      const list = document.createElement("dl");
+      for (const field of ["device_id_hash", "product_id", "first_seen_at", "last_seen_at"]) {
+        const term = document.createElement("dt");
+        const detail = document.createElement("dd");
+        term.textContent = field;
+        detail.textContent = formatValue(data[field]);
+        list.appendChild(term);
+        list.appendChild(detail);
+      }
+      output.appendChild(list);
+      const rows = Array.isArray(data.licenses) ? data.licenses : [];
+      if (rows.length === 0) {
+        const empty = document.createElement("p");
+        empty.textContent = "无授权记录。";
+        output.appendChild(empty);
+      } else {
+        const table = document.createElement("table");
+        const thead = document.createElement("thead");
+        const headRow = document.createElement("tr");
+        for (const field of DEVICE_LICENSE_FIELDS) {
+          const th = document.createElement("th");
+          th.textContent = field;
+          headRow.appendChild(th);
+        }
+        thead.appendChild(headRow);
+        table.appendChild(thead);
+        const tbody = document.createElement("tbody");
+        for (const row of rows) {
+          const tr = document.createElement("tr");
+          for (const field of DEVICE_LICENSE_FIELDS) {
+            const td = document.createElement("td");
+            td.textContent = formatValue(row[field]);
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        output.appendChild(table);
+      }
+      setStatus("设备详情已加载。");
+    } catch (error) {
+      handleError(error);
+    }
+  }
+
+  async function submitDeviceNote() {
+    if (state.deviceNoteSubmitting) {
+      return;
+    }
+    const deviceHash = byId("device-note-device-id").value.trim();
+    const note = byId("device-note-text").value.trim();
+    if (!deviceHash || note.length < 1 || note.length > 500) {
+      byId("device-note-status").textContent = "备注要求 1-500 字符。";
+      setStatus("请求参数无效。");
+      return;
+    }
+    state.deviceNoteSubmitting = true;
+    byId("device-note-submit").disabled = true;
+    try {
+      const data = await adminFetch(API_BASE + "devices/" + encodeURIComponent(deviceHash) + "/notes", {
         method: "POST",
         body: JSON.stringify({ note: note }),
       });
-      byId("order-note-text").value = "";
+      byId("device-note-text").value = "";
       renderAuditDetail(data);
       await loadList("audit", 0);
-      byId("order-note-status").textContent = "备注已追加。";
+      byId("device-note-status").textContent = "备注已追加。";
       setStatus("备注已追加。");
     } catch (error) {
-      byId("order-note-status").textContent = "备注提交失败。";
+      byId("device-note-status").textContent = "备注提交失败。";
       handleError(error);
     } finally {
-      state.noteSubmitting = false;
-      byId("order-note-submit").disabled = false;
+      state.deviceNoteSubmitting = false;
+      byId("device-note-submit").disabled = false;
+    }
+  }
+
+  async function submitLicenseNote() {
+    if (state.licenseNoteSubmitting) {
+      return;
+    }
+    const licenseId = byId("license-note-license-id").value.trim();
+    const note = byId("license-note-text").value.trim();
+    if (!licenseId || note.length < 1 || note.length > 500) {
+      byId("license-note-status").textContent = "备注要求 1-500 字符。";
+      setStatus("请求参数无效。");
+      return;
+    }
+    state.licenseNoteSubmitting = true;
+    byId("license-note-submit").disabled = true;
+    try {
+      const data = await adminFetch(API_BASE + "licenses/" + encodeURIComponent(licenseId) + "/notes", {
+        method: "POST",
+        body: JSON.stringify({ note: note }),
+      });
+      byId("license-note-text").value = "";
+      renderAuditDetail(data);
+      await loadList("audit", 0);
+      byId("license-note-status").textContent = "备注已追加。";
+      setStatus("备注已追加。");
+    } catch (error) {
+      byId("license-note-status").textContent = "备注提交失败。";
+      handleError(error);
+    } finally {
+      state.licenseNoteSubmitting = false;
+      byId("license-note-submit").disabled = false;
     }
   }
 
@@ -1193,7 +1163,7 @@ _ADMIN_JS = """
     try {
       const data = await adminFetch(API_BASE + "summary");
       renderSummary(data);
-      setStatus("摘要已加载。");
+      setStatus("统计已加载。");
     } catch (error) {
       handleError(error);
     }
@@ -1235,12 +1205,12 @@ _ADMIN_JS = """
     byId("save-secret").addEventListener("click", saveSecret);
     byId("clear-secret").addEventListener("click", clearSecret);
     byId("load-summary").addEventListener("click", loadSummary);
-    byId("order-note-submit").addEventListener("click", submitOrderNote);
-    bindList("orders");
+    byId("device-detail-load").addEventListener("click", loadDeviceDetail);
+    byId("device-note-submit").addEventListener("click", submitDeviceNote);
+    byId("license-note-submit").addEventListener("click", submitLicenseNote);
+    bindList("devices");
     bindList("audit");
     bindFilterReset("audit");
-    bindList("notifications");
-    bindList("grants");
     bindList("licenses");
     if (getSecret()) {
       setStatus("管理员令牌已在本次会话中。");

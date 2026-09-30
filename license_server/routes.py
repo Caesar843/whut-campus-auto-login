@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from license_client.constants import PRODUCT_ID, TRIAL_DAYS
+from license_client.constants import PRODUCT_ID
 from license_server.db import connect
 from license_server.license_service import (
-    create_license,
-    latest_license,
+    active_license,
+    create_free_license,
 )
 from license_server.signer import (
     LicenseSigningIdentity,
@@ -52,10 +52,6 @@ def create_router(
     *,
     database_path: Path,
     signing_identity: LicenseSigningIdentity,
-    payment_amount: str,
-    payment_currency: str,
-    payment_channels: tuple[str, ...],
-    payment_order_ttl_minutes: int,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -83,13 +79,10 @@ def create_router(
                     ),
                 )
                 device_id = int(cursor.lastrowid)
-                license_row = create_license(
+                license_row = create_free_license(
                     connection,
                     device_id=device_id,
-                    license_type="trial",
-                    source="trial",
                     starts_at=now,
-                    expires_at=now + timedelta(days=TRIAL_DAYS),
                 )
             else:
                 device_id = int(device["id"])
@@ -104,15 +97,12 @@ def create_router(
                         device_id,
                     ),
                 )
-                license_row = latest_license(connection, device_id)
+                license_row = active_license(connection, device_id)
                 if license_row is None:
-                    license_row = create_license(
+                    license_row = create_free_license(
                         connection,
                         device_id=device_id,
-                        license_type="trial",
-                        source="trial",
                         starts_at=now,
-                        expires_at=now + timedelta(days=TRIAL_DAYS),
                     )
             connection.commit()
         return _license_response(
@@ -137,9 +127,13 @@ def create_router(
                 "UPDATE devices SET last_seen_at = ? WHERE id = ?",
                 (datetime_text(now), int(device["id"])),
             )
-            license_row = latest_license(connection, int(device["id"]))
+            license_row = active_license(connection, int(device["id"]))
             if license_row is None:
-                raise HTTPException(status_code=404, detail="license_not_found")
+                license_row = create_free_license(
+                    connection,
+                    device_id=int(device["id"]),
+                    starts_at=now,
+                )
             connection.commit()
         return _license_response(
             product_id=request.product_id,
@@ -203,9 +197,10 @@ def _license_response(
 
 
 def _response_status(license_type: str, status: str, expires_at: str) -> str:
+    """免费版状态文本：free_active 表示永久免费授权可用。"""
     if status == "revoked":
         return "revoked"
     parsed_expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     if parsed_expires <= datetime.now(timezone.utc):
-        return "paid_expired" if license_type == "paid" else "trial_expired"
-    return "paid_active" if license_type == "paid" else "trial_active"
+        return f"{license_type}_expired"
+    return f"{license_type}_active"

@@ -9,6 +9,7 @@ from license_client.token_verify import LicenseTokenVerification, parse_utc_date
 
 
 class LicenseStatus(str, Enum):
+    FREE = "free"
     UNINITIALIZED = "uninitialized"
     TRIAL_ACTIVE = "trial_active"
     TRIAL_EXPIRED = "trial_expired"
@@ -27,6 +28,8 @@ TOKEN_PERSIST_FAILED_MESSAGE = (
     "restart or offline use may require another online check."
 )
 
+FREE_LICENSE_MESSAGE = "授权状态：免费版，永久免费使用，无试用期与内购限制。"
+
 
 @dataclass(frozen=True)
 class LicenseDecision:
@@ -41,6 +44,24 @@ class LicenseDecision:
     bootstrap_required: bool = False
     retryable: bool = False
     warning_code: Optional[str] = None
+    usage_sync_required: bool = False
+
+
+def free_decision(
+    *,
+    reason: str = "free_mode",
+    usage_sync_required: bool = False,
+    message_for_ui: Optional[str] = None,
+) -> LicenseDecision:
+    """免费版放行判定：允许所有功能，不读取本地凭证、不判断试用期。"""
+    return LicenseDecision(
+        status=LicenseStatus.FREE,
+        allowed=True,
+        reason=reason,
+        license_type="free",
+        message_for_ui=message_for_ui or FREE_LICENSE_MESSAGE,
+        usage_sync_required=usage_sync_required,
+    )
 
 
 def evaluate_local_license(
@@ -63,7 +84,7 @@ def evaluate_local_license(
                 license_type=license_type,
                 expires_at=expires_at,
                 days_remaining=days_remaining,
-                message_for_ui=f"授权状态：正式版，有效期至 {_date_text(expires_at)}",
+                message_for_ui=f"授权状态：免费版（历史凭证），有效期至 {_date_text(expires_at)}",
             )
         status = LicenseStatus.TRIAL_ACTIVE
         return LicenseDecision(
@@ -73,7 +94,7 @@ def evaluate_local_license(
             license_type=license_type or "trial",
             expires_at=expires_at,
             days_remaining=days_remaining,
-            message_for_ui=f"授权状态：试用中，剩余 {max(days_remaining or 0, 0)} 天",
+            message_for_ui=f"授权状态：免费版（历史凭证），剩余 {max(days_remaining or 0, 0)} 天",
         )
 
     if verification.error == "expired":
@@ -83,9 +104,9 @@ def evaluate_local_license(
             else LicenseStatus.TRIAL_EXPIRED
         )
         message = (
-            "正式授权已过期，请续费后继续使用。"
+            "历史授权凭证已过期，请联网刷新授权。"
             if status == LicenseStatus.PAID_EXPIRED
-            else "试用期已结束，请激活正式版后继续使用。"
+            else "历史试用凭证已过期，请联网刷新授权。"
         )
         return LicenseDecision(
             status=status,

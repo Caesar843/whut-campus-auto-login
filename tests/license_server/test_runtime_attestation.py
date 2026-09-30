@@ -176,19 +176,19 @@ def test_runtime_attestation_config_defaults_off_and_requires_production(
     monkeypatch,
 ):
     default_config = load_config(
-        _production_env(tmp_path, PAYMENT_PROVIDER="disabled")
+        _production_env(tmp_path)
     )
     assert default_config.runtime_attestation_enabled is False
     assert default_config.runtime_source_commit is None
 
-    development = _production_env(tmp_path, PAYMENT_PROVIDER="disabled")
+    development = _production_env(tmp_path)
     development["LICENSE_SERVER_ENV"] = "development"
     development["LICENSE_RUNTIME_ATTESTATION_ENABLED"] = "true"
     development["LICENSE_RUNTIME_SOURCE_COMMIT"] = "a" * 40
     with pytest.raises(RuntimeError, match="production"):
         load_config(development)
 
-    enabled = _production_env(tmp_path, PAYMENT_PROVIDER="disabled")
+    enabled = _production_env(tmp_path)
     enabled["LICENSE_RUNTIME_ATTESTATION_ENABLED"] = "true"
     enabled["LICENSE_RUNTIME_SOURCE_COMMIT"] = "a" * 40
     monkeypatch.setattr(
@@ -201,7 +201,7 @@ def test_runtime_attestation_config_defaults_off_and_requires_production(
 
 
 def test_runtime_attestation_config_fails_closed(tmp_path):
-    env = _production_env(tmp_path, PAYMENT_PROVIDER="disabled")
+    env = _production_env(tmp_path)
     env["LICENSE_RUNTIME_ATTESTATION_ENABLED"] = "true"
     env["LICENSE_RUNTIME_SOURCE_COMMIT"] = "2c555007"
 

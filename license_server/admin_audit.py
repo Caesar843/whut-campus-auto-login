@@ -27,44 +27,18 @@ MAX_AUDIT_SNAPSHOT_JSON_BYTES = 8192
 STRUCTURED_IDENTIFIER = re.compile(r"[A-Za-z0-9_-]+\Z")
 SAFE_SNAPSHOT_FIELDS = frozenset(
     {
-        "order_id",
-        "out_trade_no",
         "device_id_hash",
-        "plan_code",
-        "channel",
         "status",
-        "amount_fen",
-        "currency",
-        "provider_transaction_id",
-        "provider_trade_state",
-        "notification_id",
-        "process_status",
-        "signature_valid",
-        "merchant_identity_valid",
         "license_id",
         "license_status",
         "license_expire_at",
-        "grant_id",
-        "source_order_id",
-        "grant_days",
-        "previous_expire_at",
-        "new_expire_at",
-        "issued_by",
         "failure_code",
         "created_at",
         "updated_at",
-        "paid_at",
-        "closed_at",
     }
 )
 FORBIDDEN_SNAPSHOT_FIELDS = frozenset(
     {
-        "provider_code_url",
-        "raw_payload",
-        "body_raw",
-        "body_decrypted",
-        "openid",
-        "bank_type",
         "authorization",
         "Authorization",
         "bearer",
@@ -76,8 +50,6 @@ FORBIDDEN_SNAPSHOT_FIELDS = frozenset(
         "campus_account",
         "campus_password",
         "private_key",
-        "api_v3_key",
-        "wechatpay_signature",
     }
 )
 

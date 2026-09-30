@@ -1,6 +1,15 @@
 # License Server
 
-Development-only authorization server for the WHUT campus auto-login tool.
+Free-version license server for the WHUT campus auto-login tool.
+
+The tool is permanently free: there is no trial, no purchase, no activation
+code, and no order flow anywhere in the server. The server only:
+
+- registers devices (device fingerprint hash only) and issues a permanent
+  free license on first registration;
+- refreshes the signed license token for known devices;
+- serves a minimal internal read-only admin console for usage statistics;
+- optionally provides runtime attestation for privileged local processes.
 
 It implements:
 
@@ -8,26 +17,61 @@ It implements:
 - `GET /health`
 - `POST /device/register`
 - `POST /license/refresh`
-- `POST /payment/create`
-- `GET /payment/status`
 
-Payment support is only an order skeleton:
+`POST /device/register` accepts `product_id` and `device_fingerprint_hash`
+only. Legacy clients may still send `device_name`, `os`, and `app_version`;
+these fields are ignored and never stored. Any campus account fields are
+rejected with 422.
 
-- it creates and stores unpaid local payment orders;
-- it does not integrate real WeChat Pay;
-- it does not integrate real Alipay;
-- it does not generate real or fake QR codes;
-- it does not generate real or fake payment links;
-- it does not simulate payment success;
-- it does not issue paid licenses from payment orders.
+A new device immediately receives a permanent free license:
 
-The current `/payment/create` and `/payment/status` routes are skeleton or
-compatibility routes. Payment V1 target contracts, states, schema, amount rules,
-and WeChat Native-only scope are defined in
-`docs/design/PAYMENT_V1_IMPLEMENTATION.md`.
+- `license_type="free"`, `source="free"`;
+- `expires_at="9999-12-31T00:00:00Z"`;
+- the historical `order_id` column stays in the schema but is always NULL and
+  never read.
 
-Orders can only become `paid` after a future real payment callback verifies the
-provider signature, amount, order status, and idempotency rules.
+Responses include `status` (`free_active`, `free_expired`, or `revoked`), the
+license fields, and a server-signed `signed_license_token` that clients verify
+with the embedded public key. `POST /license/refresh` returns 404
+`device_not_found` for unknown devices.
+
+## Admin Console
+
+With `ADMIN_ENABLED=true` the server mounts a read-only admin console at
+`/internal/admin/` (page plus `/internal/admin/assets/admin.js`). The page
+itself contains no business data; the admin token lives only in the browser
+session. Data endpoints under `/internal/admin/api/`:
+
+- `GET /api/summary` — device totals, 24h/7d/30d active devices, license type
+  and status distribution;
+- `GET /api/devices` and `GET /api/devices/{device_fingerprint_hash}`;
+- `GET /api/licenses`;
+- `GET /api/audit-logs` and `GET /api/audit-logs/{audit_id}`;
+- `POST /api/devices/{device_fingerprint_hash}/notes` and
+  `POST /api/licenses/{license_id}/notes` — the only write endpoints; they
+  append an audited note.
+
+The console cannot issue, freeze, or modify licenses. Access uses a Bearer
+token compared by SHA-256 digest (`ADMIN_ACCESS_TOKEN_SHA256`); the raw token
+must never enter the repository, logs, or Nginx config. Responses always carry
+security headers, and sensitive note text is redacted in audit views.
+
+## Database
+
+Schema version 6 (`license_server/db.py`) keeps only the core tables
+`devices`, `licenses`, `admin_audit_logs`, and `schema_meta`. Payment-era
+legacy tables (`db.LEGACY_PAYMENT_TABLES`) are not created in new databases;
+if they still exist in an old database they are preserved as-is and are never
+validated, read, or written.
+
+## Runtime Attestation
+
+Optional and production-only. With `LICENSE_RUNTIME_ATTESTATION_ENABLED=true`
+(and a valid `LICENSE_RUNTIME_SOURCE_COMMIT`), the app starts a local runtime
+attestation server that answers signed proofs over a locked Unix socket for
+privileged local processes only. Public traffic must never reach it; the
+Nginx example blocks `/internal/runtime-attestation`. Deployment details live
+in `docs/deploy/LICENSE_SERVER_PRODUCTION_CONFIG.md`.
 
 ## Local Setup
 

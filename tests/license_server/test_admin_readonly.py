@@ -1,4 +1,15 @@
+"""免费版后台只读接口测试。
+
+支付模块移除后，后台只保留 summary / devices / licenses / audit-logs 的只读
+查询与设备、授权备注端点；支付时代的 orders / notifications / grants 端点应
+返回 404。本文件保持原有安全性质：认证明缺失或错误 401、缺少资源 404、非法
+参数 400、分页边界、安全头、敏感字段不返回、只读查询不改库。
+
+本文件的断言以 `license_server/admin_routes.py` 的真实响应结构为准。
+"""
+
 import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 
@@ -8,8 +19,8 @@ from fastapi.testclient import TestClient
 import license_server.admin_routes as admin_routes
 from license_server.app import create_app
 from license_server.db import connect
+from license_server.signer import datetime_text
 from tests.license_server.test_license_server import (
-    _client,
     _private_key_b64,
     _sqlite_url,
 )
@@ -17,18 +28,22 @@ from tests.license_server.test_license_server import (
 
 ADMIN_TOKEN = "p4-admin-token-with-randomish-value"
 ADMIN_HASH = hashlib.sha256(ADMIN_TOKEN.encode("utf-8")).hexdigest()
+ADMIN_PAGE = "/internal/admin/"
+ADMIN_SCRIPT = "/internal/admin/assets/admin.js"
+ADMIN_API = "/internal/admin/api/"
+ADMIN_PAGE_TITLE = "管理后台"
 FORBIDDEN_TEXT = (
     "provider_code_url",
     "raw_payload",
     "body_raw",
     "body_decrypted",
-    "openid",
-    "bank_type",
     "signed_token",
     "token",
     "campus_account",
     "campus_password",
     "password",
+    "order_id",
+    "out_trade_no",
 )
 ADMIN_HEADERS = {
     "cache-control": "no-store",
@@ -36,6 +51,81 @@ ADMIN_HEADERS = {
     "referrer-policy": "no-referrer",
     "content-security-policy": "default-src 'self'; frame-ancestors 'none'",
 }
+EXPECTED_ADMIN_PATHS = {
+    "/internal/admin/",
+    "/internal/admin/assets/admin.js",
+    "/internal/admin/api/summary",
+    "/internal/admin/api/devices",
+    "/internal/admin/api/devices/{device_fingerprint_hash}",
+    "/internal/admin/api/devices/{device_fingerprint_hash}/notes",
+    "/internal/admin/api/licenses",
+    "/internal/admin/api/licenses/{license_id}/notes",
+    "/internal/admin/api/audit-logs",
+    "/internal/admin/api/audit-logs/{audit_id}",
+}
+REMOVED_PAYMENT_ENDPOINTS = (
+    "/internal/admin/api/orders",
+    "/internal/admin/api/orders/order-paid",
+    "/internal/admin/api/orders/order-paid/notes",
+    "/internal/admin/api/notifications",
+    "/internal/admin/api/notifications/notice-b",
+    "/internal/admin/api/notifications/notice-b/notes",
+    "/internal/admin/api/grants",
+    "/internal/admin/api/grants/1",
+    "/internal/admin/api/grants/1/notes",
+)
+SUMMARY_FIELDS = {
+    "devices_total",
+    "devices_active_24h",
+    "devices_active_7d",
+    "devices_active_30d",
+    "licenses_by_type",
+    "licenses_by_status",
+    "licenses_active_unexpired",
+}
+DEVICE_FIELDS = {
+    "device_id_hash",
+    "product_id",
+    "first_seen_at",
+    "last_seen_at",
+    "license_id",
+    "license_type",
+    "license_status",
+    "license_expires_at",
+}
+DEVICE_DETAIL_FIELDS = {
+    "device_id_hash",
+    "product_id",
+    "first_seen_at",
+    "last_seen_at",
+    "licenses",
+}
+LICENSE_FIELDS = {
+    "license_id",
+    "license_type",
+    "status",
+    "starts_at",
+    "expires_at",
+    "source",
+    "created_at",
+    "revoked_at",
+}
+AUDIT_FIELDS = {
+    "id",
+    "actor",
+    "source_ip",
+    "request_id",
+    "action",
+    "target_type",
+    "target_id",
+    "result",
+    "before_state",
+    "after_state",
+    "reason",
+    "failure_code",
+    "created_at",
+}
+FREE_EXPIRES_AT = "9999-12-31T00:00:00Z"
 
 
 def _iter_effective_routes(routes):
@@ -97,14 +187,15 @@ def test_admin_page_and_script_load_without_bearer_but_api_does_not(
 ):
     client, _database_path = _admin_client(tmp_path, monkeypatch)
 
-    page = client.get("/internal/admin/")
-    script = client.get("/internal/admin/assets/admin.js")
-    api = client.get("/internal/admin/api/summary")
+    page = client.get(ADMIN_PAGE)
+    script = client.get(ADMIN_SCRIPT)
+    api = client.get(ADMIN_API + "summary")
 
     assert page.status_code == 200
     assert script.status_code == 200
     assert api.status_code == 401
-    assert "/internal/admin/assets/admin.js" in page.text
+    assert ADMIN_PAGE_TITLE in page.text
+    assert ADMIN_SCRIPT in page.text
     assert ADMIN_TOKEN not in page.text
     assert ADMIN_HASH not in page.text
     assert ADMIN_TOKEN not in script.text
@@ -126,7 +217,7 @@ def test_admin_page_and_script_load_without_bearer_but_api_does_not(
 def test_admin_auth_rejects_missing_malformed_and_wrong_tokens(tmp_path, monkeypatch, headers):
     client, _database_path = _admin_client(tmp_path, monkeypatch)
 
-    response = client.get("/internal/admin/api/summary", headers=headers)
+    response = client.get(ADMIN_API + "summary", headers=headers)
 
     assert response.status_code == 401
     assert response.json()["detail"] in {"ADMIN_AUTH_REQUIRED", "ADMIN_AUTH_INVALID"}
@@ -140,7 +231,7 @@ def test_admin_auth_accepts_bearer_token_and_routes_are_hidden_from_openapi(
 ):
     client, _database_path = _admin_client(tmp_path, monkeypatch)
 
-    response = client.get("/internal/admin/api/summary", headers=_auth())
+    response = client.get(ADMIN_API + "summary", headers=_auth())
     schema = client.get("/openapi.json").json()
 
     assert response.status_code == 200
@@ -153,77 +244,268 @@ def test_all_admin_api_routes_require_bearer_token(tmp_path, monkeypatch):
     client, _database_path = _admin_client(tmp_path, monkeypatch)
 
     for path in (
-        "/internal/admin/api/summary",
-        "/internal/admin/api/orders",
-        "/internal/admin/api/orders/missing",
-        "/internal/admin/api/notifications",
-        "/internal/admin/api/notifications/missing",
-        "/internal/admin/api/grants",
-        "/internal/admin/api/licenses",
+        ADMIN_API + "summary",
+        ADMIN_API + "devices",
+        ADMIN_API + "devices/device-a",
+        ADMIN_API + "licenses",
+        ADMIN_API + "audit-logs",
+        ADMIN_API + "audit-logs/1",
     ):
         response = client.get(path)
         assert response.status_code == 401
         _assert_security_headers(response)
 
+    for path in (
+        ADMIN_API + "devices/device-a/notes",
+        ADMIN_API + "licenses/1/notes",
+    ):
+        response = client.post(path, json={"note": "ok"})
+        assert response.status_code == 401
+        _assert_security_headers(response)
 
-def test_admin_queries_filter_page_and_exclude_sensitive_fields(tmp_path, monkeypatch):
+
+def test_admin_router_exposes_only_free_version_paths(tmp_path, monkeypatch):
+    client, _database_path = _admin_client(tmp_path, monkeypatch)
+
+    admin_paths = {
+        route.path
+        for route in _iter_effective_routes(client.app.routes)
+        if getattr(route, "path", "").startswith("/internal/admin")
+    }
+
+    assert admin_paths == EXPECTED_ADMIN_PATHS
+
+
+def test_removed_payment_endpoints_are_gone(tmp_path, monkeypatch):
+    client, _database_path = _admin_client(tmp_path, monkeypatch)
+
+    for path in REMOVED_PAYMENT_ENDPOINTS:
+        with_token = client.get(path, headers=_auth())
+        without_token = client.get(path)
+        posted = client.post(path, headers=_auth(), json={"note": "ok"})
+        for response in (with_token, without_token, posted):
+            assert response.status_code == 404
+            _assert_security_headers(response)
+
+
+def test_admin_devices_and_licenses_filter_and_exclude_sensitive_fields(
+    tmp_path,
+    monkeypatch,
+):
     client, database_path = _admin_client(tmp_path, monkeypatch)
     _seed_admin_rows(database_path)
 
-    orders = client.get(
-        "/internal/admin/api/orders",
-        headers=_auth(),
-        params={"status": "PAID", "created_from": "2026-07-06T00:00:00Z", "limit": 200},
-    )
-    order_detail = client.get("/internal/admin/api/orders/order-paid", headers=_auth())
-    notifications = client.get(
-        "/internal/admin/api/notifications",
-        headers=_auth(),
-        params={"process_status": "ABNORMAL", "signature_valid": "false"},
-    )
-    notification_detail = client.get("/internal/admin/api/notifications/notice-b", headers=_auth())
-    grants = client.get(
-        "/internal/admin/api/grants",
-        headers=_auth(),
-        params={"source_order_id": "order-paid"},
-    )
+    devices = client.get(ADMIN_API + "devices", headers=_auth(), params={"limit": 200})
+    device_detail = client.get(ADMIN_API + "devices/device-a", headers=_auth())
     licenses = client.get(
-        "/internal/admin/api/licenses",
+        ADMIN_API + "licenses",
         headers=_auth(),
         params={"device_id_hash": "device-a", "status": "active"},
     )
+    revoked = client.get(
+        ADMIN_API + "licenses",
+        headers=_auth(),
+        params={"device_id_hash": "device-b", "status": "revoked"},
+    )
+    by_product = client.get(
+        ADMIN_API + "devices",
+        headers=_auth(),
+        params={"product_id": "whut-campus-auto-login"},
+    )
+    other_product = client.get(
+        ADMIN_API + "devices",
+        headers=_auth(),
+        params={"product_id": "other-product"},
+    )
 
-    assert orders.status_code == 200
-    assert orders.json()["limit"] == 100
-    assert [row["order_id"] for row in orders.json()["items"]] == ["order-paid"]
-    assert order_detail.status_code == 200
-    assert order_detail.json()["order_id"] == "order-paid"
-    assert notifications.status_code == 200
-    assert [row["provider_notification_id"] for row in notifications.json()["items"]] == ["notice-b"]
-    assert notification_detail.status_code == 200
-    assert notification_detail.json()["process_status"] == "ABNORMAL"
-    assert grants.status_code == 200
-    assert grants.json()["items"][0]["new_expire_at"] == "2027-07-06T00:00:00Z"
+    assert devices.status_code == 200
+    assert devices.json()["limit"] == 100
+    assert devices.json()["offset"] == 0
+    items = devices.json()["items"]
+    # 设备按 last_seen_at 倒序
+    assert [row["device_id_hash"] for row in items] == [
+        "device-fresh",
+        "device-a",
+        "device-b",
+    ]
+    for row in items:
+        assert set(row) == DEVICE_FIELDS
+        assert row["license_type"] == "free"
+    assert items[0]["license_status"] == "active"
+    assert items[0]["license_expires_at"] == FREE_EXPIRES_AT
+    assert items[2]["license_status"] == "revoked"
+    assert items[2]["license_id"] is not None
+
+    assert [row["device_id_hash"] for row in by_product.json()["items"]] == [
+        "device-fresh",
+        "device-a",
+        "device-b",
+    ]
+    assert other_product.json()["items"] == []
+
+    assert device_detail.status_code == 200
+    detail = device_detail.json()
+    assert set(detail) == DEVICE_DETAIL_FIELDS
+    assert detail["device_id_hash"] == "device-a"
+    assert detail["product_id"] == "whut-campus-auto-login"
+    assert [row["license_type"] for row in detail["licenses"]] == ["free"]
+    assert detail["licenses"][0]["status"] == "active"
+    assert set(detail["licenses"][0]) == LICENSE_FIELDS
+
     assert licenses.status_code == 200
-    assert licenses.json()["items"][0]["device_id_hash"] == "device-a"
-    for response in (orders, order_detail, notifications, notification_detail, grants, licenses):
+    license_items = licenses.json()["items"]
+    assert [row["status"] for row in license_items] == ["active"]
+    assert license_items[0]["expires_at"] == FREE_EXPIRES_AT
+    assert license_items[0]["license_type"] == "free"
+
+    assert revoked.status_code == 200
+    revoked_items = revoked.json()["items"]
+    assert [row["status"] for row in revoked_items] == ["revoked"]
+    assert revoked_items[0]["revoked_at"] is not None
+
+    for response in (
+        devices,
+        device_detail,
+        licenses,
+        revoked,
+        by_product,
+        other_product,
+    ):
+        assert "order_id" not in response.text
         _assert_security_headers(response)
         _assert_no_sensitive_text(response.text)
+
+
+def test_admin_devices_pagination_boundaries(tmp_path, monkeypatch):
+    client, database_path = _admin_client(tmp_path, monkeypatch)
+    _seed_admin_rows(database_path)
+
+    first_page = client.get(
+        ADMIN_API + "devices", headers=_auth(), params={"limit": 2, "offset": 0}
+    )
+    second_page = client.get(
+        ADMIN_API + "devices", headers=_auth(), params={"limit": 2, "offset": 2}
+    )
+    beyond = client.get(
+        ADMIN_API + "devices", headers=_auth(), params={"limit": 2, "offset": 4}
+    )
+
+    assert first_page.status_code == 200
+    assert [row["device_id_hash"] for row in first_page.json()["items"]] == [
+        "device-fresh",
+        "device-a",
+    ]
+    assert second_page.status_code == 200
+    assert [row["device_id_hash"] for row in second_page.json()["items"]] == ["device-b"]
+    assert beyond.status_code == 200
+    assert beyond.json()["items"] == []
+    assert beyond.json()["offset"] == 4
+    for response in (first_page, second_page, beyond):
+        _assert_security_headers(response)
+
+
+def test_admin_devices_seen_range_filters(tmp_path, monkeypatch):
+    client, database_path = _admin_client(tmp_path, monkeypatch)
+    _seed_admin_rows(database_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    recent = client.get(
+        ADMIN_API + "devices",
+        headers=_auth(),
+        params={"seen_from": datetime_text(now - timedelta(days=61))},
+    )
+    older = client.get(
+        ADMIN_API + "devices",
+        headers=_auth(),
+        params={"seen_to": datetime_text(now - timedelta(days=65))},
+    )
+    contradictory = client.get(
+        ADMIN_API + "devices",
+        headers=_auth(),
+        params={
+            "seen_from": datetime_text(now - timedelta(days=61)),
+            "seen_to": datetime_text(now - timedelta(days=65)),
+        },
+    )
+    both_bounds = client.get(
+        ADMIN_API + "devices",
+        headers=_auth(),
+        params={
+            "seen_from": datetime_text(now - timedelta(days=71)),
+            "seen_to": datetime_text(now - timedelta(days=59)),
+        },
+    )
+
+    assert [row["device_id_hash"] for row in recent.json()["items"]] == [
+        "device-fresh",
+        "device-a",
+    ]
+    assert [row["device_id_hash"] for row in older.json()["items"]] == ["device-b"]
+    assert contradictory.json()["items"] == []
+    assert [row["device_id_hash"] for row in both_bounds.json()["items"]] == [
+        "device-a",
+        "device-b",
+    ]
+    for response in (recent, older, contradictory, both_bounds):
+        _assert_security_headers(response)
+
+
+def test_unknown_device_query_parameter_is_ignored(tmp_path, monkeypatch):
+    """支付时代才有的 active_within_hours 已不是过滤条件，参数被忽略。"""
+    client, database_path = _admin_client(tmp_path, monkeypatch)
+    _seed_admin_rows(database_path)
+
+    response = client.get(
+        ADMIN_API + "devices",
+        headers=_auth(),
+        params={"active_within_hours": "24"},
+    )
+
+    assert response.status_code == 200
+    assert [row["device_id_hash"] for row in response.json()["items"]] == [
+        "device-fresh",
+        "device-a",
+        "device-b",
+    ]
+
+
+def test_admin_summary_reports_free_version_stats(tmp_path, monkeypatch):
+    client, database_path = _admin_client(tmp_path, monkeypatch)
+    _seed_admin_rows(database_path)
+
+    response = client.get(ADMIN_API + "summary", headers=_auth())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == SUMMARY_FIELDS
+    assert body["devices_total"] == 3
+    assert body["devices_active_24h"] == 1
+    assert body["devices_active_7d"] == 1
+    assert body["devices_active_30d"] == 1
+    assert body["licenses_by_type"] == {"free": 3}
+    assert body["licenses_by_status"] == {"active": 2, "revoked": 1}
+    assert body["licenses_active_unexpired"] == 2
+    assert "orders_by_status" not in body
+    assert "license_grants_total" not in body
+    _assert_no_sensitive_text(response.text)
+    _assert_security_headers(response)
 
 
 @pytest.mark.parametrize(
     ("path", "params"),
     [
-        ("/internal/admin/api/orders", {"status": "SUCCESS"}),
-        ("/internal/admin/api/orders", {"created_from": "not-a-date"}),
-        ("/internal/admin/api/notifications", {"process_status": "DONE"}),
-        ("/internal/admin/api/notifications", {"signature_valid": "maybe"}),
+        ("/internal/admin/api/devices", {"seen_from": "not-a-date"}),
+        ("/internal/admin/api/devices", {"seen_to": "2026-07-06T00:00:00"}),
+        ("/internal/admin/api/devices", {"limit": 0}),
+        ("/internal/admin/api/devices", {"offset": -1}),
         ("/internal/admin/api/licenses", {"status": "deleted"}),
-        ("/internal/admin/api/grants", {"created_to": "not-a-date"}),
-        ("/internal/admin/api/orders", {"offset": -1}),
-        ("/internal/admin/api/notifications", {"offset": -1}),
-        ("/internal/admin/api/grants", {"offset": -1}),
+        ("/internal/admin/api/licenses", {"expires_from": "not-a-date"}),
+        ("/internal/admin/api/licenses", {"limit": 0}),
         ("/internal/admin/api/licenses", {"offset": -1}),
+        ("/internal/admin/api/audit-logs", {"result": "BOGUS"}),
+        ("/internal/admin/api/audit-logs", {"created_to": "not-a-date"}),
+        ("/internal/admin/api/audit-logs", {"limit": 0}),
+        ("/internal/admin/api/audit-logs", {"offset": -1}),
     ],
 )
 def test_admin_queries_reject_invalid_filters(tmp_path, monkeypatch, path, params):
@@ -240,8 +522,8 @@ def test_admin_details_return_404_for_missing_resources(tmp_path, monkeypatch):
     client, _database_path = _admin_client(tmp_path, monkeypatch)
 
     for path in (
-        "/internal/admin/api/orders/missing",
-        "/internal/admin/api/notifications/999",
+        ADMIN_API + "devices/missing-device-hash",
+        ADMIN_API + "audit-logs/999",
     ):
         response = client.get(path, headers=_auth())
         assert response.status_code == 404
@@ -249,40 +531,97 @@ def test_admin_details_return_404_for_missing_resources(tmp_path, monkeypatch):
         _assert_security_headers(response)
 
 
+def test_admin_note_post_endpoints_append_audit_rows(tmp_path, monkeypatch):
+    client, database_path = _admin_client(tmp_path, monkeypatch)
+    _seed_admin_rows(database_path)
+
+    device_note = client.post(
+        ADMIN_API + "devices/device-a/notes",
+        headers=_auth(),
+        json={"note": "复核设备活跃记录"},
+    )
+    license_note = client.post(
+        ADMIN_API + "licenses/1/notes",
+        headers=_auth(),
+        json={"note": "复核免费授权状态"},
+    )
+
+    assert device_note.status_code == 201
+    device_body = device_note.json()
+    assert set(device_body) == AUDIT_FIELDS
+    assert device_body["actor"] == "tester"
+    assert device_body["action"] == "DEVICE_NOTE_ADDED"
+    assert device_body["target_type"] == "DEVICE"
+    assert device_body["target_id"] == "device-a"
+    assert device_body["result"] == "SUCCESS"
+    assert device_body["before_state"] is None
+    assert device_body["after_state"] is None
+    assert license_note.status_code == 201
+    assert license_note.json()["action"] == "LICENSE_NOTE_ADDED"
+    assert license_note.json()["target_type"] == "LICENSE"
+
+    audit = client.get(ADMIN_API + "audit-logs", headers=_auth())
+    items = audit.json()["items"]
+    assert [row["action"] for row in items] == ["LICENSE_NOTE_ADDED", "DEVICE_NOTE_ADDED"]
+
+    device_only = client.get(
+        ADMIN_API + "audit-logs", headers=_auth(), params={"target_type": "DEVICE"}
+    )
+    assert [row["target_id"] for row in device_only.json()["items"]] == ["device-a"]
+
+    audit_page = client.get(
+        ADMIN_API + "audit-logs", headers=_auth(), params={"limit": 1, "offset": 1}
+    )
+    assert [row["action"] for row in audit_page.json()["items"]] == ["DEVICE_NOTE_ADDED"]
+
+    detail = client.get(ADMIN_API + f"audit-logs/{items[0]['id']}", headers=_auth())
+    assert detail.status_code == 200
+    assert detail.json()["reason"] == "复核免费授权状态"
+
+    for response in (device_note, license_note, audit, device_only, audit_page, detail):
+        _assert_no_sensitive_text(response.text)
+        _assert_security_headers(response)
+
+
 def test_admin_summary_and_page_have_security_headers(tmp_path, monkeypatch):
     client, database_path = _admin_client(tmp_path, monkeypatch)
     _seed_admin_rows(database_path)
 
-    summary = client.get("/internal/admin/api/summary", headers=_auth())
-    page = client.get("/internal/admin/")
-    script = client.get("/internal/admin/assets/admin.js")
+    summary = client.get(ADMIN_API + "summary", headers=_auth())
+    page = client.get(ADMIN_PAGE)
+    script = client.get(ADMIN_SCRIPT)
 
     assert summary.status_code == 200
-    assert summary.json()["orders_by_status"]["PAID"] == 1
-    assert summary.json()["license_grants_total"] == 1
+    assert "orders_by_status" not in summary.text
+    assert "license_grants_total" not in summary.text
     assert page.status_code == 200
     assert script.status_code == 200
+    assert ADMIN_PAGE_TITLE in page.text
     assert "sessionStorage" in page.text
     assert "localStorage" not in page.text
-    assert "unsafe-inline" not in page.headers["content-security-policy"]
-    assert "unsafe-inline" not in script.headers["content-security-policy"]
-    assert "http://" not in page.text
-    assert "https://" not in page.text
-    assert "http://" not in script.text
-    assert "https://" not in script.text
+    combined = page.text + script.text
+    assert "订单" not in combined
+    assert "支付" not in combined
     for response in (summary, page, script):
         _assert_security_headers(response)
+    for response in (page, script):
+        assert "unsafe-inline" not in response.headers["content-security-policy"]
+    assert "http://" not in combined
+    assert "https://" not in combined
 
 
-@pytest.mark.parametrize("helper", ["_count_by", "_count"])
+@pytest.mark.parametrize(
+    "helper",
+    ["_count", "_count_by", "_count_devices_seen_since"],
+)
 def test_admin_summary_maps_stats_helper_sqlite_errors(tmp_path, monkeypatch, helper):
     client, _database_path = _admin_client(tmp_path, monkeypatch)
 
-    def fail_stats_query(*_args):
+    def fail_stats_query(*_args, **_kwargs):
         raise sqlite3.OperationalError("summary query failed")
 
     monkeypatch.setattr(admin_routes, helper, fail_stats_query)
-    response = client.get("/internal/admin/api/summary", headers=_auth())
+    response = client.get(ADMIN_API + "summary", headers=_auth())
 
     assert response.status_code == 500
     assert response.json() == {"detail": "ADMIN_INTERNAL_ERROR"}
@@ -303,9 +642,7 @@ def test_admin_summary_maps_direct_sqlite_query_error(tmp_path, monkeypatch):
             raise sqlite3.OperationalError("summary query failed")
 
     monkeypatch.setattr(admin_routes, "_connection", lambda _database_path: FailingConnection())
-    monkeypatch.setattr(admin_routes, "_count_by", lambda *_args: {})
-    monkeypatch.setattr(admin_routes, "_count", lambda *_args: 0)
-    response = client.get("/internal/admin/api/summary", headers=_auth())
+    response = client.get(ADMIN_API + "summary", headers=_auth())
 
     assert response.status_code == 500
     assert response.json() == {"detail": "ADMIN_INTERNAL_ERROR"}
@@ -318,7 +655,7 @@ def test_admin_script_uses_session_storage_and_authorized_same_origin_api_only(
 ):
     client, _database_path = _admin_client(tmp_path, monkeypatch)
 
-    script = client.get("/internal/admin/assets/admin.js").text
+    script = client.get(ADMIN_SCRIPT).text
 
     assert "sessionStorage.setItem" in script
     assert "sessionStorage.getItem" in script
@@ -332,6 +669,7 @@ def test_admin_script_uses_session_storage_and_authorized_same_origin_api_only(
     assert 'const API_BASE = "/internal/admin/api/"' in script
     assert "path.startsWith(API_BASE)" in script
     assert "fetch(path" in script
+    assert 'credentials: "omit"' in script
     assert "管理员令牌无效或已失效。" in script
 
 
@@ -341,10 +679,16 @@ def test_admin_script_avoids_unsafe_dom_injection_and_has_basic_controls(
 ):
     client, _database_path = _admin_client(tmp_path, monkeypatch)
 
-    page = client.get("/internal/admin/").text
-    script = client.get("/internal/admin/assets/admin.js").text
+    page = client.get(ADMIN_PAGE).text
+    script = client.get(ADMIN_SCRIPT).text
 
-    for forbidden in ("innerHTML", "insertAdjacentHTML", "document.write"):
+    for forbidden in (
+        "innerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "response.text",
+        "response.body",
+    ):
         assert forbidden not in page
         assert forbidden not in script
     assert "textContent" in script
@@ -354,16 +698,49 @@ def test_admin_script_avoids_unsafe_dom_injection_and_has_basic_controls(
         'id="save-secret"',
         'id="clear-secret"',
         'id="load-summary"',
-        'id="orders-load"',
-        'id="notifications-load"',
-        'id="grants-load"',
+        'id="summary-output"',
+        'id="devices-device-id"',
+        'id="devices-product-id"',
+        'id="devices-load"',
+        'id="devices-prev"',
+        'id="devices-next"',
+        'id="devices-page"',
+        'id="devices-output"',
+        'id="licenses-device-id"',
+        'id="licenses-status"',
         'id="licenses-load"',
-        'id="orders-next"',
-        'id="notifications-next"',
-        'id="grants-next"',
+        'id="licenses-prev"',
         'id="licenses-next"',
+        'id="licenses-page"',
+        'id="licenses-output"',
+        'id="audit-target-type"',
+        'id="audit-target-id"',
+        'id="audit-action"',
+        'id="audit-result"',
+        'id="audit-request-id"',
+        'id="audit-created-from"',
+        'id="audit-created-to"',
+        'id="audit-load"',
+        'id="audit-prev"',
+        'id="audit-next"',
+        'id="audit-page"',
+        'id="audit-output"',
+        'id="audit-detail-output"',
+        'id="device-detail-hash"',
+        'id="device-detail-load"',
+        'id="device-detail-output"',
+        'id="device-note-device-id"',
+        'id="device-note-text"',
+        'id="device-note-submit"',
+        'id="device-note-status"',
+        'id="license-note-license-id"',
+        'id="license-note-text"',
+        'id="license-note-submit"',
+        'id="license-note-status"',
     ):
         assert expected in page
+    for removed_prefix in ("orders-", "notifications-", "grants-", "order-note-", "payment-"):
+        assert f'id="{removed_prefix}' not in page
     assert "rows.length === 0 && direction > 0" in script
 
 
@@ -373,8 +750,8 @@ def test_admin_router_only_exposes_note_post_and_queries_do_not_modify_database(
 ):
     client, database_path = _admin_client(tmp_path, monkeypatch)
     _seed_admin_rows(database_path)
-    before = _table_counts(database_path)
-    before_paid = _paid_license_expires(database_path)
+    before_bytes = database_path.read_bytes()
+    before_counts = _table_counts(database_path)
 
     write_routes = {
         (route.path, method)
@@ -383,17 +760,28 @@ def test_admin_router_only_exposes_note_post_and_queries_do_not_modify_database(
         for method in getattr(route, "methods", set())
         if method not in {"GET", "HEAD"}
     }
-    client.get("/internal/admin/api/orders", headers=_auth())
-    client.get("/internal/admin/api/notifications", headers=_auth())
-    client.get("/internal/admin/api/grants", headers=_auth())
-    client.get("/internal/admin/api/licenses", headers=_auth())
-    client.get("/internal/admin/api/audit-logs", headers=_auth())
+    for path in (
+        ADMIN_API + "summary",
+        ADMIN_API + "devices",
+        ADMIN_API + "devices/device-a",
+        ADMIN_API + "devices/missing-device-hash",
+        ADMIN_API + "licenses",
+        ADMIN_API + "audit-logs",
+        ADMIN_API + "audit-logs/1",
+        ADMIN_API + "audit-logs/999",
+        ADMIN_API + "orders",
+        ADMIN_API + "notifications",
+        ADMIN_API + "grants",
+    ):
+        response = client.get(path, headers=_auth())
+        assert response.status_code in {200, 404}
 
     assert write_routes == {
-        ("/internal/admin/api/orders/{order_id}/notes", "POST"),
+        ("/internal/admin/api/devices/{device_fingerprint_hash}/notes", "POST"),
+        ("/internal/admin/api/licenses/{license_id}/notes", "POST"),
     }
-    assert _table_counts(database_path) == before
-    assert _paid_license_expires(database_path) == before_paid
+    assert database_path.read_bytes() == before_bytes
+    assert _table_counts(database_path) == before_counts
 
 
 def test_nginx_example_blocks_internal_admin_before_public_proxy():
@@ -401,6 +789,12 @@ def test_nginx_example_blocks_internal_admin_before_public_proxy():
 
     assert "location ^~ /internal/admin" in config
     assert config.index("location ^~ /internal/admin") < config.index("location /")
+
+
+def _client(tmp_path, **app_kwargs):
+    from tests.license_server.test_license_server import _client as _license_server_client
+
+    return _license_server_client(tmp_path, **app_kwargs)
 
 
 def _admin_client(tmp_path, monkeypatch):
@@ -426,15 +820,34 @@ def _auth() -> dict[str, str]:
 
 
 def _seed_admin_rows(database_path):
+    """免费版夹具：3 台设备 + free 授权（1 条 revoked），不触碰支付遗留表。"""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    stamps = {
+        "a_first": datetime_text(now - timedelta(days=90)),
+        "a_seen": datetime_text(now - timedelta(days=60)),
+        "b_first": datetime_text(now - timedelta(days=95)),
+        "b_seen": datetime_text(now - timedelta(days=70)),
+        "fresh_first": datetime_text(now - timedelta(hours=2)),
+        "fresh_seen": datetime_text(now - timedelta(hours=1)),
+    }
     with connect(database_path) as connection:
         connection.execute(
             """
             INSERT INTO devices (
                 product_id, device_fingerprint_hash, first_seen_at, last_seen_at
             ) VALUES
-                ('whut-campus-auto-login', 'device-a', '2026-07-06T00:00:00Z', '2026-07-06T00:10:00Z'),
-                ('whut-campus-auto-login', 'device-b', '2026-07-06T00:00:00Z', '2026-07-06T00:10:00Z')
-            """
+                ('whut-campus-auto-login', 'device-a', ?, ?),
+                ('whut-campus-auto-login', 'device-b', ?, ?),
+                ('whut-campus-auto-login', 'device-fresh', ?, ?)
+            """,
+            (
+                stamps["a_first"],
+                stamps["a_seen"],
+                stamps["b_first"],
+                stamps["b_seen"],
+                stamps["fresh_first"],
+                stamps["fresh_seen"],
+            ),
         )
         connection.execute(
             """
@@ -442,91 +855,32 @@ def _seed_admin_rows(database_path):
                 device_id, license_type, status, starts_at, expires_at, source,
                 order_id, created_at, revoked_at
             ) VALUES
-                (1, 'paid', 'active', '2026-07-06T00:00:00Z', '2027-07-06T00:00:00Z',
-                 'payment', 'order-paid', '2026-07-06T00:00:00Z', NULL),
-                (2, 'trial', 'active', '2026-07-06T00:00:00Z', '2026-07-20T00:00:00Z',
-                 'trial', NULL, '2026-07-06T00:00:00Z', NULL)
-            """
+                (1, 'free', 'active', ?, ?, 'free', NULL, ?, NULL),
+                (2, 'free', 'revoked', ?, ?, 'free', NULL, ?, ?),
+                (3, 'free', 'active', ?, ?, 'free', NULL, ?, NULL)
+            """,
+            (
+                stamps["a_first"],
+                FREE_EXPIRES_AT,
+                stamps["a_first"],
+                stamps["b_first"],
+                FREE_EXPIRES_AT,
+                stamps["b_first"],
+                stamps["b_seen"],
+                stamps["fresh_first"],
+                FREE_EXPIRES_AT,
+                stamps["fresh_first"],
+            ),
         )
-        connection.execute(
-            """
-            INSERT INTO payment_orders (
-                order_id, device_fingerprint_hash, product_code, amount_fen,
-                currency, provider, status, open_slot, provider_order_id,
-                provider_transaction_id, provider_trade_state, created_at,
-                updated_at, expires_at, paid_at, closed_at, security_error_code
-            ) VALUES
-                ('order-waiting', 'device-a', 'annual_v1', 990, 'CNY', 'mock',
-                 'WAITING_PAYMENT', 'open', 'provider-waiting', NULL,
-                 'MOCK_WAITING_PAYMENT', '2026-07-06T00:00:00Z',
-                 '2026-07-06T00:00:00Z', '2026-07-06T00:15:00Z', NULL, NULL, NULL),
-                ('order-paid', 'device-a', 'annual_v1', 990, 'CNY', 'mock',
-                 'PAID', NULL, 'provider-paid', 'txn-paid', 'SUCCESS',
-                 '2026-07-06T00:05:00Z', '2026-07-06T00:06:00Z',
-                 '2026-07-06T00:20:00Z', '2026-07-06T00:06:00Z', NULL, NULL),
-                ('order-abnormal', 'device-b', 'annual_v1', 990, 'CNY', 'mock',
-                 'ABNORMAL', 'open', 'provider-abnormal', NULL, 'FAIL',
-                 '2026-07-06T00:03:00Z', '2026-07-06T00:04:00Z',
-                 '2026-07-06T00:18:00Z', NULL, NULL, 'amount_mismatch')
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO payment_notifications (
-                provider_notification_id, order_id, out_trade_no, provider,
-                provider_transaction_id, event_type, signature_key_id,
-                signature_valid, payload_digest_sha256, reported_trade_type,
-                reported_trade_state, reported_amount_fen, reported_currency,
-                merchant_identity_valid, process_status, security_error_code,
-                failure_code, provider_created_at, received_at, processed_at,
-                attempt_count
-            ) VALUES
-                ('notice-a', 'order-paid', 'order-paid', 'mock', 'txn-paid',
-                 'TRANSACTION.SUCCESS', 'serial-a', 1, 'digest-a', 'NATIVE',
-                 'SUCCESS', 990, 'CNY', 1, 'PROCESSED', NULL, NULL,
-                 '2026-07-06T00:06:00Z', '2026-07-06T00:06:01Z',
-                 '2026-07-06T00:06:02Z', 1),
-                ('notice-b', 'order-abnormal', 'order-abnormal', 'mock', 'txn-b',
-                 'TRANSACTION.SUCCESS', 'serial-b', 0, 'digest-b', 'NATIVE',
-                 'SUCCESS', 1, 'CNY', 1, 'ABNORMAL', 'amount_mismatch',
-                 'amount_mismatch', '2026-07-06T00:07:00Z',
-                 '2026-07-06T00:07:01Z', '2026-07-06T00:07:02Z', 2)
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO license_grants (
-                source_order_id, device_fingerprint_hash, license_id,
-                product_code, grant_days, previous_expire_at, new_expire_at,
-                granted_at, issued_by
-            ) VALUES (
-                'order-paid', 'device-a', 1, 'annual_v1', 365, NULL,
-                '2027-07-06T00:00:00Z', '2026-07-06T00:06:00Z', 'mock'
-            )
-            """
-        )
-        connection.commit()
+    return stamps
 
 
 def _table_counts(database_path):
     with connect(database_path) as connection:
         return {
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in (
-                "devices",
-                "licenses",
-                "payment_orders",
-                "payment_notifications",
-                "license_grants",
-            )
+            for table in ("devices", "licenses", "admin_audit_logs", "schema_meta")
         }
-
-
-def _paid_license_expires(database_path):
-    with connect(database_path) as connection:
-        return connection.execute(
-            "SELECT expires_at FROM licenses WHERE license_type = 'paid' ORDER BY id"
-        ).fetchall()
 
 
 def _assert_security_headers(response):

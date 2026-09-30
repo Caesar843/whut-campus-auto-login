@@ -231,7 +231,10 @@ class TrayController:
 
         next_status = TrayStatus.LOGGED_IN if result.ok else TrayStatus.LOGIN_FAILED
         self.set_status(next_status)
-        if result.ok and license_decision.bootstrap_required:
+        if result.ok and (
+            license_decision.bootstrap_required
+            or getattr(license_decision, "usage_sync_required", False)
+        ):
             try:
                 sync_decision = self._license_bootstrap_sync(
                     bootstrap_decision=license_decision

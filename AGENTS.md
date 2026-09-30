@@ -60,21 +60,15 @@
 
 7\. 测试登录；
 
-8\. 14 天免费试用；
+8\. 永久免费使用，无试用期、无内购、无需激活码；
 
-9\. 试用结束后 9.9 元 / 年；
+9\. 启动时与校园网登录成功后各上报一次设备使用情况（仅设备指纹哈希与时间戳）；
 
-10\. 支付 V1 支持微信 Native 支付；支付宝不在 V1 范围，可作为未来可能扩展；
+10\. 基础设备授权凭证（服务端签发，license\_type=free）；
 
-11\. 支付成功后自动检查订单状态；
+11\. 右下角托盘后台运行；
 
-12\. 支付成功后自动激活正式版；
-
-13\. 基础授权校验；
-
-14\. 右下角托盘后台运行；
-
-15\. 基础状态展示。
+12\. 基础状态展示。
 
 
 
@@ -110,7 +104,9 @@
 
 14\. 不做校园网异常自动修复；
 
-15\. 不做复杂会员体系。
+15\. 不做复杂会员体系；
+
+16\. 不做支付、内购、订阅、激活码、订单与退款系统。
 
 
 
@@ -140,7 +136,7 @@
 
 5\. 在错误信息中显示校园网密码；
 
-6\. 在支付、授权、设备指纹接口中夹带校园网账号密码；
+6\. 在授权、设备指纹、使用情况上报接口中夹带校园网账号密码；
 
 7\. 将校园网账号密码与设备授权状态绑定上传。
 
@@ -178,7 +174,7 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 1\. campus\_login 不能依赖 UI；
 
-2\. campus\_login 不能依赖支付模块；
+2\. campus\_login 不能依赖授权模块（登录路径不做任何授权服务器网络请求）；
 
 3\. campus\_login 不能依赖授权服务器内部实现；
 
@@ -224,23 +220,21 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 
 
-设备指纹 + 服务器时间 + 签名授权凭证
+设备指纹 + 服务端签名授权凭证 + 使用情况上报
 
 
 
-授权系统目标是防止普通用户通过以下方式无限试用：
+授权系统目标只有两件事：
 
 
 
-1\. 删除配置文件；
+1\. 识别设备，签发永久免费的授权凭证；
 
-2\. 卸载重装；
+2\. 统计有多少设备在使用本工具。
 
-3\. 换目录重新解压；
 
-4\. 修改系统时间；
 
-5\. 复制别人的授权文件。
+免费版没有试用期、没有收费、没有功能门槛。
 
 
 
@@ -254,29 +248,19 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 1\. device\_id\_hash；
 
-2\. trial\_start\_at；
+2\. license\_type（免费版固定为 free）；
 
-3\. trial\_end\_at；
+3\. license\_status；
 
-4\. license\_status；
+4\. license\_expire\_at；
 
-5\. license\_expire\_at；
+5\. first\_seen\_at；
 
-6\. order\_id；
+6\. last\_seen\_at；
 
-7\. payment\_channel；
+7\. created\_at；
 
-8\. payment\_status；
-
-9\. payment\_amount；
-
-10\. payment\_time；
-
-11\. transaction\_id；
-
-12\. created\_at；
-
-13\. last\_seen\_at。
+8\. 后台备注与审计记录（操作者名称、动作、目标设备/授权、时间）。
 
 
 
@@ -294,7 +278,13 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 5\. 用户上网内容；
 
-6\. 复杂个人资料。
+6\. 复杂个人资料；
+
+7\. 任何支付、订单、金额、交易号信息。
+
+
+
+历史遗留说明：`licenses.order\_id` 列与历史支付表属于旧结构，保留但不写入、不读取、不展示。
 
 
 
@@ -318,7 +308,7 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 2\. 客户端只内置公钥；
 
-3\. signed\_token 中包含 device\_id\_hash、license\_status、trial\_end\_at、license\_expire\_at；
+3\. signed\_token 中包含 device\_id\_hash、license\_type、license\_status、expires\_at；
 
 4\. 客户端验证签名；
 
@@ -336,11 +326,11 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 1\. 把签名私钥放进客户端；
 
-2\. 在客户端生成正式版授权；
+2\. 在客户端生成或伪造服务端授权；
 
-3\. 只靠本地时间判断试用期；
+3\. 在客户端实现试用期倒计时、付费门槛或激活码校验；
 
-4\. 只靠本地配置文件判断是否正式版。
+4\. 依赖本地时间或本地配置决定是否允许使用（免费版一律放行，凭证只用于设备识别与统计）。
 
 
 
@@ -372,17 +362,17 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 2\. 工具后台启动；
 
-3\. 读取本地 signed\_token；
+3\. 本地直接放行（免费版不读取任何付费或试用状态）；
 
-4\. 如果本地凭证显示仍在试用期或正式授权期内，允许先执行校园网自动登录；
+4\. 立即执行校园网自动登录；
 
-5\. 校园网登录成功后，再访问云端授权服务同步最新授权状态。
+5\. 应用启动时上报一次设备使用情况；校园网登录成功后再上报一次；
+
+6\. 上报失败只记日志，不影响任何功能。
 
 
 
-本地签名凭证负责开机时先放行；
-
-云端授权服务负责联网后校验和更新状态。
+授权服务只负责统计与凭证刷新，不参与"是否允许使用"的判断。
 
 
 
@@ -390,7 +380,7 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 
 
-\## 8. 支付系统约束
+\## 8. 免费版约束（原支付章节已废止）
 
 
 
@@ -398,13 +388,7 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 
 
-支付订单 + 支付回调 + 客户端查询订单状态 + 自动发放授权
-
-
-
-第一版不使用传统激活码。
-
-支付 V1 的业务和技术细则见 `docs/design/PAYMENT_V1_IMPLEMENTATION.md`。V1 当前仅支持微信 Native；支付宝不在 V1 范围。支付数据库、回调、金额校验、幂等和授权发放仍属于 C 档。`PAYMENT_V1_IMPLEMENTATION.md` 不覆盖本文件中的模型分流、Git 和任务边界规则。
+永久免费 + 无内购 + 无激活码 + 无订单系统
 
 
 
@@ -412,47 +396,35 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 
 
-1\. 人工发码作为正常激活流程；
+1\. 重新引入支付、订单、内购、订阅、开通会员、退款等任何商业化能力；
 
-2\. 用户手动输入激活码作为正常激活流程；
+2\. 人工发码或要求用户输入激活码；
 
-3\. 普通个人收款码充当自动激活支付方式；
+3\. 在客户端或服务端保留支付端点、支付回调、支付密钥、支付对账与支付 worker 配置；
 
-4\. 支付成功后不验签直接发放授权；
-
-5\. 支付回调不做幂等处理；
-
-6\. 支付金额不校验；
-
-7\. 支付订单不绑定 device\_id\_hash。
+4\. 以任何形式限制"未付费用户"的功能（免费版不存在"正式版"概念）。
 
 
 
-支付成功后的正常流程：
+免费版正常流程：
 
 
 
-1\. 客户端创建支付订单；
+1\. 客户端启动，生成设备指纹；
 
-2\. 服务端返回支付二维码或支付链接；
+2\. 客户端上报一次设备使用情况（仅设备指纹哈希与时间戳）；
 
-3\. 用户扫码支付；
+3\. 服务端为新设备签发永久免费授权（license\_type=free，expires\_at=9999-12-31T00:00:00Z）；
 
-4\. 支付平台通知服务端；
+4\. 客户端无需任何操作即可使用全部功能；
 
-5\. 服务端验签；
+5\. 校园网登录成功后客户端再上报一次使用情况；
 
-6\. 服务端检查订单号、金额、支付状态；
+6\. 服务端后台可以查看设备数量、活跃设备数与授权状态。
 
-7\. 服务端更新订单状态；
 
-8\. 服务端给当前设备生成正式授权；
 
-9\. 客户端查询订单状态；
-
-10\. 客户端刷新 signed\_token；
-
-11\. 客户端显示正式版已激活。
+历史支付实现（payment 模块、支付回调、对账 worker、支付窗口、支付状态机）已整体删除，不得恢复。
 
 
 
@@ -460,39 +432,23 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 
 
-\## 9. 支付回调规则
+\## 9. 历史支付章节（已废弃）
 
 
 
-支付回调必须做到：
+支付回调、订单状态查询、对账补偿、支付 worker 的相关规则随支付模块一并删除。
 
 
 
-1\. 验证通知签名；
-
-2\. 检查订单号是否存在；
-
-3\. 检查订单金额是否等于 9.9 元；
-
-4\. 检查支付状态是否成功；
-
-5\. 检查订单是否已经处理过；
-
-6\. 如果已经处理过，直接返回成功，不重复生成授权；
-
-7\. 如果未处理过，生成正式版授权；
-
-8\. 将订单状态更新为 paid；
-
-9\. 记录支付平台交易号；
-
-10\. 生成新的 signed\_token；
-
-11\. 给客户端提供授权刷新接口。
+服务端不得再暴露任何支付、回调、订单、授权发放（grant）端点。
 
 
 
-支付平台通知可能重复发送，因此必须幂等。
+历史数据库里的支付遗留表保持原样：不清空、不迁移、不校验、不读写，仅由 `license\_server/db.py` 的 `LEGACY\_PAYMENT\_TABLES` 登记，升级代码也不得依据它们做任何判断。
+
+
+
+数据库 schema 版本固定为 6，核心表只有 devices、licenses、admin\_audit\_logs、schema\_meta。
 
 
 
@@ -510,7 +466,7 @@ campus\_login 是核心模块，负责武汉理工校园网认证登录。
 
 desktop\_app/
 
-&#x20;   桌面界面、托盘、自启、配置管理、支付二维码展示、授权状态刷新
+&#x20;   桌面界面、托盘、自启、配置管理、授权与使用状态展示
 
 
 
@@ -522,19 +478,13 @@ campus\_login/
 
 license\_client/
 
-&#x20;   设备指纹、试用状态、本地授权凭证、支付状态查询
+&#x20;   设备指纹、免费版放行判定、本地授权凭证、使用情况上报
 
 
 
 license\_server/
 
-&#x20;   设备试用记录、授权状态、签名授权凭证、支付订单创建、支付回调处理
-
-
-
-payment/
-
-&#x20;   支付 V1 接入微信 Native 支付、订单状态、回调验签、自动授权发放；支付宝作为未来可能扩展
+&#x20;   设备注册记录、免费授权签发、内部只读后台统计、运行时证明
 
 
 
@@ -546,7 +496,7 @@ shared/
 
 docs/
 
-&#x20;   项目设计、接口、部署、测试、合规说明
+&#x20;   项目设计、接口、部署、测试、说明
 
 
 
@@ -558,7 +508,7 @@ tests/
 
 scripts/
 
-&#x20;   开发、构建、数据库、支付辅助脚本
+&#x20;   开发、构建、数据库辅助脚本
 
 
 
@@ -588,7 +538,7 @@ deploy/
 
 服务端：
 
-&#x20;   FastAPI + MySQL + Nginx + HTTPS
+&#x20;   FastAPI + MySQL/SQLite + Nginx + HTTPS
 
 
 
@@ -604,12 +554,6 @@ deploy/
 
 
 
-支付：
-
-&#x20;   支付 V1 采用微信支付 Native 支付；支付宝当面付 / 预创建支付不在 V1 范围
-
-
-
 说明：
 
 
@@ -618,11 +562,9 @@ deploy/
 
 2\. 不要一开始引入过重架构；
 
-3\. 不要同时实现过多支付渠道；
+3\. 不引入任何支付/内购第三方 SDK；
 
-4\. 可以先完整跑通一种支付方式，再补充另一种；
-
-5\. 不要为了炫技引入复杂微服务。
+4\. 不要为了炫技引入复杂微服务。
 
 
 
@@ -642,19 +584,15 @@ deploy/
 
 
 
-1\. 首次试用时请求一次；
+1\. 软件启动时上报一次；
 
-2\. 软件启动时请求一次；
+2\. 校园网登录成功后最多再上报一次；
 
-3\. 登录成功后最多同步一次授权状态；
+3\. 授权服务器不可用时不要重试、不要弹窗；
 
-4\. 支付窗口轮询最多持续 2 分钟；
+4\. 网络异常时本地直接放行（免费版不依赖服务器可用性）；
 
-5\. 支付状态轮询间隔不低于 3 秒；
-
-6\. 授权服务器不可用时，不要高频重试；
-
-7\. 网络异常时使用本地 signed\_token 判断是否允许继续使用。
+5\. 上报请求超时不超过 5 秒。
 
 
 
@@ -666,9 +604,7 @@ deploy/
 
 2\. 后台无限重试；
 
-3\. 支付窗口关闭后继续轮询支付状态；
-
-4\. 网络异常时疯狂弹窗。
+3\. 因授权服务器不可用而阻止用户登录校园网。
 
 
 
@@ -690,7 +626,7 @@ deploy/
 
 3\. 授权状态；
 
-4\. 支付订单状态；
+4\. 使用情况上报结果；
 
 5\. 错误类型；
 
@@ -708,9 +644,9 @@ deploy/
 
 2\. 完整校园网账号；
 
-3\. 支付密钥；
+3\. 服务器签名私钥；
 
-4\. 签名私钥；
+4\. 后台管理令牌；
 
 5\. 原始敏感 token；
 
@@ -738,29 +674,23 @@ deploy/
 
 
 
-1\. 查看设备试用记录；
+1\. 查看设备列表与首见、末见时间；
 
-2\. 查看订单记录；
+2\. 查看活跃设备数（24 小时 / 7 天 / 30 天）；
 
-3\. 查看支付状态；
+3\. 查看设备授权状态与到期时间；
 
-4\. 查看某设备是否已授权；
+4\. 查看授权列表；
 
-5\. 查看正式版到期时间；
+5\. 查看审计日志；
 
-6\. 查询异常订单；
+6\. 给设备或授权添加运维备注；
 
-7\. 手动修复异常授权；
-
-8\. 冻结异常授权；
-
-9\. 查看支付回调日志；
-
-10\. 查看授权刷新记录。
+7\. 冻结异常设备授权。
 
 
 
-后台必须有访问控制。
+后台必须有访问控制（令牌摘要比对 + 仅内部地址访问）。
 
 
 
@@ -774,7 +704,9 @@ deploy/
 
 3\. 后台做复杂用户画像；
 
-4\. 后台做广告投放。
+4\. 后台做广告投放；
+
+5\. 后台查看或恢复任何支付、订单信息。
 
 
 
@@ -798,15 +730,13 @@ deploy/
 
 
 
-付费说明必须明确：
+免费说明必须明确：
 
 
 
-免费试用 14 天。
+本工具完全免费，无试用期、无内购、无需激活码。
 
-试用结束后，9.9 元 / 年。
-
-支付成功后会自动激活正式版，无需输入激活码。
+只会向服务器上报本机设备指纹与最近使用时间，不会上报校园网账号和密码。
 
 
 
@@ -842,17 +772,11 @@ deploy/
 
 第四阶段：
 
-&#x20;   license\_client + license\_server，支持 14 天试用和 signed\_token
+&#x20;   license\_client + license\_server，免费版放行 + 设备使用情况上报 + 后台统计
 
 
 
 第五阶段：
-
-&#x20;   payment 模块，支持创建支付订单、支付回调、订单状态查询、自动激活
-
-
-
-第六阶段：
 
 &#x20;   打包、安装、真实用户测试
 
@@ -860,9 +784,9 @@ deploy/
 
 不要跳过第一阶段直接写完整 UI；
 
-不要跳过真实校园网验证直接写支付；
+不要在登录核心不稳定时引入新功能；
 
-不要在登录核心不稳定时做复杂商业化。
+不要重新引入支付或任何商业化模块。
 
 
 
@@ -888,43 +812,31 @@ deploy/
 
 5\. 用户可以点击“测试登录”验证账号密码；
 
-6\. 用户首次使用可以获得 14 天试用；
+6\. 软件永久免费，界面上没有任何支付、购买、续费、激活码入口；
 
-7\. 试用状态绑定设备；
+7\. 免费状态绑定设备指纹；
 
-8\. 修改系统时间不能延长试用期；
+8\. 修改系统时间不影响任何功能；
 
-9\. 删除配置、重装软件不能重新获得试用期；
+9\. 删除配置、重装软件后仍然免费可用；
 
-10\. 试用结束后自动登录功能停止；
+10\. 客户端启动时与校园网登录成功后各上报一次设备使用情况；
 
-11\. 用户可以点击“激活正式版”创建支付订单；
+11\. 上报内容只含设备指纹哈希与时间戳，不含校园网账号密码；
 
-12\. 用户可以使用微信 Native 支付；支付宝作为未来可能扩展，不属于 V1 验收范围；
+12\. 服务端可以为新设备签发 license\_type=free 的永久授权；
 
-13\. 支付成功后服务端可以自动生成正式版授权；
+13\. 授权服务器不可用时，客户端仍可正常登录校园网；
 
-14\. 客户端可以检查订单状态并自动激活；
+14\. 授权凭证必须绑定设备指纹；
 
-15\. 用户不需要手动输入激活码；
+15\. 授权凭证必须由服务端签名；
 
-16\. 开发者不需要人工发码；
+16\. 校园网账号密码不上传服务器；
 
-17\. 支付回调必须验签；
+17\. 授权服务器不能部署在开发者个人电脑上；
 
-18\. 支付回调必须幂等处理；
-
-19\. 授权凭证必须绑定设备指纹；
-
-20\. 授权凭证必须由服务端签名；
-
-21\. 校园网账号密码不上传服务器；
-
-22\. 授权服务器不能部署在开发者个人电脑上；
-
-23\. 授权服务器不可用时，未过期本地凭证仍可用于开机自动登录；
-
-24\. 支付异常时有后台兜底处理能力。
+18\. 后台可以查看设备数量、活跃设备数与授权状态，且只读查询不解锁任何支付数据。
 
 
 
@@ -952,7 +864,7 @@ deploy/
 
 6\. 当前还缺什么真实信息；
 
-7\. 是否涉及账号密码、支付密钥、签名密钥等敏感信息。
+7\. 是否涉及账号密码、签名密钥、后台管理令牌等敏感信息。
 
 
 
@@ -960,7 +872,7 @@ deploy/
 
 
 
-如果缺少支付商户信息，不要伪造可用支付接口。
+不要新增或恢复任何支付、内购、激活码相关实现；发现遗留支付代码或配置时，必须删除并记录在汇报中。
 
 
 
@@ -976,7 +888,7 @@ deploy/
 
 
 
-当前项目还处于早期阶段。
+当前项目已完成"移除支付模块、转为永久免费"的改造。
 
 
 
@@ -984,19 +896,87 @@ deploy/
 
 
 
-1\. 建立项目骨架；
+1\. 保持免费版放行逻辑与设备使用上报稳定；
 
-2\. 固化项目边界；
+2\. 维护后台设备与授权统计能力；
 
-3\. 跑通校园网最小登录脚本；
+3\. 巩固校园网登录核心与桌面端体验；
 
-4\. 再做桌面端；
+4\. 打包、安装与真实用户测试；
 
-5\. 再做授权；
-
-6\. 最后接支付。
+5\. 不引入支付、内购、激活码等商业化模块。
 
 
 
-不要在校园网登录核心未验证前投入大量时间做支付和 UI。
+不要在校园网登录核心未验证前投入大量时间做 UI。
 
+
+
+<claude-mem-context>
+# Memory Context
+
+# [whut-campus-auto-login] recent context, 2026-09-28 8:33pm GMT+8
+
+Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
+Format: ID TIME TYPE TITLE
+Fetch details: get_observations([IDs]) | Search: mem-search skill
+
+Stats: 50 obs (9,016t read) | 0t work
+
+### Jul 28, 2026
+S10 Final Phase 1 Runtime Attestation Test Suite Execution (Jul 28, 1:13 PM)
+S9 WSL Testing Phase Closure with CodeRabbit Integration (Jul 28, 1:13 PM)
+244 2:28p 🔵 Code Analysis Confirms Git Safe.directory Configuration
+246 2:29p 🔴 Git Safe.directory Configuration Insufficient
+247 2:30p 🔴 Git Clone Global Configuration Required
+249 2:31p 🔴 Git Safe.directory Environment Variables Test
+250 2:32p 🔴 Git Global Configuration Works for First Clone
+252 " 🟣 P6-A1c-1B Test Git Clone Fix Implementation
+253 2:34p 🟣 P6-A1c-1B Test Suite Git Configuration Fix Applied
+256 2:36p 🟣 P6-A1c-1B Fix Synchronization to Ext4 Repository
+257 " 🟣 P6-A1c-1B Phase 2 Regression Test Execution
+258 2:37p 🟣 P6-A1c-1B Phase 2 Test Monitoring
+259 " 🔴 P6-A1c-1B Phase 2 Tests Still Failing
+261 2:39p 🔵 ACL Check and Unix Socket Permission Analysis
+264 2:42p 🔵 Deployment Gate Logic and Test Implementation Analysis
+266 2:44p 🔵 Deployment Gate Logic and Test Implementation Analysis
+268 2:45p 🔵 POSIX ACL Attribute Discovery
+269 " 🔵 ACL Attribute Access Error Analysis
+271 2:47p 🔵 POSIX ACL Error Patterns Identified
+272 2:48p 🟣 P6-A1c-1B Socket Connection Error Handling Fix
+274 2:49p 🟣 P6-A1c-1B Connection Reset Error Handling Applied
+277 2:52p 🟣 P6-A1c-1B Test File Synchronization to Ext4 Repository
+279 2:54p 🔵 Unix Peer Credentials Test Success
+281 2:56p 🔵 P6-A1c-1B Deployment Environment Status
+282 2:57p 🔴 P6-A1c-1B Phase 2 Test Execution Command Syntax Error
+284 " 🔴 P6-A1c-1B Phase 2 Test Suite Results
+285 2:58p 🟣 P6-A1c-1B Python Module Import Fix
+287 2:59p 🟣 Python Module Import Fix Applied
+289 3:01p 🟣 ACL Permission Test Success
+290 3:02p 🔴 P6-A1c-1B Final Phase 2 Test Results
+292 3:04p 🔵 P6-A1c-1B Test Environment Audit Results
+295 3:07p 🟣 P6-A1c-1B Test Environment Cleanup Completed
+297 3:08p 🟣 P6-A1c-1B Task Completion Summary
+299 3:11p 🔵 Linux Runtime Attestation Test Suite
+S11 Phase 1 Test Suite Completion and CodeRabbit Review Trigger (Jul 28, 3:12 PM)
+S12 CodeRabbit Review of Runtime Attestation Test Suite (Jul 28, 3:14 PM)
+303 3:17p ✅ P6-A1c-1B WSL Test Completion Task
+304 " 🔴 CodeRabbit Review Timeout Handling
+S13 Retrying CodeRabbit Review for Tests Directory (Jul 28, 3:18 PM)
+307 3:22p 🔵 WSL Testing Task Identified
+308 " 🔴 Git Safe Directory Configuration Fixed
+309 🔴 Git Safe Directory Configuration Applied
+311 3:23p 🔴 Git Safe Directory Configuration Applied
+313 3:26p 🔵 Environment Cleanup and Validation Completed
+315 3:28p ✅ Client Requirements Installation Initiated
+316 3:29p 🔵 Background Installation Process Not Found
+318 3:31p 🔵 Client Requirements Installation Timed Out
+320 3:33p 🔵 Background Pip Installation Still Running
+322 3:35p 🔵 Pip Installation Status Monitored
+324 3:37p 🔵 Pip Installation Progress Tracked
+326 3:39p ✅ Background Pip Installation Terminated
+328 3:40p 🚨 Temporary Cleanup Attempt Blocked
+330 3:42p ✅ Targeted Cleanup Completed
+332 3:44p 🟣 Phase 1 Regression Tests Completed
+335 3:47p 🔵 Git Repository Status Confirmed
+</claude-mem-context>

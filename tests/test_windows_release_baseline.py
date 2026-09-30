@@ -174,5 +174,7 @@ def test_windows_release_sop_keeps_server_dependencies_out_of_build_venv():
     )
 
     assert "tests\\campus_login tests\\client tests\\license_client" in release_sop
-    assert "--ignore=tests\\client\\test_payment_flow.py" in release_sop
+    # 免费版：发布 SOP 不再引用任何支付时代已删除的测试文件
+    assert "test_payment_flow" not in release_sop
+    assert "test_payment" not in release_sop
     assert "完整仓库测试需要另行安装 requirements-server.txt" in release_sop

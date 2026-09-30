@@ -130,7 +130,7 @@ Never retain:
 - the private-key file, its path, or a dump of it;
 - the private key or any private-key digest;
 - the random challenge or signature;
-- payment or administrator secrets;
+- administrator secrets;
 - database contents;
 - unrelated environment values.
 
@@ -142,7 +142,7 @@ configured key pair. It does not prove:
 - that the currently running service process reloaded the environment file;
 - that DNS, TLS, Nginx, or public HTTPS works;
 - that the final Windows EXE embeds the correct public key;
-- that the complete trial, refresh, payment, or authorization flow works.
+- that the complete device register, refresh, or authorization flow works.
 
 The explicit `running_service_keypair=not_verified` field records this boundary.
 Python may retain sensitive material in process memory and cannot guarantee

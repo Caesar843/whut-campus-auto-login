@@ -37,7 +37,7 @@ def test_empty_database_initializes_admin_audit_latest_schema_and_indexes(tmp_pa
             for row in connection.execute("PRAGMA index_list(admin_audit_logs)").fetchall()
         }
 
-    assert version == "5"
+    assert version == "6"
     assert columns == {
         "id",
         "actor",
@@ -72,52 +72,55 @@ def test_admin_audit_result_check_constraint_rejects_invalid_value(tmp_path):
                 INSERT INTO admin_audit_logs (
                     actor, source_ip, request_id, action, target_type, target_id,
                     result, reason, created_at
-                ) VALUES ('operator', '127.0.0.1', 'request-1', 'ORDER_NOTE_ADDED',
-                          'ORDER', 'order-1', 'INVALID', 'test', '2026-07-10T12:00:00Z')
+                ) VALUES ('operator', '127.0.0.1', 'request-1', 'DEVICE_NOTE_ADDED',
+                          'DEVICE', 'device-1', 'INVALID', 'test', '2026-07-10T12:00:00Z')
                 """
             )
 
 
-def test_v1_database_upgrades_to_latest_without_losing_existing_rows(tmp_path):
+def test_initialize_database_is_idempotent_and_keeps_existing_rows(tmp_path):
     database_path = tmp_path / "license.sqlite3"
-    _create_v1_database_with_rows(database_path)
-    with sqlite3.connect(database_path) as connection:
-        objects = {
-            (row[0], row[1])
-            for row in connection.execute(
-                "SELECT type, name FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%'"
+    initialize_database(database_path)
+    with write_transaction(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO devices (
+                product_id, device_fingerprint_hash, first_seen_at, last_seen_at
+            ) VALUES (
+                'whut-campus-auto-login', 'device-a',
+                '2026-07-10T12:00:00Z', '2026-07-10T12:00:00Z'
             )
-        }
-    assert objects == {
-        ("table", "devices"),
-        ("table", "licenses"),
-        ("table", "payment_orders"),
-        ("table", "payment_notifications"),
-        ("table", "license_grants"),
-        ("table", "schema_meta"),
-        ("index", "idx_payment_orders_device_open_slot"),
-        ("index", "idx_payment_orders_status"),
-        ("index", "idx_payment_notifications_order"),
-        ("index", "idx_payment_notifications_process"),
-        ("index", "idx_license_grants_device"),
-    }
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO licenses (
+                device_id, license_type, status, starts_at, expires_at, source,
+                created_at
+            ) VALUES (
+                1, 'free', 'active', '2026-07-10T12:00:00Z',
+                '2027-07-10T12:00:00Z', 'free', '2026-07-10T12:00:00Z'
+            )
+            """
+        )
+    record_admin_audit(database_path, _entry(target_id="device-a"))
 
     initialize_database(database_path)
 
     with connect(database_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        assert tables == {"devices", "licenses", "admin_audit_logs", "schema_meta"}
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "5"
+        ).fetchone()[0] == "6"
         assert connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM licenses").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM payment_orders").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM payment_notifications").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM license_grants").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM admin_audit_logs").fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) FROM payment_reconciliations"
-        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM admin_audit_logs").fetchone()[0] == 1
 
 
 def test_admin_audit_schema_setup_rolls_back_with_the_rest_of_initialization(tmp_path, monkeypatch):
@@ -173,7 +176,7 @@ def test_snapshots_are_stable_compact_json_and_none_stays_null(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     initialize_database(database_path)
     entry = _entry(
-        before_state={"status": "ABNORMAL", "amount_fen": 990, "paid_at": NOW},
+        before_state={"license_status": "active", "license_expire_at": NOW},
         after_state=None,
     )
 
@@ -185,7 +188,7 @@ def test_snapshots_are_stable_compact_json_and_none_stays_null(tmp_path):
         ).fetchone()
 
     assert serialize_audit_snapshot(entry.before_state) == (
-        '{"amount_fen":990,"paid_at":"2026-07-10T12:00:00Z","status":"ABNORMAL"}'
+        '{"license_expire_at":"2026-07-10T12:00:00Z","license_status":"active"}'
     )
     assert tuple(row) == (serialize_audit_snapshot(entry.before_state), None)
 
@@ -206,21 +209,16 @@ def test_snapshot_rejects_unknown_sensitive_and_unsupported_values(snapshot, mes
 
 def test_snapshot_json_contains_no_forbidden_keys():
     snapshot_json = serialize_audit_snapshot(
-        {"order_id": "order-1", "status": "ABNORMAL", "amount_fen": 990}
+        {"device_id_hash": "device-1", "status": "active"}
     )
 
     for forbidden in (
-        "provider_code_url",
-        "raw_payload",
-        "openid",
-        "bank_type",
         "signed_token",
         "token",
         "password",
         "campus_account",
         "campus_password",
         "private_key",
-        "api_v3_key",
         "authorization",
     ):
         assert forbidden not in snapshot_json
@@ -277,13 +275,14 @@ def test_snapshot_json_under_limit_with_multiple_fields_persists(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     initialize_database(database_path)
     snapshot = {
-        "order_id": "x" * 1000,
-        "out_trade_no": "x" * 1000,
         "device_id_hash": "x" * 1000,
-        "plan_code": "x" * 1000,
-        "channel": "x" * 1000,
         "status": "x" * 1000,
-        "currency": "x" * 1000,
+        "license_id": "x" * 1000,
+        "license_status": "x" * 1000,
+        "license_expire_at": "x" * 1000,
+        "failure_code": "x" * 1000,
+        "created_at": "x" * 1000,
+        "updated_at": "x" * 1000,
     }
     snapshot_json = serialize_audit_snapshot(snapshot)
 
@@ -304,15 +303,14 @@ def test_snapshot_json_over_limit_is_rejected_before_insert(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     initialize_database(database_path)
     snapshot = {
-        "order_id": "x" * 1000,
-        "out_trade_no": "x" * 1000,
-        "device_id_hash": "x" * 1000,
-        "plan_code": "x" * 1000,
-        "channel": "x" * 1000,
-        "status": "x" * 1000,
-        "currency": "x" * 1000,
-        "provider_transaction_id": "x" * 1000,
-        "provider_trade_state": "x" * 1000,
+        "device_id_hash": "x" * 1024,
+        "status": "x" * 1024,
+        "license_id": "x" * 1024,
+        "license_status": "x" * 1024,
+        "license_expire_at": "x" * 1024,
+        "failure_code": "x" * 1024,
+        "created_at": "x" * 1024,
+        "updated_at": "x" * 1024,
     }
 
     with pytest.raises(ValueError, match="snapshot_json_too_large") as excinfo:
@@ -339,23 +337,23 @@ def test_over_limit_snapshot_rolls_back_callers_transaction(tmp_path):
 
 
 def test_entry_snapshot_is_isolated_from_original_dict_mutation():
-    before_state = {"status": "ABNORMAL"}
-    after_state = {"status": "REVIEWED"}
+    before_state = {"license_status": "active"}
+    after_state = {"license_status": "revoked"}
 
     entry = _entry(before_state=before_state, after_state=after_state)
-    before_state["status"] = "MUTATED"
-    after_state["status"] = "MUTATED"
+    before_state["license_status"] = "MUTATED"
+    after_state["license_status"] = "MUTATED"
 
-    assert entry.before_state["status"] == "ABNORMAL"
-    assert entry.after_state["status"] == "REVIEWED"
+    assert entry.before_state["license_status"] == "active"
+    assert entry.after_state["license_status"] == "revoked"
 
 
 def test_same_request_id_appends_distinct_audit_rows(tmp_path):
     database_path = tmp_path / "license.sqlite3"
     initialize_database(database_path)
 
-    first = record_admin_audit(database_path, _entry(request_id="request-1", target_id="order-1"))
-    second = record_admin_audit(database_path, _entry(request_id="request-1", target_id="order-2"))
+    first = record_admin_audit(database_path, _entry(request_id="request-1", target_id="device-1"))
+    second = record_admin_audit(database_path, _entry(request_id="request-1", target_id="device-2"))
 
     with connect(database_path) as connection:
         rows = connection.execute(
@@ -364,8 +362,8 @@ def test_same_request_id_appends_distinct_audit_rows(tmp_path):
 
     assert first != second
     assert [(row["request_id"], row["target_id"]) for row in rows] == [
-        ("request-1", "order-1"),
-        ("request-1", "order-2"),
+        ("request-1", "device-1"),
+        ("request-1", "device-2"),
     ]
 
 
@@ -375,8 +373,8 @@ def test_same_request_id_appends_distinct_audit_rows(tmp_path):
         ("actor", "   ", "actor_invalid"),
         ("source_ip", "", "source_ip_invalid"),
         ("request_id", "request\n1", "request_id_invalid"),
-        ("action", "order note", "action_invalid"),
-        ("target_type", "ORDER!", "target_type_invalid"),
+        ("action", "device note", "action_invalid"),
+        ("target_type", "DEVICE!", "target_type_invalid"),
         ("target_id", "target\x00", "target_id_invalid"),
         ("reason", "   ", "reason_invalid"),
         ("reason", "x" * 501, "reason_invalid"),
@@ -466,84 +464,15 @@ def _entry(**overrides):
         "actor": "operator-1",
         "source_ip": "127.0.0.1",
         "request_id": "request-1",
-        "action": "ORDER_NOTE_ADDED",
-        "target_type": "ORDER",
-        "target_id": "order-1",
+        "action": "DEVICE_NOTE_ADDED",
+        "target_type": "DEVICE",
+        "target_id": "device-1",
         "result": AuditResult.SUCCESS,
-        "before_state": {"status": "ABNORMAL", "amount_fen": 990},
-        "after_state": {"status": "ABNORMAL"},
+        "before_state": {"license_status": "active"},
+        "after_state": {"license_status": "active"},
         "reason": "operator review",
         "failure_code": None,
         "created_at": NOW,
     }
     data.update(overrides)
     return AdminAuditEntry(**data)
-
-
-def _create_v1_database_with_rows(database_path):
-    with sqlite3.connect(database_path) as connection:
-        connection.executescript(
-            "\n".join(
-                (
-                    db.CORE_SCHEMA,
-                    db.PAYMENT_ORDER_V2_TABLE_SQL + ";",
-                    "CREATE UNIQUE INDEX idx_payment_orders_device_open_slot "
-                    "ON payment_orders(device_fingerprint_hash, open_slot);",
-                    "CREATE INDEX idx_payment_orders_status "
-                    "ON payment_orders(status, expires_at);",
-                    db.PAYMENT_NOTIFICATION_V3_SCHEMA,
-                    db.LICENSE_GRANT_SCHEMA,
-                    db.SCHEMA_META_SQL,
-                )
-            )
-        )
-        connection.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')"
-        )
-        connection.execute(
-            """
-            INSERT INTO devices (
-                product_id, device_fingerprint_hash, first_seen_at, last_seen_at
-            ) VALUES ('whut-campus-auto-login', 'device-a', ?, ?)
-            """,
-            ("2026-07-10T12:00:00Z", "2026-07-10T12:00:00Z"),
-        )
-        connection.execute(
-            """
-            INSERT INTO licenses (
-                device_id, license_type, status, starts_at, expires_at, source,
-                order_id, created_at, revoked_at
-            ) VALUES (1, 'paid', 'active', ?, ?, 'payment', 'order-a', ?, NULL)
-            """,
-            ("2026-07-10T12:00:00Z", "2027-07-10T12:00:00Z", "2026-07-10T12:00:00Z"),
-        )
-        connection.execute(
-            """
-            INSERT INTO payment_orders (
-                order_id, device_fingerprint_hash, product_code, amount_fen,
-                currency, provider, status, open_slot, created_at, updated_at,
-                expires_at
-            ) VALUES ('order-a', 'device-a', 'annual_v1', 990, 'CNY', 'mock',
-                      'PAID', NULL, ?, ?, ?)
-            """,
-            ("2026-07-10T12:00:00Z", "2026-07-10T12:00:00Z", "2026-07-10T12:15:00Z"),
-        )
-        connection.execute(
-            """
-            INSERT INTO payment_notifications (
-                provider_notification_id, provider, process_status, received_at,
-                processed_at
-            ) VALUES ('notification-a', 'mock', 'PROCESSED', ?, ?)
-            """,
-            ("2026-07-10T12:00:00Z", "2026-07-10T12:00:01Z"),
-        )
-        connection.execute(
-            """
-            INSERT INTO license_grants (
-                source_order_id, device_fingerprint_hash, license_id,
-                product_code, grant_days, granted_at, issued_by
-            ) VALUES ('order-a', 'device-a', 1, 'annual_v1', 365, ?, 'mock')
-            """,
-            ("2026-07-10T12:00:00Z",),
-        )
-        connection.commit()

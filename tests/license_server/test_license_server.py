@@ -112,20 +112,6 @@ def test_default_app_refuses_invalid_production_config(monkeypatch):
     assert "DATABASE_URL or LICENSE_DB_PATH is required in production" in str(exc_info.value)
 
 
-def test_default_app_refuses_invalid_explicit_wechat_config_in_development(
-    tmp_path,
-    monkeypatch,
-):
-    monkeypatch.setenv("LICENSE_SERVER_ENV", "development")
-    monkeypatch.setenv("DATABASE_URL", _sqlite_url(tmp_path / "license.sqlite3"))
-    monkeypatch.setenv("LICENSE_PRIVATE_KEY", _private_key_b64())
-    monkeypatch.setenv("PAYMENT_PROVIDER", "wechat_native")
-    monkeypatch.delenv("WECHAT_PAY_APP_ID", raising=False)
-
-    with pytest.raises(RuntimeError, match="WECHAT_PAY_APP_ID"):
-        _default_app()
-
-
 def test_load_config_accepts_development_mode(monkeypatch):
     monkeypatch.setenv("LICENSE_SERVER_ENV", "development")
     monkeypatch.setenv("DATABASE_URL", "sqlite:///./license_server_dev.sqlite3")
@@ -150,66 +136,39 @@ def test_load_config_accepts_test_mode_with_temporary_config(tmp_path):
     assert config.database_path == tmp_path / "license.sqlite3"
 
 
-def test_payment_provider_unconfigured_keeps_authorization_service_usable(tmp_path):
+def test_free_version_config_has_no_payment_settings(tmp_path):
+    """免费版：服务端配置里不再有任何支付相关项。"""
     config = load_config(_production_env(tmp_path))
 
-    assert config.payment_provider is None
-    assert config.payment_price_fen == 990
-    assert config.payment_currency == "CNY"
+    for forbidden in (
+        "payment_provider",
+        "payment_mock_admin_token",
+        "wechat_pay",
+        "payment_price_fen",
+        "payment_amount",
+        "payment_currency",
+        "payment_channels",
+        "payment_order_ttl_minutes",
+        "payment_notification_worker_enabled",
+        "payment_reconciliation_worker_enabled",
+    ):
+        assert not hasattr(config, forbidden), forbidden
 
 
-def test_development_and_test_allow_mock_payment_provider(tmp_path):
-    for environment in ("development", "test"):
-        config = load_config(
-            {
-                "LICENSE_SERVER_ENV": environment,
-                "DATABASE_URL": _sqlite_url(tmp_path / f"{environment}.sqlite3"),
-                "LICENSE_PRIVATE_KEY": _private_key_b64(),
-                "PAYMENT_PROVIDER": "mock",
-                "PAYMENT_MOCK_ADMIN_TOKEN": "mockR4ndomValue123456",
-                "PAYMENT_PRICE_FEN": "990",
-                "PAYMENT_CURRENCY": "cny",
-            }
-        )
+def test_load_config_ignores_legacy_payment_env(tmp_path):
+    """历史 env 里残留的支付变量不再影响免费版启动。"""
+    env = _production_env(
+        tmp_path,
+        PAYMENT_PROVIDER="wechat_native",
+        PAYMENT_PRICE_FEN="991",
+        PAYMENT_CURRENCY="USD",
+        WECHAT_PAY_APP_ID="legacy-app-id",
+    )
 
-        assert config.payment_provider == "mock"
-        assert config.payment_mock_admin_token == "mockR4ndomValue123456"
-        assert config.payment_price_fen == 990
-        assert config.payment_currency == "CNY"
+    config = load_config(env)
 
-
-def test_production_rejects_mock_payment_provider(tmp_path):
-    env = _production_env(tmp_path, PAYMENT_PROVIDER="mock")
-
-    with pytest.raises(RuntimeError, match="PAYMENT_PROVIDER=mock"):
-        load_config(env)
-
-
-def test_mock_payment_provider_requires_mock_admin_token(tmp_path):
-    env = {
-        "LICENSE_SERVER_ENV": "test",
-        "DATABASE_URL": _sqlite_url(tmp_path / "license.sqlite3"),
-        "LICENSE_PRIVATE_KEY": _private_key_b64(),
-        "PAYMENT_PROVIDER": "mock",
-    }
-
-    with pytest.raises(RuntimeError, match="PAYMENT_MOCK_ADMIN_TOKEN"):
-        load_config(env)
-
-
-@pytest.mark.parametrize(
-    ("key", "value", "message"),
-    [
-        ("PAYMENT_PRICE_FEN", "991", "PAYMENT_PRICE_FEN"),
-        ("PAYMENT_PRICE_FEN", "9.9", "PAYMENT_PRICE_FEN"),
-        ("PAYMENT_CURRENCY", "USD", "PAYMENT_CURRENCY"),
-    ],
-)
-def test_payment_config_must_match_product_catalog(tmp_path, key, value, message):
-    env = _production_env(tmp_path, **{key: value})
-
-    with pytest.raises(RuntimeError, match=message):
-        load_config(env)
+    assert config.environment == "production"
+    assert config.database_path == tmp_path / "license.sqlite3"
 
 
 def test_load_config_rejects_invalid_environment():
@@ -375,7 +334,7 @@ def test_database_connection_enforces_license_device_foreign_key(tmp_path):
                 INSERT INTO licenses (
                     device_id, license_type, status, starts_at, expires_at,
                     source, order_id, created_at, revoked_at
-                ) VALUES (999, 'trial', 'active', ?, ?, 'trial', NULL, ?, NULL)
+                ) VALUES (999, 'free', 'active', ?, ?, 'free', NULL, ?, NULL)
                 """,
                 (
                     "2026-06-04T00:00:00Z",
@@ -542,7 +501,7 @@ def test_invalid_v1_orphan_license_fails_closed_without_changes(tmp_path):
             "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
         ).fetchall() == before_schema
         assert connection.execute("SELECT * FROM licenses").fetchall() == before_licenses
-    assert str(exc_info.value) == "database schema does not match declared schema version 5"
+    assert str(exc_info.value) == "database schema does not match the free-version core schema"
 
 
 def test_register_device_ignores_device_description_fields(tmp_path):
@@ -610,21 +569,22 @@ def test_refresh_license_ignores_device_description_fields(tmp_path):
     assert response.status_code == 200
 
 
-def test_register_new_device_issues_14_day_trial(tmp_path):
+def test_register_new_device_issues_free_license(tmp_path):
     client, _public_key_b64_value = _client(tmp_path)
 
     response = client.post("/device/register", json=_register_payload())
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["license_type"] == "trial"
+    assert payload["license_type"] == "free"
     assert payload["license_status"] == "active"
+    assert payload["status"] == "free_active"
     assert payload["signed_license_token"]
     assert "device_name" not in payload
     assert "os" not in payload
     assert "app_version" not in payload
-    expires_at = datetime.fromisoformat(payload["expires_at"].replace("Z", "+00:00"))
-    assert 13 <= (expires_at - datetime.now(timezone.utc)).days <= 14
+    # 免费版：永久免费，不再是 14 天试用
+    assert payload["expires_at"] == "9999-12-31T00:00:00Z"
 
 
 def test_register_device_stores_only_minimal_device_fields(tmp_path):
@@ -651,14 +611,14 @@ def test_register_device_stores_only_minimal_device_fields(tmp_path):
     assert row[2] == "device-a"
 
 
-def test_register_existing_device_does_not_duplicate_trial(tmp_path):
+def test_register_existing_device_does_not_duplicate_license(tmp_path):
     client, _public_key_b64_value = _client(tmp_path)
 
     first = client.post("/device/register", json=_register_payload()).json()
     second = client.post("/device/register", json=_register_payload()).json()
 
     assert second["license_id"] == first["license_id"]
-    assert second["license_type"] == "trial"
+    assert second["license_type"] == "free"
 
 
 def test_refresh_returns_latest_license(tmp_path):
@@ -710,12 +670,14 @@ def test_env_example_contains_only_placeholders():
     assert "LICENSE_SERVER_ENV=development" in content
     assert "DATABASE_URL=sqlite:///ABSOLUTE_PATH_TO_LICENSE_SERVER_DB.sqlite3" in content
     assert "LICENSE_PRIVATE_KEY_FILE=ABSOLUTE_PATH_TO_ED25519_PRIVATE_KEY_B64_FILE" in content
-    assert "PAYMENT_MOCK_ADMIN_TOKEN=REPLACE_WITH_RANDOM_MOCK_TOKEN_AT_LEAST_16_CHARS" in content
     assert "LICENSE_SERVER_URL=http://127.0.0.1:8787" in content
     assert "LICENSE_PUBLIC_KEY=REPLACE_WITH_ED25519_PUBLIC_KEY_B64" in content
     assert "LICENSE_ADMIN_TOKEN" not in content
     assert "\nSERVER_ENV=" not in content
     assert "LICENSE_DB_PATH" not in content
+    # 免费版：示例环境文件里不再有任何支付配置
+    for payment_key in ("PAYMENT_PROVIDER", "WECHAT_PAY", "PAYMENT_PRICE_FEN", "PAYMENT_CURRENCY"):
+        assert payment_key not in content
     forbidden_fragments = [
         "124.223.7.147",
         "license.whutlogin.cn",

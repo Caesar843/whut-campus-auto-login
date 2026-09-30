@@ -14,10 +14,18 @@ from license_client.license_api import LicenseApiClient, LicenseApiResult
 from license_client.constants import DEFAULT_LICENSE_SERVER_URL
 from license_client.license_guard import (
     check_license_before_login,
+    get_current_license_state,
     initialize_license,
+    report_device_usage,
     try_initialize_license_after_bootstrap_login,
 )
-from license_client.license_state import LicenseDecision, LicenseStatus, evaluate_local_license
+from license_client.license_state import (
+    FREE_LICENSE_MESSAGE,
+    LicenseDecision,
+    LicenseStatus,
+    evaluate_local_license,
+    free_decision,
+)
 from license_client.token_store import (
     delete_signed_license_token,
     load_signed_license_token,
@@ -98,7 +106,7 @@ def test_register_device_payload_excludes_campus_account_fields(monkeypatch):
 
         def json(self):
             return {
-                "status": "trial_active",
+                "status": "free_active",
                 "signed_license_token": "signed-token",
             }
 
@@ -266,7 +274,7 @@ def test_valid_unexpired_trial_token_allows_use():
     assert decision.status == LicenseStatus.TRIAL_ACTIVE
     assert decision.allowed is True
     assert decision.days_remaining >= 1
-    assert "试用中" in decision.message_for_ui
+    assert "免费版" in decision.message_for_ui
 
 
 def test_expired_trial_token_blocks_use():
@@ -352,442 +360,182 @@ def test_revoked_token_blocks_use():
     assert decision.allowed is False
 
 
-def test_guard_allows_valid_local_token_when_server_unreachable(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key)
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(signed_license_token, token_path=token_path)
+# ---------------------------------------------------------------------------
+# 免费版授权入口：任何本地凭证状态都不能阻断功能
+# ---------------------------------------------------------------------------
 
-    decision = check_license_before_login(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
+
+def test_free_decision_is_allowed_and_marked_free():
+    decision = free_decision()
+
+    assert decision.status == LicenseStatus.FREE
+    assert decision.allowed is True
+    assert decision.license_type == "free"
+    assert decision.reason == "free_mode"
+    assert decision.message_for_ui == FREE_LICENSE_MESSAGE
+
+
+def test_check_license_before_login_allows_without_network_or_token(monkeypatch):
+    monkeypatch.setattr(
+        "license_client.license_api.requests.post",
+        lambda *args, **kwargs: pytest.fail("login-time check must not call the server"),
     )
+    monkeypatch.setattr(
+        "license_client.license_guard.generate_device_fingerprint_hash",
+        lambda *args, **kwargs: pytest.fail("login-time check must not touch the device"),
+    )
+
+    decision = check_license_before_login()
 
     assert decision.allowed is True
-    assert decision.status == LicenseStatus.TRIAL_ACTIVE
+    assert decision.status == LicenseStatus.FREE
+    # 登录成功后仍需补一次设备使用上报
+    assert decision.usage_sync_required is True
 
 
-def test_guard_blocks_when_server_unreachable_and_token_missing(tmp_path):
-    decision = check_license_before_login(
-        token_path=tmp_path / "missing-license.json",
-        public_key_b64="unused",
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-        saved_login_available_func=lambda: False,
-        campus_network_probe_func=lambda: True,
-    )
+def test_guard_public_api_no_longer_accepts_blocking_inputs():
+    import inspect
 
-    assert decision.allowed is False
-    assert decision.status == LicenseStatus.SERVER_UNREACHABLE
-
-
-def test_guard_registers_device_and_saves_trial_token_when_missing(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key)
-    token_path = tmp_path / "license_token.json"
-
-    decision = check_license_before_login(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(
-            reachable=True,
-            status="trial_active",
-            signed_license_token=signed_license_token,
-        ),
-    )
-
-    assert decision.allowed is True
-    assert decision.status == LicenseStatus.TRIAL_ACTIVE
-    assert load_signed_license_token(token_path=token_path).signed_license_token == signed_license_token
+    assert set(inspect.signature(check_license_before_login).parameters) == set()
+    assert set(inspect.signature(initialize_license).parameters) == {
+        "device_fingerprint_hash",
+        "api_client",
+    }
+    assert set(
+        inspect.signature(try_initialize_license_after_bootstrap_login).parameters
+    ) == {"bootstrap_decision", "device_fingerprint_hash", "api_client"}
 
 
-def test_initialize_license_registers_device_verifies_and_saves_token(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key)
-    token_path = tmp_path / "license_token.json"
+def test_initialize_license_reports_device_usage_and_allows():
     calls = []
 
-    decision = initialize_license(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: calls.append("register")
-        or LicenseApiResult(
-            reachable=True,
-            status="trial_active",
-            signed_license_token=signed_license_token,
-        ),
-    )
-
-    assert calls == ["register"]
-    assert decision.status == LicenseStatus.TRIAL_ACTIVE
-    assert load_signed_license_token(token_path=token_path).signed_license_token == signed_license_token
-
-
-def test_initialize_license_timeout_is_retryable_without_saving_token(tmp_path):
-    token_path = tmp_path / "license_token.json"
+    def fake_api_client():
+        calls.append("called")
+        return LicenseApiResult(reachable=True, status="free_active")
 
     decision = initialize_license(
-        token_path=token_path,
-        public_key_b64="unused",
         device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(
-            reachable=False,
-            status="request_timeout",
-            error="request_timeout",
-        ),
+        api_client=fake_api_client,
     )
 
-    assert decision.status == LicenseStatus.SERVER_UNREACHABLE
-    assert decision.reason == "request_timeout"
-    assert decision.retryable is True
-    assert load_signed_license_token(token_path=token_path).status == "missing"
+    assert calls == ["called"]
+    assert decision.allowed is True
+    assert decision.status == LicenseStatus.FREE
+    assert decision.usage_sync_required is False
 
 
-def test_initialize_license_rejects_bad_signature_without_saving(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key)
-    payload_segment, signature_segment = signed_license_token.split(".")
-    payload = json.loads(base64.urlsafe_b64decode(payload_segment + "==").decode("utf-8"))
-    payload["license_type"] = "paid"
-    tampered = _b64url(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    )
-    token_path = tmp_path / "license_token.json"
-
+def test_initialize_license_allows_when_server_unreachable():
     decision = initialize_license(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
         device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(
-            reachable=True,
-            status="trial_active",
-            signed_license_token=f"{tampered}.{signature_segment}",
-        ),
-    )
-
-    assert decision.status == LicenseStatus.TOKEN_INVALID
-    assert decision.reason == "signature_invalid"
-    assert load_signed_license_token(token_path=token_path).status == "missing"
-
-
-def test_initialize_license_rejects_device_mismatch_without_saving(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key, device_fingerprint_hash="device-b")
-    token_path = tmp_path / "license_token.json"
-
-    decision = initialize_license(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(
-            reachable=True,
-            status="trial_active",
-            signed_license_token=signed_license_token,
-        ),
-    )
-
-    assert decision.status == LicenseStatus.TOKEN_INVALID
-    assert decision.reason == "device_mismatch"
-    assert load_signed_license_token(token_path=token_path).status == "missing"
-
-
-def test_guard_keeps_allowed_decision_when_token_persist_fails(tmp_path, monkeypatch):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key)
-
-    def fail_save(token, *, token_path=None):
-        raise OSError(f"persist failed C:/Users/example/{token}")
-
-    monkeypatch.setattr(license_guard, "save_signed_license_token", fail_save)
-
-    decision = check_license_before_login(
-        token_path=tmp_path / "license_token.json",
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(
-            reachable=True,
-            status="trial_active",
-            signed_license_token=signed_license_token,
-        ),
+        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
     )
 
     assert decision.allowed is True
-    assert decision.status == LicenseStatus.TRIAL_ACTIVE
-    assert decision.warning_code == "token_persist_failed"
-    assert signed_license_token not in decision.message_for_ui
-    assert "C:/Users/example" not in decision.message_for_ui
-    assert "persist failed" not in decision.message_for_ui
+    assert decision.status == LicenseStatus.FREE
 
 
-def test_guard_does_not_convert_invalid_token_to_allowed_persistence_warning(tmp_path, monkeypatch):
-    _, public_key_b64 = _key_pair()
-    save_calls = []
+def test_initialize_license_allows_when_api_client_raises():
+    def broken_api_client():
+        raise RuntimeError("boom")
+
+    decision = initialize_license(
+        device_fingerprint_hash="device-a",
+        api_client=broken_api_client,
+    )
+
+    assert decision.allowed is True
+    assert decision.status == LicenseStatus.FREE
+
+
+def test_initialize_license_allows_when_fingerprint_generation_fails(monkeypatch):
+    def broken_fingerprint(*args, **kwargs):
+        raise OSError("no device identity")
+
     monkeypatch.setattr(
-        license_guard,
-        "save_signed_license_token",
-        lambda *args, **kwargs: save_calls.append(args),
+        "license_client.license_guard.generate_device_fingerprint_hash",
+        broken_fingerprint,
     )
 
-    decision = check_license_before_login(
-        token_path=tmp_path / "license_token.json",
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(
-            reachable=True,
-            status="trial_active",
-            signed_license_token="invalid-token",
-        ),
-    )
-
-    assert decision.allowed is False
-    assert decision.status == LicenseStatus.TOKEN_INVALID
-    assert decision.warning_code is None
-    assert save_calls == []
-
-
-def test_guard_allows_bootstrap_when_token_missing_server_unreachable_saved_config_and_campus_network(tmp_path):
-    decision = check_license_before_login(
-        token_path=tmp_path / "missing-license.json",
-        public_key_b64="unused",
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-        saved_login_available_func=lambda: True,
-        campus_network_probe_func=lambda: True,
+    decision = initialize_license(
+        api_client=lambda: pytest.fail("no fingerprint, no report"),
     )
 
     assert decision.allowed is True
-    assert decision.status == LicenseStatus.BOOTSTRAP_ALLOWED
-    assert decision.bootstrap_required is True
-    assert "首次使用" in decision.message_for_ui
+    assert decision.status == LicenseStatus.FREE
 
 
-def test_guard_blocks_bootstrap_when_saved_config_missing(tmp_path):
-    decision = check_license_before_login(
-        token_path=tmp_path / "missing-license.json",
-        public_key_b64="unused",
+def test_get_current_license_state_is_always_free():
+    first = get_current_license_state()
+    second = get_current_license_state()
+
+    assert first.allowed is True
+    assert second.allowed is True
+    assert first.status == LicenseStatus.FREE
+    assert second.usage_sync_required is True
+
+
+def test_bootstrap_sync_reports_usage_when_required():
+    calls = []
+
+    def fake_api_client():
+        calls.append("called")
+        return LicenseApiResult(reachable=True, status="free_active")
+
+    decision = try_initialize_license_after_bootstrap_login(
+        bootstrap_decision=free_decision(usage_sync_required=True),
         device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-        saved_login_available_func=lambda: False,
-        campus_network_probe_func=lambda: True,
+        api_client=fake_api_client,
     )
 
-    assert decision.allowed is False
-    assert decision.status == LicenseStatus.SERVER_UNREACHABLE
-    assert decision.reason == "missing_saved_login_config"
-    assert decision.retryable is False
-    assert decision.bootstrap_required is False
-
-
-def test_guard_marks_bootstrap_portal_not_ready_as_retryable(tmp_path):
-    decision = check_license_before_login(
-        token_path=tmp_path / "missing-license.json",
-        public_key_b64="unused",
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-        saved_login_available_func=lambda: True,
-        campus_network_probe_func=lambda: False,
-    )
-
-    assert decision.allowed is False
-    assert decision.status == LicenseStatus.SERVER_UNREACHABLE
-    assert decision.reason == "bootstrap_portal_not_ready"
-    assert decision.retryable is True
-    assert decision.bootstrap_required is False
-
-
-def test_paid_active_local_token_allows_use_when_server_unreachable(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key, license_type="paid")
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(signed_license_token, token_path=token_path)
-
-    decision = check_license_before_login(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-    )
-
+    assert calls == ["called"]
     assert decision.allowed is True
-    assert decision.status == LicenseStatus.PAID_ACTIVE
+    assert decision.status == LicenseStatus.FREE
 
 
-def test_expired_token_blocks_without_bootstrap_even_when_campus_network_available(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    expired_at = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
-    signed_license_token = _signed_license_token(
-        private_key,
-        expires_at=expired_at.isoformat().replace("+00:00", "Z"),
-    )
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(signed_license_token, token_path=token_path)
-
-    decision = check_license_before_login(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-        saved_login_available_func=lambda: True,
-        campus_network_probe_func=lambda: True,
-    )
-
-    assert decision.allowed is False
-    assert decision.status == LicenseStatus.TRIAL_EXPIRED
-    assert decision.retryable is False
-    assert decision.bootstrap_required is False
-    assert "试用期已结束" in decision.message_for_ui
-
-
-def test_paid_expired_token_blocks_without_bootstrap(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    expired_at = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
-    signed_license_token = _signed_license_token(
-        private_key,
-        license_type="paid",
-        expires_at=expired_at.isoformat().replace("+00:00", "Z"),
-    )
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(signed_license_token, token_path=token_path)
-
-    decision = check_license_before_login(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-        saved_login_available_func=lambda: True,
-        campus_network_probe_func=lambda: True,
-    )
-
-    assert decision.allowed is False
-    assert decision.status == LicenseStatus.PAID_EXPIRED
-    assert decision.retryable is False
-    assert decision.bootstrap_required is False
-
-
-def test_invalid_token_blocks_without_bootstrap(tmp_path):
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token("invalid-token", token_path=token_path)
-
-    decision = check_license_before_login(
-        token_path=token_path,
-        public_key_b64="not-a-real-key",
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-        saved_login_available_func=lambda: True,
-        campus_network_probe_func=lambda: True,
-    )
-
-    assert decision.allowed is False
-    assert decision.status == LicenseStatus.TOKEN_INVALID
-    assert decision.retryable is False
-    assert decision.bootstrap_required is False
-    assert "本地授权凭证无效" in decision.message_for_ui
-
-
-def test_revoked_token_blocks_without_bootstrap(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key, license_status="revoked")
-    token_path = tmp_path / "license_token.json"
-    save_signed_license_token(signed_license_token, token_path=token_path)
-
-    decision = check_license_before_login(
-        token_path=token_path,
-        public_key_b64=public_key_b64,
-        device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(reachable=False, status="server_unreachable"),
-        saved_login_available_func=lambda: True,
-        campus_network_probe_func=lambda: True,
-    )
-
-    assert decision.allowed is False
-    assert decision.status == LicenseStatus.REVOKED
-    assert decision.retryable is False
-    assert decision.bootstrap_required is False
-
-
-def test_bootstrap_success_initializes_and_saves_license_token(tmp_path):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key)
-    token_path = tmp_path / "license_token.json"
-    bootstrap_decision = LicenseDecision(
-        status=LicenseStatus.BOOTSTRAP_ALLOWED,
-        allowed=True,
-        reason="bootstrap_allowed",
-        bootstrap_required=True,
-    )
+def test_bootstrap_sync_skips_report_when_not_required():
+    bootstrap_decision = free_decision(usage_sync_required=False)
 
     decision = try_initialize_license_after_bootstrap_login(
         bootstrap_decision=bootstrap_decision,
-        token_path=token_path,
-        public_key_b64=public_key_b64,
         device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(
-            reachable=True,
-            status="trial_active",
-            signed_license_token=signed_license_token,
-        ),
+        api_client=lambda: pytest.fail("sync not required, no report expected"),
+    )
+
+    assert decision is bootstrap_decision
+
+
+def test_bootstrap_sync_allows_when_report_fails():
+    decision = try_initialize_license_after_bootstrap_login(
+        bootstrap_decision=free_decision(usage_sync_required=True),
+        device_fingerprint_hash="device-a",
+        api_client=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
 
     assert decision.allowed is True
-    assert decision.status == LicenseStatus.TRIAL_ACTIVE
-    assert load_signed_license_token(token_path=token_path).signed_license_token == signed_license_token
+    assert decision.status == LicenseStatus.FREE
 
 
-def test_bootstrap_initialize_keeps_allowed_decision_when_token_persist_fails(tmp_path, monkeypatch):
-    private_key, public_key_b64 = _key_pair()
-    signed_license_token = _signed_license_token(private_key)
-    bootstrap_decision = LicenseDecision(
-        status=LicenseStatus.BOOTSTRAP_ALLOWED,
-        allowed=True,
-        reason="bootstrap_allowed",
-        bootstrap_required=True,
+def test_report_device_usage_returns_none_instead_of_raising(monkeypatch):
+    monkeypatch.setattr(
+        "license_client.license_guard.generate_device_fingerprint_hash",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("broken")),
     )
 
-    def fail_save(token, *, token_path=None):
-        raise OSError(f"persist failed C:/Users/example/{token}")
+    assert report_device_usage(api_client=lambda: pytest.fail("must not report")) is None
 
-    monkeypatch.setattr(license_guard, "save_signed_license_token", fail_save)
 
-    decision = try_initialize_license_after_bootstrap_login(
-        bootstrap_decision=bootstrap_decision,
-        token_path=tmp_path / "license_token.json",
-        public_key_b64=public_key_b64,
+def test_report_device_usage_surfaces_api_result_for_logging():
+    expected = LicenseApiResult(reachable=False, status="server_unreachable")
+
+    assert report_device_usage(
         device_fingerprint_hash="device-a",
-        api_client=lambda: LicenseApiResult(
-            reachable=True,
-            status="trial_active",
-            signed_license_token=signed_license_token,
-        ),
-    )
-
-    assert decision.allowed is True
-    assert decision.status == LicenseStatus.TRIAL_ACTIVE
-    assert decision.warning_code == "token_persist_failed"
-    assert signed_license_token not in decision.message_for_ui
-    assert "C:/Users/example" not in decision.message_for_ui
-    assert "persist failed" not in decision.message_for_ui
+        api_client=lambda: expected,
+    ) is expected
 
 
-def test_bootstrap_failed_login_does_not_create_token(tmp_path):
-    token_path = tmp_path / "license_token.json"
-    non_bootstrap_decision = LicenseDecision(
-        status=LicenseStatus.TRIAL_ACTIVE,
-        allowed=True,
-        reason="trial_active",
-        bootstrap_required=False,
-    )
-
-    decision = try_initialize_license_after_bootstrap_login(
-        bootstrap_decision=non_bootstrap_decision,
-        token_path=token_path,
-        public_key_b64="unused",
-        device_fingerprint_hash="device-a",
-        api_client=lambda: pytest.fail("post-bootstrap init should not run"),
-    )
-
-    assert decision is non_bootstrap_decision
-    assert load_signed_license_token(token_path=token_path).status == "missing"
+def test_license_guard_module_keeps_no_payment_surface():
+    assert not hasattr(license_guard, "PaymentApiClient")
+    assert not hasattr(license_guard, "default_campus_network_probe")
+    source = Path(license_guard.__file__).read_text(encoding="utf-8")
+    for forbidden in ("payment", "Payment", "PAYMENT", "wechat", "order"):
+        assert forbidden not in source

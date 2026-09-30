@@ -82,10 +82,14 @@ def verify_device_proof_token(
     return DeviceProof(device_fingerprint_hash=device_hash, license_id=license_id)
 
 
+# 免费版签发 license_type="free"；trial/paid 为历史凭证，仍然承认。
+SUPPORTED_LICENSE_TYPES = {"free", "trial", "paid"}
+
+
 def _validate_payload_shape(payload: Mapping[str, Any]) -> None:
     if any(key not in payload for key in REQUIRED_CLAIMS):
         raise ValueError("missing_claim")
-    if payload.get("license_type") not in {"trial", "paid"}:
+    if payload.get("license_type") not in SUPPORTED_LICENSE_TYPES:
         raise ValueError("invalid_license_type")
     if payload.get("license_status") not in {"active", "revoked"}:
         raise ValueError("invalid_license_status")

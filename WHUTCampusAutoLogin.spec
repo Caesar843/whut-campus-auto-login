@@ -44,7 +44,6 @@ a = Analysis(
     excludes=[
         "deploy",
         "license_server",
-        "payment",
         "references",
         "scripts",
         "tests",
