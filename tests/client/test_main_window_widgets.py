@@ -14,7 +14,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from PySide6.QtWidgets import QApplication, QMessageBox, QLineEdit
 
 from desktop_app.log_window import RuntimeLogWindow
-from desktop_app.main_window import LICENSE_PLACEHOLDER, MainWindow, MainWindowController
+from desktop_app import main_window
+from desktop_app.main_window import (
+    FEEDBACK_URL,
+    FEEDBACK_URL_LABEL,
+    LICENSE_PLACEHOLDER,
+    MainWindow,
+    MainWindowController,
+)
 from desktop_app.widgets import AccountLineEdit, PasswordLineEdit
 from license_client.license_state import (
     FREE_LICENSE_MESSAGE,
@@ -121,6 +128,37 @@ def test_main_window_has_runtime_log_entry_button_and_free_version_copy():
     assert "无试用期" in notice
     for forbidden in ("9.9", "购买", "付费", "支付", "续费", "元/年"):
         assert forbidden not in notice
+
+
+def test_main_window_notice_has_clickable_feedback_link(monkeypatch):
+    _app()
+    controller = MainWindowController(
+        load_config_func=lambda: FakeConfig(),
+        is_autostart_enabled_func=lambda: True,
+    )
+
+    opened: list[str] = []
+    monkeypatch.setattr(main_window, "open_external_url", lambda url: opened.append(url) or True)
+
+    window = MainWindow(controller=controller)
+    label = window.notice_label
+
+    assert "欢迎来" in label.text()
+    assert f'href="{FEEDBACK_URL}"' in label.text()
+    assert FEEDBACK_URL_LABEL in label.text()
+    # 链接点击由 linkActivated 接管，交给系统默认浏览器打开
+    assert label.openExternalLinks() is False
+
+    label.linkActivated.emit(FEEDBACK_URL)
+    assert opened == [FEEDBACK_URL]
+
+    # 非反馈站点的链接一律忽略
+    label.linkActivated.emit("https://example.invalid/phishing")
+    assert opened == [FEEDBACK_URL]
+
+    # 富文本换行必须用 <br/>，避免整段说明被折叠成一行
+    assert "\n" not in label.text()
+    assert "<br/>" in label.text()
 
 
 def test_main_window_reuses_independent_runtime_log_window():

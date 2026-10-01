@@ -4,7 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -61,6 +62,15 @@ from license_client.license_state import (
 LOGGER = logging.getLogger(__name__)
 WINDOW_TITLE = "武汉理工校园网助手"
 LICENSE_PLACEHOLDER = ""
+# 界面底部反馈入口：点击后由系统默认浏览器打开。
+FEEDBACK_URL = "https://whutlogin.cn/"
+FEEDBACK_URL_LABEL = "whutlogin.cn"
+FEEDBACK_LINK_COLOR = "#0369A1"
+
+
+def open_external_url(url: str) -> bool:
+    """用系统默认浏览器打开链接；独立成函数便于测试时替换。"""
+    return QDesktopServices.openUrl(QUrl(url))
 
 
 LoginRunner = Callable[[str, str], LoginResult]
@@ -468,16 +478,23 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.runtime_logs_button)
         layout.addWidget(card)
 
+        # 富文本：底部反馈入口需要可点击跳转，换行统一用 <br/> 表达。
         notice = QLabel(
-            "说明：本工具会在电脑已连接武汉理工校园网环境后，自动完成校园网认证登录。\n"
-            "它不会自动选择 Wi-Fi、绕过验证码或突破校园网设备限制。\n"
-            "校园网账号密码仅保存在本机，不会上传服务器。\n\n"
-            "免费说明：本工具完全免费，无试用期、无内购、无需激活码。\n"
+            "说明：本工具会在电脑已连接武汉理工校园网环境后，自动完成校园网认证登录。<br/>"
+            "它不会自动选择 Wi-Fi、绕过验证码或突破校园网设备限制。<br/>"
+            "校园网账号密码仅保存在本机，不会上传服务器。<br/><br/>"
+            "免费说明：本工具完全免费，无试用期、无内购、无需激活码。<br/>"
             "为统计使用人数，本工具只会向服务器上报本机设备指纹与最近使用时间，"
-            "不会上报校园网账号和密码。"
+            "不会上报校园网账号和密码。<br/><br/>"
+            f'反馈：如果有任何问题，欢迎来 <a href="{FEEDBACK_URL}" '
+            f'style="color: {FEEDBACK_LINK_COLOR};">{FEEDBACK_URL_LABEL}</a> 进行反馈。'
         )
         notice.setObjectName("notice")
         notice.setWordWrap(True)
+        notice.setTextFormat(Qt.TextFormat.RichText)
+        notice.setOpenExternalLinks(False)
+        notice.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        notice.linkActivated.connect(self._open_feedback_link)
         self.notice_label = notice
         layout.addWidget(self.notice_label)
         layout.addStretch(1)
@@ -489,6 +506,14 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(root)
         self.setStyleSheet(_style_sheet())
+
+    @Slot(str)
+    def _open_feedback_link(self, url: str) -> None:
+        # 只放行界面内置的反馈站点，避免被伪装链接带跑。
+        if not url.startswith(FEEDBACK_URL):
+            LOGGER.warning("Ignored unexpected external link from notice.")
+            return
+        open_external_url(url)
 
     @Slot()
     def _save_config(self) -> None:
