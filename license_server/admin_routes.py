@@ -619,104 +619,182 @@ _ADMIN_HTML = """<!doctype html>
 </head>
 <body>
   <main>
-    <h1>管理后台</h1>
-    <p>只读后台。页面不含业务数据；管理员令牌仅保存在本次浏览器会话的 sessionStorage 中。</p>
+    <h1>授权服务管理后台</h1>
+    <p>本页为只读后台，仅用于查看设备与授权统计，页面本身不保存任何业务数据。管理员令牌只留在当前浏览器标签页的 sessionStorage 会话存储里，关闭标签页即失效。</p>
+
+    <hr>
 
     <section aria-labelledby="access-title">
-      <h2 id="access-title">访问令牌</h2>
-      <label for="admin-secret">管理员令牌</label>
-      <input id="admin-secret" type="password" autocomplete="off">
-      <button id="save-secret" type="button">保存本次会话</button>
-      <button id="clear-secret" type="button">清除令牌</button>
-      <p id="access-status" role="status">未加载数据。</p>
+      <h2 id="access-title">第一步：管理员身份</h2>
+      <p>粘贴管理员令牌后才能读取下面的数据，令牌不会写入浏览器本地存储。</p>
+      <p>
+        <label for="admin-secret">管理员令牌</label>
+        <input id="admin-secret" type="password" autocomplete="off" size="40">
+        <button id="save-secret" type="button">保存到本次会话</button>
+        <button id="clear-secret" type="button">清除令牌</button>
+      </p>
+      <p id="access-status" role="status">尚未加载数据。</p>
     </section>
 
+    <hr>
+
     <section aria-labelledby="summary-title">
-      <h2 id="summary-title">使用统计</h2>
-      <button id="load-summary" type="button">加载统计</button>
+      <h2 id="summary-title">第二步：总体使用统计</h2>
+      <p>汇总设备总数、近 24 小时 / 7 天 / 30 天的活跃设备数，以及授权类型与状态分布。</p>
+      <p><button id="load-summary" type="button">刷新统计数据</button></p>
       <div id="summary-output"></div>
     </section>
 
+    <hr>
+
     <section aria-labelledby="devices-title">
-      <h2 id="devices-title">设备</h2>
-      <label for="devices-device-id">device_id_hash</label>
-      <input id="devices-device-id" autocomplete="off">
-      <label for="devices-product-id">product_id</label>
-      <input id="devices-product-id" autocomplete="off">
-      <label for="devices-limit">limit</label>
-      <input id="devices-limit" type="number" min="1" max="100" value="50">
-      <label for="devices-offset">offset</label>
-      <input id="devices-offset" type="number" min="0" value="0">
-      <button id="devices-load" type="button">加载设备</button>
-      <button id="devices-prev" type="button">上一页</button>
-      <button id="devices-next" type="button">下一页</button>
-      <p id="devices-page">offset 0</p>
+      <h2 id="devices-title">第三步：设备记录</h2>
+      <p>每一行代表一台使用过本工具的电脑，可查看它的首次与最近上报时间，以及对应的授权状态。</p>
+
+      <fieldset>
+        <legend>查询条件</legend>
+        <p>
+          <label for="devices-device-id">设备指纹哈希</label>
+          <input id="devices-device-id" autocomplete="off" size="40">
+          <label for="devices-product-id">产品标识</label>
+          <input id="devices-product-id" autocomplete="off" size="20">
+        </p>
+        <p>
+          <label for="devices-limit">每页条数</label>
+          <input id="devices-limit" type="number" min="1" max="100" value="50" size="4">
+          <label for="devices-offset">跳过条数</label>
+          <input id="devices-offset" type="number" min="0" value="0" size="6">
+        </p>
+      </fieldset>
+
+      <p>
+        <button id="devices-load" type="button">查询设备</button>
+        <button id="devices-prev" type="button">上一页</button>
+        <button id="devices-next" type="button">下一页</button>
+      </p>
+      <p>当前分页位置：<b id="devices-page">offset 0</b></p>
       <div id="devices-output"></div>
-      <h3>设备详情</h3>
-      <label for="device-detail-hash">device_id_hash</label>
-      <input id="device-detail-hash" autocomplete="off">
-      <button id="device-detail-load" type="button">加载详情</button>
-      <div id="device-detail-output"></div>
-      <h3>追加设备备注</h3>
-      <label for="device-note-device-id">device_id_hash</label>
-      <input id="device-note-device-id" autocomplete="off">
-      <label for="device-note-text">备注</label>
-      <textarea id="device-note-text" maxlength="500"></textarea>
-      <button id="device-note-submit" type="button">追加备注</button>
-      <p id="device-note-status" role="status"></p>
+
+      <details>
+        <summary>查看单台设备详情</summary>
+        <p>
+          <label for="device-detail-hash">设备指纹哈希</label>
+          <input id="device-detail-hash" autocomplete="off" size="40">
+          <button id="device-detail-load" type="button">查看详情</button>
+        </p>
+        <div id="device-detail-output"></div>
+      </details>
+
+      <details>
+        <summary>给设备追加运维备注</summary>
+        <p>备注会写入审计记录，最长 500 字。请勿在此填写任何账号或密码。</p>
+        <p>
+          <label for="device-note-device-id">设备指纹哈希</label>
+          <input id="device-note-device-id" autocomplete="off" size="40">
+        </p>
+        <p>
+          <label for="device-note-text">备注内容</label>
+          <textarea id="device-note-text" maxlength="500" rows="3" cols="60"></textarea>
+        </p>
+        <p><button id="device-note-submit" type="button">提交备注</button></p>
+        <p id="device-note-status" role="status"></p>
+      </details>
     </section>
 
-    <section aria-labelledby="audit-title">
-      <h2 id="audit-title">审计记录</h2>
-      <label for="audit-target-type">target_type</label>
-      <input id="audit-target-type" autocomplete="off">
-      <label for="audit-target-id">target_id</label>
-      <input id="audit-target-id" autocomplete="off">
-      <label for="audit-action">action</label>
-      <input id="audit-action" autocomplete="off">
-      <label for="audit-result">result</label>
-      <input id="audit-result" autocomplete="off">
-      <label for="audit-request-id">request_id</label>
-      <input id="audit-request-id" autocomplete="off">
-      <label for="audit-created-from">created_from</label>
-      <input id="audit-created-from" autocomplete="off">
-      <label for="audit-created-to">created_to</label>
-      <input id="audit-created-to" autocomplete="off">
-      <label for="audit-limit">limit</label>
-      <input id="audit-limit" type="number" min="1" max="100" value="50">
-      <label for="audit-offset">offset</label>
-      <input id="audit-offset" type="number" min="0" value="0">
-      <button id="audit-load" type="button">加载审计记录</button>
-      <button id="audit-prev" type="button">上一页</button>
-      <button id="audit-next" type="button">下一页</button>
-      <p id="audit-page">offset 0</p>
-      <div id="audit-output"></div>
-      <h3>审计详情</h3>
-      <div id="audit-detail-output"></div>
-    </section>
+    <hr>
 
     <section aria-labelledby="licenses-title">
-      <h2 id="licenses-title">当前授权</h2>
-      <label for="licenses-device-id">device_id_hash</label>
-      <input id="licenses-device-id" autocomplete="off">
-      <label for="licenses-status">status</label>
-      <input id="licenses-status" autocomplete="off">
-      <label for="licenses-limit">limit</label>
-      <input id="licenses-limit" type="number" min="1" max="100" value="50">
-      <label for="licenses-offset">offset</label>
-      <input id="licenses-offset" type="number" min="0" value="0">
-      <button id="licenses-load" type="button">加载当前授权</button>
-      <button id="licenses-prev" type="button">上一页</button>
-      <button id="licenses-next" type="button">下一页</button>
-      <p id="licenses-page">offset 0</p>
+      <h2 id="licenses-title">第四步：授权记录</h2>
+      <p>授权凭证由服务端签发并绑定设备。免费版授权没有到期时间，状态正常即代表该设备可正常使用。</p>
+
+      <fieldset>
+        <legend>查询条件</legend>
+        <p>
+          <label for="licenses-device-id">设备指纹哈希</label>
+          <input id="licenses-device-id" autocomplete="off" size="40">
+          <label for="licenses-status">授权状态</label>
+          <input id="licenses-status" autocomplete="off" size="12">
+        </p>
+        <p>
+          <label for="licenses-limit">每页条数</label>
+          <input id="licenses-limit" type="number" min="1" max="100" value="50" size="4">
+          <label for="licenses-offset">跳过条数</label>
+          <input id="licenses-offset" type="number" min="0" value="0" size="6">
+        </p>
+      </fieldset>
+
+      <p>
+        <button id="licenses-load" type="button">查询授权</button>
+        <button id="licenses-prev" type="button">上一页</button>
+        <button id="licenses-next" type="button">下一页</button>
+      </p>
+      <p>当前分页位置：<b id="licenses-page">offset 0</b></p>
       <div id="licenses-output"></div>
-      <h3>追加授权备注</h3>
-      <label for="license-note-license-id">license_id</label>
-      <input id="license-note-license-id" autocomplete="off">
-      <label for="license-note-text">备注</label>
-      <textarea id="license-note-text" maxlength="500"></textarea>
-      <button id="license-note-submit" type="button">追加备注</button>
-      <p id="license-note-status" role="status"></p>
+
+      <details>
+        <summary>给授权追加运维备注</summary>
+        <p>备注会写入审计记录，最长 500 字。请勿在此填写任何账号或密码。</p>
+        <p>
+          <label for="license-note-license-id">授权编号</label>
+          <input id="license-note-license-id" autocomplete="off" size="12">
+        </p>
+        <p>
+          <label for="license-note-text">备注内容</label>
+          <textarea id="license-note-text" maxlength="500" rows="3" cols="60"></textarea>
+        </p>
+        <p><button id="license-note-submit" type="button">提交备注</button></p>
+        <p id="license-note-status" role="status"></p>
+      </details>
+    </section>
+
+    <hr>
+
+    <section aria-labelledby="audit-title">
+      <h2 id="audit-title">第五步：审计记录</h2>
+      <p>记录管理员在后台做过的每一次查询与备注操作，用于事后追溯。点某一行左侧的「查看」可展开完整内容。</p>
+
+      <details>
+        <summary>筛选条件</summary>
+        <p>
+          <label for="audit-target-type">目标类型</label>
+          <input id="audit-target-type" autocomplete="off" size="16">
+          <label for="audit-target-id">目标编号</label>
+          <input id="audit-target-id" autocomplete="off" size="16">
+        </p>
+        <p>
+          <label for="audit-action">操作名称</label>
+          <input id="audit-action" autocomplete="off" size="16">
+          <label for="audit-result">执行结果</label>
+          <input id="audit-result" autocomplete="off" size="16">
+        </p>
+        <p>
+          <label for="audit-request-id">请求编号</label>
+          <input id="audit-request-id" autocomplete="off" size="24">
+        </p>
+        <p>
+          <label for="audit-created-from">起始时间</label>
+          <input id="audit-created-from" autocomplete="off" size="24">
+          <label for="audit-created-to">结束时间</label>
+          <input id="audit-created-to" autocomplete="off" size="24">
+        </p>
+        <p>
+          <label for="audit-limit">每页条数</label>
+          <input id="audit-limit" type="number" min="1" max="100" value="50" size="4">
+          <label for="audit-offset">跳过条数</label>
+          <input id="audit-offset" type="number" min="0" value="0" size="6">
+        </p>
+      </details>
+
+      <p>
+        <button id="audit-load" type="button">查询审计记录</button>
+        <button id="audit-prev" type="button">上一页</button>
+        <button id="audit-next" type="button">下一页</button>
+      </p>
+      <p>当前分页位置：<b id="audit-page">offset 0</b></p>
+      <div id="audit-output"></div>
+
+      <h3>审计详情</h3>
+      <div id="audit-detail-output"></div>
     </section>
   </main>
 </body>
@@ -807,6 +885,114 @@ _ADMIN_JS = """
       ],
     },
   };
+
+  // 展示层中文映射：只影响界面文字，不改变请求参数与数据字段名。
+  const FIELD_LABELS = {
+    id: "记录编号",
+    actor: "操作者",
+    source_ip: "来源地址",
+    request_id: "请求编号",
+    action: "操作名称",
+    target_type: "目标类型",
+    target_id: "目标编号",
+    result: "执行结果",
+    reason: "原因",
+    failure_code: "失败代码",
+    created_at: "创建时间",
+    before_state: "变更前状态",
+    after_state: "变更后状态",
+    device_id_hash: "设备指纹哈希",
+    product_id: "产品标识",
+    first_seen_at: "首次上报时间",
+    last_seen_at: "最近上报时间",
+    license_id: "授权编号",
+    license_type: "授权类型",
+    license_status: "授权状态",
+    license_expires_at: "授权到期时间",
+    status: "状态",
+    starts_at: "生效时间",
+    expires_at: "到期时间",
+    source: "来源",
+    revoked_at: "撤销时间",
+  };
+
+  const SUMMARY_LABELS = {
+    devices_total: "设备总数",
+    devices_active_24h: "近 24 小时活跃设备",
+    devices_active_7d: "近 7 天活跃设备",
+    devices_active_30d: "近 30 天活跃设备",
+    licenses_by_type: "按授权类型统计",
+    licenses_by_status: "按授权状态统计",
+    licenses_active_unexpired: "有效且未过期的授权数",
+  };
+
+  const SUMMARY_NOTES = {
+    devices_total: "累计上报过的设备台数",
+    devices_active_24h: "最近 24 小时内上报过的设备",
+    devices_active_7d: "最近 7 天内上报过的设备",
+    devices_active_30d: "最近 30 天内上报过的设备",
+    licenses_by_type: "每种授权类型各有多少条",
+    licenses_by_status: "正常与已撤销各有多少条",
+    licenses_active_unexpired: "状态正常且尚未到期的授权",
+  };
+
+  const VALUE_LABELS = {
+    devices: "设备",
+    licenses: "授权",
+    notes: "备注",
+    active: "正常",
+    revoked: "已撤销",
+    free: "免费授权",
+    paid: "已购授权",
+    trial: "体验授权",
+    expired: "已过期",
+    pending: "待处理",
+    payment: "历史渠道",
+    manual: "人工发放",
+    system: "系统签发",
+    admin: "管理员",
+    visitor: "访客",
+    device: "设备",
+    license: "授权",
+    success: "成功",
+    failure: "失败",
+    denied: "已拒绝",
+  };
+
+  function labelOf(field) {
+    return FIELD_LABELS[field] || field;
+  }
+
+  const ISO_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+
+  function formatTime(value) {
+    if (typeof value !== "string" || !ISO_TIME_PATTERN.test(value)) {
+      return null;
+    }
+    return value.replace("T", " ").replace(/Z$/, " (UTC)");
+  }
+
+  function valueLabel(value) {
+    if (typeof value !== "string") {
+      return null;
+    }
+    return Object.prototype.hasOwnProperty.call(VALUE_LABELS, value)
+      ? VALUE_LABELS[value]
+      : null;
+  }
+
+  function formatSummaryValue(name, value) {
+    if (value === null || value === undefined) {
+      return "暂无数据";
+    }
+    if (typeof value === "object") {
+      const parts = Object.keys(value).map((key) => {
+        return (valueLabel(key) || key) + "：" + String(value[key]);
+      });
+      return parts.length === 0 ? "暂无数据" : parts.join("；");
+    }
+    return String(value);
+  }
 
   function byId(id) {
     return document.getElementById(id);
@@ -927,12 +1113,17 @@ _ADMIN_JS = """
 
   function formatValue(value) {
     if (value === null || value === undefined) {
-      return "";
+      return "—";
     }
     if (typeof value === "object") {
       return JSON.stringify(value);
     }
-    return String(value);
+    const text = String(value);
+    if (text === "") {
+      return "—";
+    }
+    const time = formatTime(text);
+    return time === null ? text : time;
   }
 
   function clearAuditDetail() {
@@ -953,8 +1144,14 @@ _ADMIN_JS = """
     for (const name of Object.keys(data)) {
       const term = document.createElement("dt");
       const detail = document.createElement("dd");
-      term.textContent = name;
-      detail.textContent = JSON.stringify(data[name]);
+      term.textContent = SUMMARY_LABELS[name] || name;
+      const note = SUMMARY_NOTES[name];
+      if (note) {
+        const explain = document.createElement("small");
+        explain.textContent = "（" + note + "）";
+        term.appendChild(explain);
+      }
+      detail.textContent = formatSummaryValue(name, data[name]);
       list.appendChild(term);
       list.appendChild(detail);
     }
@@ -967,21 +1164,24 @@ _ADMIN_JS = """
     clearNode(output);
     if (rows.length === 0) {
       const empty = document.createElement("p");
-      empty.textContent = "无数据。";
+      empty.textContent = "没有符合条件的数据。";
       output.appendChild(empty);
       return;
     }
     const table = document.createElement("table");
+    table.setAttribute("border", "1");
+    table.setAttribute("cellpadding", "6");
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
     if (item.detail) {
       const detailHead = document.createElement("th");
-      detailHead.textContent = "detail";
+      detailHead.textContent = "详情";
       headRow.appendChild(detailHead);
     }
     for (const field of item.fields) {
       const th = document.createElement("th");
-      th.textContent = field;
+      th.textContent = labelOf(field);
+      th.setAttribute("nowrap", "nowrap");
       headRow.appendChild(th);
     }
     thead.appendChild(headRow);
@@ -1001,7 +1201,8 @@ _ADMIN_JS = """
       }
       for (const field of item.fields) {
         const td = document.createElement("td");
-        td.textContent = formatValue(row[field]);
+        const shown = valueLabel(row[field]);
+        td.textContent = shown === null ? formatValue(row[field]) : shown;
         tr.appendChild(td);
       }
       tbody.appendChild(tr);
@@ -1017,8 +1218,9 @@ _ADMIN_JS = """
     for (const field of config.audit.fields.concat(["before_state", "after_state"])) {
       const term = document.createElement("dt");
       const detail = document.createElement("dd");
-      term.textContent = field;
-      detail.textContent = formatValue(data[field]);
+      term.textContent = labelOf(field);
+      const shown = valueLabel(data[field]);
+      detail.textContent = shown === null ? formatValue(data[field]) : shown;
       list.appendChild(term);
       list.appendChild(detail);
     }
@@ -1050,28 +1252,37 @@ _ADMIN_JS = """
     }
     try {
       const data = await adminFetch(API_BASE + "devices/" + encodeURIComponent(deviceHash));
+      const heading = document.createElement("h4");
+      heading.textContent = "设备基本信息";
+      output.appendChild(heading);
       const list = document.createElement("dl");
       for (const field of ["device_id_hash", "product_id", "first_seen_at", "last_seen_at"]) {
         const term = document.createElement("dt");
         const detail = document.createElement("dd");
-        term.textContent = field;
+        term.textContent = labelOf(field);
         detail.textContent = formatValue(data[field]);
         list.appendChild(term);
         list.appendChild(detail);
       }
       output.appendChild(list);
       const rows = Array.isArray(data.licenses) ? data.licenses : [];
+      const licenseHeading = document.createElement("h4");
+      licenseHeading.textContent = "该设备的授权记录";
+      output.appendChild(licenseHeading);
       if (rows.length === 0) {
         const empty = document.createElement("p");
-        empty.textContent = "无授权记录。";
+        empty.textContent = "这台设备还没有授权记录。";
         output.appendChild(empty);
       } else {
         const table = document.createElement("table");
+        table.setAttribute("border", "1");
+        table.setAttribute("cellpadding", "6");
         const thead = document.createElement("thead");
         const headRow = document.createElement("tr");
         for (const field of DEVICE_LICENSE_FIELDS) {
           const th = document.createElement("th");
-          th.textContent = field;
+          th.textContent = labelOf(field);
+          th.setAttribute("nowrap", "nowrap");
           headRow.appendChild(th);
         }
         thead.appendChild(headRow);
@@ -1081,7 +1292,8 @@ _ADMIN_JS = """
           const tr = document.createElement("tr");
           for (const field of DEVICE_LICENSE_FIELDS) {
             const td = document.createElement("td");
-            td.textContent = formatValue(row[field]);
+            const shown = valueLabel(row[field]);
+            td.textContent = shown === null ? formatValue(row[field]) : shown;
             tr.appendChild(td);
           }
           tbody.appendChild(tr);
