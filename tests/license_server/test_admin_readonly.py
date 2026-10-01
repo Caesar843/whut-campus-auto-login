@@ -1,7 +1,7 @@
 """免费版后台只读接口测试。
 
-支付模块移除后，后台只保留 summary / devices / licenses / audit-logs 的只读
-查询与设备、授权备注端点；支付时代的 orders / notifications / grants 端点应
+旧版商业模块移除后，后台只保留 summary / devices / licenses / audit-logs 的只读
+查询与设备、授权备注端点；旧版的 orders / notifications / grants 端点应
 返回 404。本文件保持原有安全性质：认证明缺失或错误 401、缺少资源 404、非法
 参数 400、分页边界、安全头、敏感字段不返回、只读查询不改库。
 

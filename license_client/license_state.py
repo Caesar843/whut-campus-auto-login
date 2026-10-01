@@ -53,7 +53,7 @@ def free_decision(
     usage_sync_required: bool = False,
     message_for_ui: Optional[str] = None,
 ) -> LicenseDecision:
-    """免费版放行判定：允许所有功能，不读取本地凭证、不判断试用期。"""
+    """免费版放行判定：允许所有功能，不读取本地凭证、不做状态判断。"""
     return LicenseDecision(
         status=LicenseStatus.FREE,
         allowed=True,

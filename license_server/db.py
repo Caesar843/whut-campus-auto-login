@@ -3,11 +3,11 @@
 schema 版本 6 = 免费版核心结构：
     devices / licenses / admin_audit_logs / schema_meta
 
-支付时代的表（payment_orders、payment_notifications、payment_reconciliations、
-license_grants 等）随支付模块一起移除：
+历史版本遗留的表（payment_orders、payment_notifications、payment_reconciliations、
+license_grants 等）已随旧模块一起移除：
 - 新建库不再创建这些表；
 - 历史库里如果还留着它们，保持原样、不再读写、也不参与结构校验，
-  以免误删历史订单数据。
+  以免误删历史数据。
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ CORE_TABLES = (
     "schema_meta",
 )
 
-# 支付时代的遗留表：只识别名称，不校验、不读写。
+# 历史版本遗留的表：只识别名称，不校验、不读写。
 LEGACY_PAYMENT_TABLES = (
     "payment_orders",
     "payment_notifications",
@@ -216,7 +216,7 @@ def initialize_database(database_path: Path) -> None:
     """初始化/升级到免费版核心 schema，并兼容历史版本的库。
 
     历史库（无 schema_meta 的旧库、schema_version 1..5）只做核心表结构与外键校验，
-    随后把版本标记为 6；支付时代的遗留表保持原样。
+    随后把版本标记为 6；历史版本遗留的表保持原样。
     """
     with write_transaction(database_path) as connection:
         if _table_exists(connection, "schema_meta"):
@@ -233,7 +233,7 @@ def initialize_database(database_path: Path) -> None:
 
 
 def _require_compatible_legacy_database(connection: sqlite3.Connection) -> None:
-    """无 schema_meta 的历史库：允许支付遗留表存在，但核心表必须符合预期且没有业务数据。"""
+    """无 schema_meta 的历史库：允许历史遗留表存在，但核心表必须符合预期且没有业务数据。"""
     core_tables = set(LEGACY_UNVERSIONED_COLUMNS)
     leftover_tables = set(LEGACY_PAYMENT_TABLES)
     unexpected_objects: set[tuple[str, str]] = set()
@@ -253,7 +253,7 @@ def _require_compatible_legacy_database(connection: sqlite3.Connection) -> None:
                 unexpected_objects.add((object_type, name))
         elif object_type == "index":
             if table_name in leftover_tables:
-                # 支付遗留表的索引随表一起忽略，不校验命名与结构。
+                # 历史遗留表的索引随表一起忽略，不校验命名与结构。
                 continue
             if table_name not in core_tables or name not in _declared_core_index_names(table_name):
                 unexpected_objects.add((object_type, name))
@@ -360,7 +360,7 @@ def _schema_version(connection: sqlite3.Connection) -> int:
 
 
 def _require_core_schema(connection: sqlite3.Connection) -> None:
-    """只校验免费版核心表；历史遗留的支付表不参与校验。"""
+    """只校验免费版核心表；历史遗留的表不参与校验。"""
     expected = sqlite3.connect(":memory:")
     expected.row_factory = sqlite3.Row
     expected.execute("PRAGMA foreign_keys = ON")
